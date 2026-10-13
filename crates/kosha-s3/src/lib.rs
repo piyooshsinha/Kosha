@@ -2,8 +2,10 @@
 
 mod auth;
 mod body;
+mod config;
 mod error;
 mod handlers;
+mod metrics;
 mod xml;
 
 use std::sync::Arc;
@@ -25,6 +27,8 @@ pub struct S3Config {
     pub domain: Option<String>,
     /// Cluster status and administration (absent on a single node).
     pub cluster: Option<Arc<dyn ClusterHooks>>,
+    /// Serve `/_kosha/metrics` without authentication (for Prometheus).
+    pub metrics_public: bool,
 }
 
 /// What the S3 front end needs from a cluster, for `/_kosha/cluster*`.
@@ -33,6 +37,10 @@ pub trait ClusterHooks: Send + Sync + 'static {
     fn status(&self) -> serde_json::Value;
     /// `DELETE /_kosha/cluster/nodes/{id}`. `Err` carries a user-facing reason.
     fn remove_node(&self, id: u64) -> futures::future::BoxFuture<'static, Result<(), String>>;
+    /// Extra Prometheus series appended to `/_kosha/metrics`.
+    fn prometheus(&self) -> String {
+        String::new()
+    }
 }
 
 impl std::fmt::Debug for dyn ClusterHooks {
@@ -48,6 +56,7 @@ impl Default for S3Config {
             credentials: Credentials::new(),
             domain: None,
             cluster: None,
+            metrics_public: false,
         }
     }
 }
@@ -55,10 +64,15 @@ impl Default for S3Config {
 pub(crate) struct AppState {
     pub engine: Engine,
     pub cfg: S3Config,
+    pub metrics: metrics::Metrics,
 }
 
 /// Build the S3 API router.
 pub fn router(engine: Engine, cfg: S3Config) -> Router {
-    let state = Arc::new(AppState { engine, cfg });
+    let state = Arc::new(AppState {
+        engine,
+        cfg,
+        metrics: Default::default(),
+    });
     Router::new().fallback(handlers::dispatch).with_state(state)
 }

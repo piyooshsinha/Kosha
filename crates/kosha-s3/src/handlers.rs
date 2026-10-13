@@ -9,7 +9,7 @@ use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use futures::{StreamExt, TryStreamExt};
-use kosha_engine::{ListQuery, ObjectAttrs, ObjectMeta, WriteCondition};
+use kosha_engine::{BucketConfigUpdate, ListQuery, ObjectAttrs, ObjectMeta, WriteCondition};
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
 
@@ -76,6 +76,9 @@ pub async fn dispatch(State(st): State<Arc<AppState>>, req: Request) -> Response
     let is_head = req.method() == Method::HEAD;
     let started = std::time::Instant::now();
     let (method, path) = (req.method().clone(), req.uri().path().to_string());
+    let op = crate::metrics::operation(&method, &path, req.uri().query());
+    let bytes_in = content_length(req.headers());
+    let metrics_st = st.clone();
 
     let mut resp = match handle(st, req).await {
         Ok(r) => r,
@@ -100,11 +103,95 @@ pub async fn dispatch(State(st): State<Arc<AppState>>, req: Request) -> Response
         HeaderValue::from_str(&request_id).unwrap(),
     );
     h.insert(header::SERVER, HeaderValue::from_static("Kosha"));
-    tracing::info!(
-        %method, %path, status = resp.status().as_u16(),
-        ms = started.elapsed().as_millis() as u64, "request"
+    let elapsed = started.elapsed();
+    let bytes_out = if is_head {
+        0
+    } else {
+        content_length(resp.headers())
+    };
+    metrics_st
+        .metrics
+        .observe(op, resp.status().as_u16(), elapsed, bytes_in, bytes_out);
+    tracing::debug!(
+        %method, %path, op, status = resp.status().as_u16(),
+        us = elapsed.as_micros() as u64, "request"
     );
     resp
+}
+
+fn content_length(h: &HeaderMap) -> u64 {
+    h.get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Prometheus exposition for `/_kosha/metrics`.
+async fn metrics_response(st: &AppState) -> S3Result<Response> {
+    use crate::metrics::{counter, gauge};
+    let mut out = String::new();
+    st.metrics.render(&mut out);
+    let s = st.engine.stats().await?;
+    gauge(&mut out, "kosha_buckets", "Buckets.", s.buckets);
+    gauge(&mut out, "kosha_objects", "Objects.", s.objects);
+    gauge(
+        &mut out,
+        "kosha_logical_bytes",
+        "Sum of object sizes as clients see them.",
+        s.logical_bytes,
+    );
+    gauge(
+        &mut out,
+        "kosha_unique_bytes",
+        "Bytes of unique chunks (after dedup).",
+        s.unique_bytes,
+    );
+    gauge(
+        &mut out,
+        "kosha_physical_bytes",
+        "Bytes of chunks on disk (after dedup and compression), per replica.",
+        s.physical_bytes,
+    );
+    gauge(&mut out, "kosha_chunks", "Unique chunks.", s.chunks);
+    let w = st.engine.write_stats();
+    counter(
+        &mut out,
+        "kosha_commit_batches_total",
+        "Local metadata transactions (single node).",
+        w.commit_batches,
+    );
+    counter(
+        &mut out,
+        "kosha_commit_commands_total",
+        "Commands carried by those transactions.",
+        w.commit_commands,
+    );
+    counter(
+        &mut out,
+        "kosha_sync_requests_total",
+        "Chunk writes that waited for durability (group sync).",
+        w.sync_requests,
+    );
+    counter(
+        &mut out,
+        "kosha_sync_calls_total",
+        "syncfs calls that made them durable.",
+        w.sync_calls,
+    );
+    crate::metrics::header(&mut out, "kosha_info", "gauge", "Build and configuration.");
+    out.push_str(&format!(
+        "kosha_info{{version=\"{}\",io_backend=\"{}\",sync=\"{:?}\"}} 1\n",
+        env!("CARGO_PKG_VERSION"),
+        st.engine.io_backend(),
+        st.engine.config().sync
+    ));
+    if let Some(c) = &st.cfg.cluster {
+        out.push_str(&c.prometheus());
+    }
+    Ok(Response::builder()
+        .header(header::CONTENT_TYPE, "text/plain; version=0.0.4")
+        .body(Body::from(out))
+        .unwrap())
 }
 
 fn rand_u64() -> u64 {
@@ -118,6 +205,19 @@ async fn handle(st: Arc<AppState>, req: Request) -> S3Result<Response> {
 
     if raw_path == "/_kosha/health" {
         return Ok((StatusCode::OK, "ok\n").into_response());
+    }
+    if raw_path == "/_kosha/metrics" && st.cfg.metrics_public {
+        return metrics_response(&st).await;
+    }
+
+    // CORS preflights are never signed.
+    if parts.method == Method::OPTIONS {
+        let (bucket, _) = resolve_target(&st, &parts.headers, &raw_path);
+        let rules = bucket
+            .as_deref()
+            .and_then(|b| st.engine.bucket_local(b).ok())
+            .and_then(|b| b.config.cors);
+        return Ok(crate::config::preflight(rules.as_deref(), &parts.headers));
     }
 
     let query = auth::parse_query(parts.uri.query());
@@ -133,6 +233,9 @@ async fn handle(st: Arc<AppState>, req: Request) -> S3Result<Response> {
 
     if raw_path == "/_kosha/stats" {
         return stats(&st).await;
+    }
+    if raw_path == "/_kosha/metrics" {
+        return metrics_response(&st).await;
     }
     if raw_path == "/_kosha/cluster" {
         let body = match &st.cfg.cluster {
@@ -174,13 +277,128 @@ async fn handle(st: Arc<AppState>, req: Request) -> S3Result<Response> {
         key,
         payload,
     };
-    route(&ctx, body).await.map_err(|e| {
+    let result = route(&ctx, body).await.map_err(|e| {
         if e.resource.is_none() {
             e.with_resource(ctx.resource())
         } else {
             e
         }
-    })
+    });
+    let origin = ctx.header("origin").map(str::to_string);
+    match (origin, ctx.bucket.as_deref()) {
+        (Some(origin), Some(bucket)) => {
+            let rules = ctx
+                .st
+                .engine
+                .bucket_local(bucket)
+                .ok()
+                .and_then(|b| b.config.cors);
+            let mut resp = match result {
+                Ok(r) => r,
+                Err(e) => e.into_response(),
+            };
+            if let Some(rules) = rules {
+                crate::config::decorate(&mut resp, &rules, &origin, &ctx.method);
+            }
+            Ok(resp)
+        }
+        _ => result,
+    }
+}
+
+async fn read_text(ctx: &Ctx, body: Body) -> S3Result<String> {
+    let md5 = content_md5(&ctx.headers)?;
+    let raw = BodySource::new(body, ctx.payload.clone(), &ctx.headers)?
+        .collect(MAX_XML_BODY)
+        .await?;
+    if md5.is_some() {
+        use md5::Digest;
+        check_md5(md5, &md5::Md5::digest(&raw).into())?;
+    }
+    String::from_utf8(raw.to_vec()).map_err(|_| S3Error::malformed_xml("body is not UTF-8"))
+}
+
+/// Bucket configuration subresources (tagging, CORS).
+async fn bucket_config(ctx: &Ctx, bucket: &str, body: Body) -> S3Result<Option<Response>> {
+    use crate::config::*;
+    let engine = ctx.engine();
+    let m = &ctx.method;
+    if ctx.has("tagging") {
+        return Ok(Some(match *m {
+            Method::PUT => {
+                let tags = parse_tagging(&read_text(ctx, body).await?, true)?;
+                engine
+                    .set_bucket_config(bucket, BucketConfigUpdate::Tags(tags))
+                    .await?;
+                StatusCode::NO_CONTENT.into_response()
+            }
+            Method::DELETE => {
+                engine
+                    .set_bucket_config(bucket, BucketConfigUpdate::Tags(Default::default()))
+                    .await?;
+                StatusCode::NO_CONTENT.into_response()
+            }
+            _ => {
+                let info = engine.bucket(bucket).await?;
+                if info.config.tags.is_empty() {
+                    return Err(S3Error::new(
+                        StatusCode::NOT_FOUND,
+                        "NoSuchTagSet",
+                        "The TagSet does not exist",
+                    ));
+                }
+                xml_response(render_tagging(&info.config.tags))
+            }
+        }));
+    }
+    if ctx.has("cors") {
+        return Ok(Some(match *m {
+            Method::PUT => {
+                let update = parse_cors(&read_text(ctx, body).await?)?;
+                engine.set_bucket_config(bucket, update).await?;
+                StatusCode::OK.into_response()
+            }
+            Method::DELETE => {
+                engine
+                    .set_bucket_config(bucket, BucketConfigUpdate::Cors(None))
+                    .await?;
+                StatusCode::NO_CONTENT.into_response()
+            }
+            _ => match engine.bucket(bucket).await?.config.cors {
+                Some(rules) => xml_response(render_cors(&rules)),
+                None => {
+                    return Err(S3Error::new(
+                        StatusCode::NOT_FOUND,
+                        "NoSuchCORSConfiguration",
+                        "The CORS configuration does not exist",
+                    ));
+                }
+            },
+        }));
+    }
+    Ok(None)
+}
+
+/// Object tagging subresource.
+async fn object_tagging(ctx: &Ctx, bucket: &str, key: &str, body: Body) -> S3Result<Response> {
+    use crate::config::*;
+    match ctx.method {
+        Method::PUT => {
+            let tags = parse_tagging(&read_text(ctx, body).await?, false)?;
+            ctx.engine().set_object_tags(bucket, key, tags).await?;
+            Ok(StatusCode::OK.into_response())
+        }
+        Method::DELETE => {
+            ctx.engine()
+                .set_object_tags(bucket, key, Default::default())
+                .await?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+        _ => {
+            let meta = ctx.engine().head_object(bucket, key).await?;
+            Ok(xml_response(render_tagging(&meta.attrs.tags)))
+        }
+    }
 }
 
 fn decode_path(s: &str) -> String {
@@ -230,14 +448,18 @@ async fn route(ctx: &Ctx, body: Body) -> S3Result<Response> {
         },
         (Some(bucket), None) => {
             let bucket = bucket.as_str();
+            if ctx.has("tagging") || ctx.has("cors") {
+                if let Some(resp) = bucket_config(ctx, bucket, body).await? {
+                    return Ok(resp);
+                }
+                return Err(S3Error::internal("unhandled bucket subresource"));
+            }
             match *m {
                 Method::PUT => {
                     for sub in [
                         "versioning",
                         "policy",
-                        "cors",
                         "lifecycle",
-                        "tagging",
                         "acl",
                         "encryption",
                         "object-lock",
@@ -257,12 +479,7 @@ async fn route(ctx: &Ctx, body: Body) -> S3Result<Response> {
                         .unwrap())
                 }
                 Method::DELETE => {
-                    if ctx.has("policy")
-                        || ctx.has("cors")
-                        || ctx.has("lifecycle")
-                        || ctx.has("tagging")
-                        || ctx.has("encryption")
-                    {
+                    if ctx.has("policy") || ctx.has("lifecycle") || ctx.has("encryption") {
                         ctx.engine().bucket(bucket).await?;
                         return Ok(StatusCode::NO_CONTENT.into_response());
                     }
@@ -285,12 +502,10 @@ async fn route(ctx: &Ctx, body: Body) -> S3Result<Response> {
             let (bucket, key) = (bucket.as_str(), key.as_str());
             match *m {
                 Method::PUT if ctx.has("uploadId") => upload_part(ctx, bucket, key, body).await,
-                Method::PUT
-                    if ctx.has("tagging")
-                        || ctx.has("acl")
-                        || ctx.has("retention")
-                        || ctx.has("legal-hold") =>
-                {
+                Method::PUT | Method::GET | Method::DELETE if ctx.has("tagging") => {
+                    object_tagging(ctx, bucket, key, body).await
+                }
+                Method::PUT if ctx.has("acl") || ctx.has("retention") || ctx.has("legal-hold") => {
                     Err(S3Error::not_implemented("object subresources"))
                 }
                 Method::PUT if ctx.headers.contains_key("x-amz-copy-source") => {
@@ -298,12 +513,6 @@ async fn route(ctx: &Ctx, body: Body) -> S3Result<Response> {
                 }
                 Method::PUT => put_object(ctx, bucket, key, body).await,
                 Method::GET if ctx.has("uploadId") => list_parts(ctx, bucket, key).await,
-                Method::GET if ctx.has("tagging") => {
-                    ctx.engine().head_object(bucket, key).await?;
-                    let mut x = Xml::new("Tagging");
-                    x.open("TagSet").close("TagSet");
-                    Ok(xml_response(x.finish("Tagging")))
-                }
                 Method::GET | Method::HEAD => get_object(ctx, bucket, key).await,
                 Method::DELETE if ctx.has("uploadId") => {
                     ctx.engine()
@@ -708,6 +917,15 @@ async fn list_uploads(ctx: &Ctx, bucket: &str) -> S3Result<Response> {
 
 // ------------------------------------------------------------------- object
 
+/// Attributes from request headers, including `x-amz-tagging`.
+fn attrs_with_tags(headers: &HeaderMap) -> S3Result<ObjectAttrs> {
+    let mut attrs = attrs_from_headers(headers);
+    if let Some(tags) = crate::config::parse_tag_header(headers)? {
+        attrs.tags = tags;
+    }
+    Ok(attrs)
+}
+
 fn attrs_from_headers(headers: &HeaderMap) -> ObjectAttrs {
     let mut attrs = ObjectAttrs {
         content_type: headers
@@ -784,7 +1002,7 @@ async fn put_object(ctx: &Ctx, bucket: &str, key: &str, body: Body) -> S3Result<
             bucket,
             key,
             data,
-            attrs_from_headers(&ctx.headers),
+            attrs_with_tags(&ctx.headers)?,
             write_condition(ctx),
         )
         .await?;
@@ -818,16 +1036,22 @@ async fn copy_object(ctx: &Ctx, bucket: &str, key: &str) -> S3Result<Response> {
     }
     let src = ctx.engine().head_object(&sb, &sk).await?;
     check_copy_conditions(ctx, &src)?;
+    let replace_tags = ctx
+        .header("x-amz-tagging-directive")
+        .is_some_and(|d| d.eq_ignore_ascii_case("REPLACE"));
+    let mut attrs = if replace {
+        attrs_from_headers(&ctx.headers)
+    } else {
+        src.attrs.clone()
+    };
+    attrs.tags = if replace_tags {
+        crate::config::parse_tag_header(&ctx.headers)?.unwrap_or_default()
+    } else {
+        src.attrs.tags.clone()
+    };
     let meta = ctx
         .engine()
-        .copy_object(
-            &sb,
-            &sk,
-            bucket,
-            key,
-            replace.then(|| attrs_from_headers(&ctx.headers)),
-            write_condition(ctx),
-        )
+        .copy_object(&sb, &sk, bucket, key, Some(attrs), write_condition(ctx))
         .await?;
     let mut x = Xml::new("CopyObjectResult");
     x.elem("LastModified", iso8601(&meta.last_modified))
@@ -972,6 +1196,9 @@ async fn get_object(ctx: &Ctx, bucket: &str, key: &str) -> S3Result<Response> {
     for (k, v) in &meta.attrs.user_meta {
         b = b.header(format!("x-amz-meta-{k}"), v);
     }
+    if !meta.attrs.tags.is_empty() {
+        b = b.header("x-amz-tagging-count", meta.attrs.tags.len().to_string());
+    }
 
     let range = match ctx.header("range") {
         Some(r) => parse_range(r, meta.size)?,
@@ -1001,7 +1228,7 @@ async fn get_object(ctx: &Ctx, bucket: &str, key: &str) -> S3Result<Response> {
 async fn create_upload(ctx: &Ctx, bucket: &str, key: &str) -> S3Result<Response> {
     let info = ctx
         .engine()
-        .create_upload(bucket, key, attrs_from_headers(&ctx.headers))
+        .create_upload(bucket, key, attrs_with_tags(&ctx.headers)?)
         .await?;
     let mut x = Xml::new("InitiateMultipartUploadResult");
     x.elem("Bucket", bucket)

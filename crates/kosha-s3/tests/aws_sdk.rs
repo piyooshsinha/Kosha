@@ -7,7 +7,7 @@ use aws_sdk_s3::config::{BehaviorVersion, Credentials as AwsCreds, Region};
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier};
-use kosha_engine::{Engine, EngineConfig};
+use kosha_engine::{Engine, EngineConfig, SyncMode};
 use kosha_s3::{Credentials, S3Config};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -22,7 +22,7 @@ struct Server {
 async fn start() -> Server {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = EngineConfig::new(dir.path());
-    cfg.fsync = false;
+    cfg.sync = SyncMode::None;
     let engine = Engine::open(cfg).unwrap();
     let app = kosha_s3::router(
         engine,
@@ -464,4 +464,244 @@ async fn auth_and_conditions() {
     let mut resp = String::new();
     conn.read_to_string(&mut resp).await.unwrap();
     assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
+}
+
+async fn raw_http(addr: std::net::SocketAddr, request: String) -> String {
+    let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+    conn.write_all(request.as_bytes()).await.unwrap();
+    let mut resp = String::new();
+    conn.read_to_string(&mut resp).await.unwrap();
+    resp
+}
+
+#[tokio::test]
+async fn tagging_and_cors() {
+    use aws_sdk_s3::types::{CorsConfiguration, CorsRule, Tag, Tagging, TaggingDirective};
+    let s = start().await;
+    let c = client(&s, SK);
+    c.create_bucket().bucket("tagged").send().await.unwrap();
+
+    // Tags on upload, tag count on GET, replace, delete.
+    c.put_object()
+        .bucket("tagged")
+        .key("doc")
+        .tagging("project=kosha&team=storage%20core")
+        .body(ByteStream::from_static(b"hello"))
+        .send()
+        .await
+        .unwrap();
+    let got = c
+        .get_object()
+        .bucket("tagged")
+        .key("doc")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(got.tag_count(), Some(2));
+    let tags = c
+        .get_object_tagging()
+        .bucket("tagged")
+        .key("doc")
+        .send()
+        .await
+        .unwrap();
+    let team = tags.tag_set().iter().find(|t| t.key() == "team").unwrap();
+    assert_eq!(team.value(), "storage core");
+
+    let one = Tagging::builder()
+        .tag_set(Tag::builder().key("stage").value("final").build().unwrap())
+        .build()
+        .unwrap();
+    c.put_object_tagging()
+        .bucket("tagged")
+        .key("doc")
+        .tagging(one)
+        .send()
+        .await
+        .unwrap();
+    let tags = c
+        .get_object_tagging()
+        .bucket("tagged")
+        .key("doc")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tags.tag_set().len(), 1);
+
+    // Copy keeps tags by default, or replaces them.
+    c.copy_object()
+        .bucket("tagged")
+        .key("kept")
+        .copy_source("tagged/doc")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        c.get_object_tagging()
+            .bucket("tagged")
+            .key("kept")
+            .send()
+            .await
+            .unwrap()
+            .tag_set()[0]
+            .key(),
+        "stage"
+    );
+    c.copy_object()
+        .bucket("tagged")
+        .key("replaced")
+        .copy_source("tagged/doc")
+        .tagging_directive(TaggingDirective::Replace)
+        .tagging("new=1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        c.get_object_tagging()
+            .bucket("tagged")
+            .key("replaced")
+            .send()
+            .await
+            .unwrap()
+            .tag_set()[0]
+            .key(),
+        "new"
+    );
+
+    c.delete_object_tagging()
+        .bucket("tagged")
+        .key("doc")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        c.get_object_tagging()
+            .bucket("tagged")
+            .key("doc")
+            .send()
+            .await
+            .unwrap()
+            .tag_set()
+            .is_empty()
+    );
+
+    // Bucket tagging.
+    let bt = Tagging::builder()
+        .tag_set(
+            Tag::builder()
+                .key("cost-center")
+                .value("42")
+                .build()
+                .unwrap(),
+        )
+        .build()
+        .unwrap();
+    c.put_bucket_tagging()
+        .bucket("tagged")
+        .tagging(bt)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        c.get_bucket_tagging()
+            .bucket("tagged")
+            .send()
+            .await
+            .unwrap()
+            .tag_set()[0]
+            .value(),
+        "42"
+    );
+    c.delete_bucket_tagging()
+        .bucket("tagged")
+        .send()
+        .await
+        .unwrap();
+    let err = c
+        .get_bucket_tagging()
+        .bucket("tagged")
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(err.into_service_error().meta().code(), Some("NoSuchTagSet"));
+
+    // CORS configuration round trip.
+    let rule = CorsRule::builder()
+        .allowed_origins("https://*.example.com")
+        .allowed_methods("GET")
+        .allowed_methods("PUT")
+        .allowed_headers("*")
+        .expose_headers("ETag")
+        .max_age_seconds(600)
+        .build()
+        .unwrap();
+    c.put_bucket_cors()
+        .bucket("tagged")
+        .cors_configuration(
+            CorsConfiguration::builder()
+                .cors_rules(rule)
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let cors = c.get_bucket_cors().bucket("tagged").send().await.unwrap();
+    assert_eq!(cors.cors_rules()[0].allowed_methods(), ["GET", "PUT"]);
+
+    // Preflight from an allowed origin, then from a disallowed one.
+    let ok = raw_http(s.addr, format!(
+        "OPTIONS /tagged/doc HTTP/1.1\r\nHost: {}\r\nOrigin: https://app.example.com\r\nAccess-Control-Request-Method: PUT\r\nAccess-Control-Request-Headers: content-type\r\nConnection: close\r\n\r\n", s.addr)).await;
+    assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+    assert!(
+        ok.to_lowercase()
+            .contains("access-control-allow-origin: https://app.example.com"),
+        "{ok}"
+    );
+    assert!(
+        ok.to_lowercase().contains("access-control-max-age: 600"),
+        "{ok}"
+    );
+    let denied = raw_http(s.addr, format!(
+        "OPTIONS /tagged/doc HTTP/1.1\r\nHost: {}\r\nOrigin: https://evil.com\r\nAccess-Control-Request-Method: PUT\r\nConnection: close\r\n\r\n", s.addr)).await;
+    assert!(denied.starts_with("HTTP/1.1 403"), "{denied}");
+
+    // A real cross-origin GET (presigned) gets CORS headers.
+    let req = c
+        .get_object()
+        .bucket("tagged")
+        .key("doc")
+        .presigned(PresigningConfig::expires_in(Duration::from_secs(60)).unwrap())
+        .await
+        .unwrap();
+    let uri: axum::http::Uri = req.uri().parse().unwrap();
+    let resp = raw_http(s.addr, format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nOrigin: https://app.example.com\r\nConnection: close\r\n\r\n",
+        uri.path_and_query().unwrap(), s.addr)).await;
+    let lower = resp.to_lowercase();
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    assert!(
+        lower.contains("access-control-allow-origin: https://app.example.com"),
+        "{resp}"
+    );
+    assert!(
+        lower.contains("access-control-expose-headers: etag"),
+        "{resp}"
+    );
+
+    c.delete_bucket_cors()
+        .bucket("tagged")
+        .send()
+        .await
+        .unwrap();
+    let err = c
+        .get_bucket_cors()
+        .bucket("tagged")
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.into_service_error().meta().code(),
+        Some("NoSuchCORSConfiguration")
+    );
 }

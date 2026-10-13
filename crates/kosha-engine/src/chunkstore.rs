@@ -30,6 +30,7 @@ use std::time::{Duration, SystemTime};
 use bytes::Bytes;
 use parking_lot::Mutex;
 
+use crate::durability::{GroupSync, SyncMode, sync_dir};
 use crate::error::{Error, Result};
 use crate::io::IoBackend;
 use crate::types::ChunkId;
@@ -42,7 +43,7 @@ const PROBE: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub struct StoreOptions {
-    pub fsync: bool,
+    pub sync: SyncMode,
     pub compression_level: i32,
     pub io: IoBackend,
     pub gc_grace: Duration,
@@ -52,6 +53,7 @@ pub struct ChunkStore {
     root: PathBuf,
     tmp: PathBuf,
     opts: StoreOptions,
+    group_sync: Option<GroupSync>,
     pins: Mutex<HashMap<ChunkId, usize>>,
 }
 
@@ -82,12 +84,34 @@ impl ChunkStore {
         for entry in fs::read_dir(&tmp)? {
             let _ = fs::remove_file(entry?.path());
         }
+        let group_sync = match opts.sync {
+            SyncMode::Group if cfg!(target_os = "linux") => Some(GroupSync::start(root)?),
+            _ => None,
+        };
+        let opts = match opts.sync {
+            // Group sync is unavailable off Linux: fall back to per-file syncs.
+            SyncMode::Group if group_sync.is_none() => StoreOptions {
+                sync: SyncMode::File,
+                ..opts
+            },
+            _ => opts,
+        };
         Ok(ChunkStore {
             root: root.to_path_buf(),
             tmp,
             opts,
+            group_sync,
             pins: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// (durability requests, syncfs calls) for group sync; zeros otherwise.
+    pub fn sync_stats(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        match &self.group_sync {
+            Some(g) => (g.stats.requests.load(Relaxed), g.stats.syncs.load(Relaxed)),
+            None => (0, 0),
+        }
     }
 
     pub fn io_name(&self) -> &'static str {
@@ -162,9 +186,22 @@ impl ChunkStore {
                 buf,
             } => {
                 let io = &self.opts.io;
+                let mode = self.opts.sync;
                 let r = async {
-                    io.write_file(tmp.clone(), buf, self.opts.fsync).await?;
-                    io.rename(tmp.clone(), path).await
+                    io.write_file(tmp.clone(), buf, mode == SyncMode::File)
+                        .await?;
+                    let dir = path.parent().expect("chunk path has parent").to_path_buf();
+                    io.rename(tmp.clone(), path).await?;
+                    match mode {
+                        SyncMode::None => Ok(()),
+                        SyncMode::File => tokio::task::spawn_blocking(move || sync_dir(dir))
+                            .await
+                            .map_err(std::io::Error::other)?,
+                        SyncMode::Group => match &self.group_sync {
+                            Some(g) => g.sync().await,
+                            None => Ok(()),
+                        },
+                    }
                 }
                 .await;
                 if let Err(e) = r {
@@ -408,7 +445,7 @@ mod tests {
             ChunkStore::open(
                 dir,
                 StoreOptions {
-                    fsync: false,
+                    sync: SyncMode::None,
                     compression_level: level,
                     io: IoBackend::new(IoMode::Auto, 1).unwrap(),
                     gc_grace: grace,
@@ -431,6 +468,28 @@ mod tests {
             "compressible data shrinks"
         );
         assert_eq!(store.get(&a.id, a.len).await.unwrap(), text);
+    }
+
+    #[tokio::test]
+    async fn every_sync_mode_roundtrips() {
+        for mode in [SyncMode::None, SyncMode::File, SyncMode::Group] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(
+                ChunkStore::open(
+                    dir.path(),
+                    StoreOptions {
+                        sync: mode,
+                        compression_level: 0,
+                        io: IoBackend::new(IoMode::Auto, 1).unwrap(),
+                        gc_grace: Duration::ZERO,
+                    },
+                )
+                .unwrap(),
+            );
+            let data = Bytes::from(vec![9u8; 100_000]);
+            let c = store.put(data.clone()).await.unwrap();
+            assert_eq!(store.get(&c.id, c.len).await.unwrap(), data, "{mode:?}");
+        }
     }
 
     #[tokio::test]

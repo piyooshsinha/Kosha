@@ -10,9 +10,10 @@ use futures::stream::{self, BoxStream, StreamExt};
 use crate::chunker::ChunkerConfig;
 use crate::chunkstore::{ChunkStore, StoreOptions};
 use crate::commit::{GroupCommitter, apply_and_collect};
+use crate::durability::SyncMode;
 use crate::error::{Error, Result};
 use crate::io::{IoBackend, IoMode};
-use crate::meta::{Command, CommandOutput, CommandResult, MetaStore};
+use crate::meta::{Command, CommandOutput, CommandResult, MetaStore, Request};
 use crate::types::*;
 use crate::writer::{ChunkSink, ObjectWriter, WrittenData};
 
@@ -22,8 +23,9 @@ const MAX_PART_NUMBER: u32 = 10_000;
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
     pub data_dir: PathBuf,
-    /// fsync chunk files and metadata commits before acknowledging writes.
-    pub fsync: bool,
+    /// How chunk files are made durable before a write is acknowledged.
+    /// Metadata commits are always durable.
+    pub sync: SyncMode,
     /// zstd level for compressible chunks; 0 disables compression.
     pub compression_level: i32,
     /// Objects up to this size are stored inside their manifest.
@@ -51,7 +53,7 @@ impl EngineConfig {
             .unwrap_or(4);
         EngineConfig {
             data_dir: data_dir.into(),
-            fsync: true,
+            sync: SyncMode::Group,
             compression_level: 3,
             inline_max: 8 * 1024,
             chunking: ChunkerConfig::default(),
@@ -63,6 +65,17 @@ impl EngineConfig {
             gc_grace: Duration::ZERO,
         }
     }
+}
+
+/// Counters describing how well writes are being batched.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WriteStats {
+    /// Local metadata transactions and the commands they carried (single node).
+    pub commit_batches: u64,
+    pub commit_commands: u64,
+    /// Chunk writes that waited for durability, and syncfs calls that served them.
+    pub sync_requests: u64,
+    pub sync_calls: u64,
 }
 
 /// Orders metadata commands. The default (no consensus attached) applies
@@ -147,7 +160,7 @@ impl Engine {
         let store = ChunkStore::open(
             &cfg.data_dir.join("chunks"),
             StoreOptions {
-                fsync: cfg.fsync,
+                sync: cfg.sync,
                 compression_level: cfg.compression_level,
                 io,
                 gc_grace: cfg.gc_grace,
@@ -175,6 +188,19 @@ impl Engine {
     /// Name of the active chunk I/O backend ("io_uring" or "threads").
     pub fn io_backend(&self) -> &'static str {
         self.inner.store.io_name()
+    }
+
+    /// Group-commit and group-sync counters since startup.
+    pub fn write_stats(&self) -> WriteStats {
+        use std::sync::atomic::Ordering::Relaxed;
+        let c = &self.inner.committer.stats;
+        let (sync_requests, sync_calls) = self.inner.store.sync_stats();
+        WriteStats {
+            commit_batches: c.0.load(Relaxed),
+            commit_commands: c.1.load(Relaxed),
+            sync_requests,
+            sync_calls,
+        }
     }
 
     /// The local chunk store (used by cluster replication).
@@ -206,10 +232,10 @@ impl Engine {
     /// chunks they released. Blocking; called by the consensus layer.
     pub fn apply_committed(
         &self,
-        cmds: Vec<Command>,
+        reqs: Vec<Request>,
         sm_state: Option<Vec<u8>>,
     ) -> Result<Vec<CommandResult>> {
-        apply_and_collect(&self.inner.meta, &self.inner.store, cmds, sm_state)
+        apply_and_collect(&self.inner.meta, &self.inner.store, reqs, sm_state)
     }
 
     pub fn sm_state(&self) -> Result<Option<Vec<u8>>> {
@@ -322,6 +348,7 @@ impl Engine {
         let info = BucketInfo {
             name: name.to_string(),
             created: Utc::now(),
+            config: BucketConfig::default(),
         };
         self.propose(Command::CreateBucket { info: info.clone() })
             .await?;
@@ -332,6 +359,38 @@ impl Engine {
         self.propose(Command::DeleteBucket { name: name.into() })
             .await
             .map(drop)
+    }
+
+    pub async fn set_bucket_config(&self, bucket: &str, update: BucketConfigUpdate) -> Result<()> {
+        self.propose(Command::SetBucketConfig {
+            bucket: bucket.into(),
+            update,
+        })
+        .await
+        .map(drop)
+    }
+
+    /// Replace an object's tags; an empty map removes them.
+    pub async fn set_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        tags: std::collections::BTreeMap<String, String>,
+    ) -> Result<ObjectMeta> {
+        expect_object(
+            self.propose(Command::SetObjectTags {
+                bucket: bucket.into(),
+                key: key.into(),
+                tags,
+            })
+            .await?,
+        )
+    }
+
+    /// Bucket record from local state, without a read barrier. For
+    /// configuration lookups (e.g. CORS) where brief staleness is acceptable.
+    pub fn bucket_local(&self, name: &str) -> Result<BucketInfo> {
+        self.inner.meta.bucket(name)
     }
 
     pub async fn bucket(&self, name: &str) -> Result<BucketInfo> {

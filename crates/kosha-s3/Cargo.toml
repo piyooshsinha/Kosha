@@ -15,6 +15,7 @@ hmac = "0.13.0"
 http-body-util = "0.1.5"
 kosha-engine = { version = "0.1.0", path = "../kosha-engine" }
 md-5 = "0.11.0"
+parking_lot = "0.12.5"
 percent-encoding = "2.3.2"
 quick-xml = { version = "0.42.0", features = ["serialize"] }
 serde = { version = "1.0.229", features = ["derive"] }

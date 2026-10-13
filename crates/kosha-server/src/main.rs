@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::Parser;
 use kosha_cluster::{Cluster, ClusterConfig};
-use kosha_engine::{Engine, EngineConfig, IoMode};
+use kosha_engine::{Engine, EngineConfig, IoMode, SyncMode};
 use kosha_s3::{ClusterHooks, Credentials, S3Config};
 use tracing_subscriber::EnvFilter;
 
@@ -48,10 +48,19 @@ struct Args {
     #[arg(long, env = "KOSHA_COMPRESSION_LEVEL", default_value_t = 3)]
     compression_level: i32,
 
-    /// Skip fsync of chunk files (metadata commits stay durable). Chunk data written
-    /// just before a power failure can be lost.
+    /// How chunk files are made durable: group (shared syncfs, default), file
+    /// (fsync each file and its directory) or none. Metadata is always durable.
+    #[arg(long, env = "KOSHA_SYNC", default_value = "group")]
+    sync: SyncMode,
+
+    /// Shorthand for --sync none. Chunk data written just before a power
+    /// failure can be lost.
     #[arg(long, env = "KOSHA_NO_FSYNC")]
     no_fsync: bool,
+
+    /// Serve /_kosha/metrics without authentication (for Prometheus scrapers).
+    #[arg(long, env = "KOSHA_METRICS_PUBLIC")]
+    metrics_public: bool,
 
     /// Chunk I/O backend: auto (io_uring if available), uring, threads.
     #[arg(long, env = "KOSHA_IO", default_value = "auto")]
@@ -117,6 +126,10 @@ impl ClusterHooks for Hooks {
         let c = self.0.clone();
         Box::pin(async move { c.remove_node(id).await.map_err(|e| e.to_string()) })
     }
+
+    fn prometheus(&self) -> String {
+        self.0.prometheus()
+    }
 }
 
 #[tokio::main]
@@ -145,7 +158,11 @@ async fn main() -> anyhow::Result<()> {
     let clustered = args.node_id.is_some();
     let mut cfg = EngineConfig::new(&args.data_dir);
     cfg.compression_level = args.compression_level;
-    cfg.fsync = !args.no_fsync;
+    cfg.sync = if args.no_fsync {
+        SyncMode::None
+    } else {
+        args.sync
+    };
     cfg.io_mode = args.io;
     // A single node protects in-flight uploads with pins alone; a cluster also
     // needs the grace period for uploads coordinated by other nodes.
@@ -156,13 +173,14 @@ async fn main() -> anyhow::Result<()> {
     };
     let engine = Engine::open(cfg)
         .with_context(|| format!("opening data directory {}", args.data_dir.display()))?;
-    tracing::info!(io = engine.io_backend(), "storage engine ready");
+    tracing::info!(io = engine.io_backend(), sync = ?engine.config().sync, "storage engine ready");
 
     let mut s3 = S3Config {
         region: args.region.clone(),
         credentials,
         domain: args.domain.clone(),
         cluster: None,
+        metrics_public: args.metrics_public,
     };
 
     let cluster = match args.node_id {

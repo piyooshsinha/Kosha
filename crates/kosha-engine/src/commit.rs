@@ -12,13 +12,14 @@
 //! until their reply arrives, which is after the batch commits.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 
 use tokio::sync::oneshot;
 
 use crate::chunkstore::ChunkStore;
 use crate::error::{Error, Result};
-use crate::meta::{Command, CommandResult, MetaStore};
+use crate::meta::{Command, CommandResult, MetaStore, Request};
 
 /// Upper bound on commands per transaction, keeping latency bounded.
 const MAX_BATCH: usize = 512;
@@ -31,16 +32,18 @@ struct Pending {
 pub(crate) struct GroupCommitter {
     tx: Option<mpsc::Sender<Pending>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// (transactions, commands) committed, for metrics.
+    pub stats: Arc<(AtomicU64, AtomicU64)>,
 }
 
 /// Apply a batch and collect chunks it released.
 pub(crate) fn apply_and_collect(
     meta: &MetaStore,
     store: &ChunkStore,
-    cmds: Vec<Command>,
+    reqs: Vec<Request>,
     sm_state: Option<Vec<u8>>,
 ) -> Result<Vec<CommandResult>> {
-    let applied = meta.apply(cmds, sm_state)?;
+    let applied = meta.apply_requests(reqs, sm_state)?;
     if !applied.freed.is_empty() {
         let removed = store.collect(&applied.freed, |id| Ok(!meta.is_referenced(id)?))?;
         tracing::debug!(
@@ -55,6 +58,8 @@ pub(crate) fn apply_and_collect(
 impl GroupCommitter {
     pub(crate) fn start(meta: Arc<MetaStore>, store: Arc<ChunkStore>) -> Result<Self> {
         let (tx, rx) = mpsc::channel::<Pending>();
+        let stats = Arc::new((AtomicU64::new(0), AtomicU64::new(0)));
+        let counters = stats.clone();
         let thread = std::thread::Builder::new()
             .name("kosha-commit".into())
             .spawn(move || {
@@ -70,7 +75,14 @@ impl GroupCommitter {
                     let (cmds, replies): (Vec<_>, Vec<_>) =
                         batch.into_iter().map(|p| (p.cmd, p.reply)).unzip();
                     let n = cmds.len();
-                    match apply_and_collect(&meta, &store, cmds, None) {
+                    counters.0.fetch_add(1, Ordering::Relaxed);
+                    counters.1.fetch_add(n as u64, Ordering::Relaxed);
+                    match apply_and_collect(
+                        &meta,
+                        &store,
+                        cmds.into_iter().map(Request::from).collect(),
+                        None,
+                    ) {
                         Ok(results) => {
                             for (reply, r) in replies.into_iter().zip(results) {
                                 let _ = reply.send(Ok(r));
@@ -89,6 +101,7 @@ impl GroupCommitter {
         Ok(GroupCommitter {
             tx: Some(tx),
             thread: Some(thread),
+            stats,
         })
     }
 

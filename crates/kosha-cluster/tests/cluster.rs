@@ -14,7 +14,7 @@ struct Node {
 async fn start_node(id: u64) -> Node {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = EngineConfig::new(dir.path().join("data"));
-    cfg.fsync = false;
+    cfg.sync = SyncMode::None;
     cfg.chunking = ChunkerConfig {
         min: 1024,
         avg: 4096,
@@ -417,5 +417,45 @@ async fn repair_removes_surplus_replicas() {
     }
     for n in &nodes {
         assert_eq!(get(&n.engine, "balance", "obj").await, body);
+    }
+}
+
+/// A batch re-delivered after the leader already committed it (a forwarding
+/// reply lost in transit, then a retry) must not be applied twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retried_batches_apply_exactly_once() {
+    use kosha_cluster::CommandBatch;
+    let nodes = three_nodes().await;
+    let leader_id = nodes[0].cluster.status().leader.unwrap();
+    let leader = nodes
+        .iter()
+        .find(|n| n.cluster.node_id() == leader_id)
+        .unwrap();
+    let id = RequestId::random();
+    let batch = CommandBatch(vec![Request {
+        id: Some(id),
+        cmd: Command::CreateBucket {
+            info: BucketInfo {
+                name: "exactly-once".into(),
+                created: chrono::Utc::now(),
+                config: Default::default(),
+            },
+        },
+    }]);
+    let first = leader
+        .cluster
+        .raft()
+        .client_write(batch.clone())
+        .await
+        .unwrap();
+    let retry = leader.cluster.raft().client_write(batch).await.unwrap();
+    assert!(first.data.0[0].is_ok());
+    assert!(
+        retry.data.0[0].is_ok(),
+        "retry returns the original success, not BucketAlreadyExists"
+    );
+    for n in &nodes {
+        n.engine.bucket("exactly-once").await.unwrap();
+        assert_eq!(n.engine.stats().await.unwrap().buckets, 1);
     }
 }

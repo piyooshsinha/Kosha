@@ -1,7 +1,7 @@
 use std::fmt;
 use std::io::Cursor;
 
-use kosha_engine::{Command, CommandResult};
+use kosha_engine::{CommandResult, Request};
 use serde::{Deserialize, Serialize};
 
 pub type NodeId = u64;
@@ -22,9 +22,10 @@ impl fmt::Display for KoshaNode {
     }
 }
 
-/// One Raft entry: a group of commands committed together (group commit).
+/// One Raft entry: a group of requests committed together (group commit).
+/// Each carries a request id so a retried batch is applied at most once.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct CommandBatch(pub Vec<Command>);
+pub struct CommandBatch(pub Vec<Request>);
 
 /// Result of applying one log entry: one result per command in its batch
 /// (empty for blank and membership entries).

@@ -72,6 +72,9 @@ pub struct ObjectAttrs {
     pub headers: BTreeMap<String, String>,
     /// `x-amz-meta-*` user metadata, keys without the prefix, lowercase.
     pub user_meta: BTreeMap<String, String>,
+    /// Object tags (`x-amz-tagging`, PutObjectTagging).
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
 }
 
 /// The manifest of a stored object.
@@ -90,6 +93,35 @@ pub struct ObjectMeta {
 pub struct BucketInfo {
     pub name: String,
     pub created: DateTime<Utc>,
+    #[serde(default)]
+    pub config: BucketConfig,
+}
+
+/// Per-bucket configuration, replicated with the bucket record.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BucketConfig {
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
+    #[serde(default)]
+    pub cors: Option<Vec<CorsRule>>,
+}
+
+/// One cross-origin rule, as in S3's CORSConfiguration.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorsRule {
+    pub id: Option<String>,
+    pub allowed_origins: Vec<String>,
+    pub allowed_methods: Vec<String>,
+    pub allowed_headers: Vec<String>,
+    pub expose_headers: Vec<String>,
+    pub max_age_seconds: Option<u32>,
+}
+
+/// A change to one part of a bucket's configuration.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum BucketConfigUpdate {
+    Tags(BTreeMap<String, String>),
+    Cors(Option<Vec<CorsRule>>),
 }
 
 /// Summary of one object returned by listings.

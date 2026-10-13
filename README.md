@@ -24,6 +24,8 @@ with io_uring.
 | Concurrency control | last writer wins | adds **conditional writes** (`If-None-Match: *`, `If-Match`) evaluated in the Raft log |
 | Write path | one commit per request | **group commit**: concurrent writes share one durable transaction / one Raft entry |
 | Durability after node loss | manual rebuild | **self-healing**: background re-replication restores every chunk's replica count |
+| Retried writes | may apply twice | **exactly-once**: request ids make a re-delivered write return its original result |
+| Data durability cost | fsync per file | **group sync**: concurrent chunk writes share one `syncfs`, including the directory entry |
 | Admin UI | separate product | **built-in web console**, compiled into the binary |
 
 **Contents:**
@@ -239,6 +241,7 @@ curl -X DELETE --aws-sigv4 "aws:amz:us-east-1:s3" --user admin:admin-secret-key 
 |---|---|---|
 | `GET /_kosha/health` | none | `ok`, for load balancer and liveness probes |
 | `GET /_kosha/stats` | SigV4 | objects, logical/unique/physical bytes, dedup and compression ratios, I/O backend |
+| `GET /_kosha/metrics` | SigV4, or none with `--metrics-public` | Prometheus: requests and latency histograms per S3 operation, bytes in/out, storage gauges, group commit/sync batching, Raft state, follower lag, lease/quorum reads, repair counters |
 | `GET /_kosha/cluster` | SigV4 | role, term, leader, log/applied indexes, members, replication progress, lease vs quorum reads, background repair counters |
 | `DELETE /_kosha/cluster/nodes/{id}` | SigV4 | removes a voter (refuses non-voters and the last voter) |
 
@@ -248,8 +251,19 @@ curl -s --aws-sigv4 "aws:amz:us-east-1:s3" --user admin:change-me-please http://
 #  "physical_bytes":292552944,"chunks":240,"dedup_ratio":2.846,"compression_ratio":1.000,"overall_ratio":2.846}
 ```
 
-Logs go to stderr and are filtered with `RUST_LOG`, for example
-`RUST_LOG=kosha_cluster=debug`.
+Prometheus scrape config:
+
+```yaml
+scrape_configs:
+  - job_name: kosha
+    metrics_path: /_kosha/metrics
+    static_configs: [{ targets: ["10.0.0.1:9000", "10.0.0.2:9000", "10.0.0.3:9000"] }]
+```
+
+(start the nodes with `--metrics-public`). Logs go to stderr and are
+filtered with `RUST_LOG`. Per-request lines are at debug level, for example
+`RUST_LOG=kosha_s3=debug`; at the default level the metrics are the
+per-request record.
 
 ---
 
@@ -354,9 +368,15 @@ large objects in the cluster.
   dedup skips the disk write entirely, are only modestly faster
   (164 vs 143 MiB/s in an earlier run). The single-stream curl upload with
   `UNSIGNED-PAYLOAD` skips the SHA-256 and reaches 245–340 MB/s.
-- **Medium objects (64 KiB) pay one fsync per chunk file.** Each one is
-  durably written before the PUT is acknowledged. Batching those fsyncs the
-  way metadata commits are batched is the next write-path optimization.
+- **Chunk durability is not the limit.** Each chunk is written to a temp
+  file, renamed into place, and made durable *together with its directory
+  entry* before the PUT is acknowledged. With `--sync group` (the default)
+  concurrent writers share one `syncfs`. Measured on 64 KiB PUTs:
+  `group` 860–904 req/s, `none` (no sync at all) 772–886 req/s,
+  `file` (fsync each file and directory) 736–749 req/s. Correct durability is
+  therefore effectively free. An earlier version of this README guessed that
+  per-chunk fsync limited 64 KiB writes; the `none` row shows the limit is
+  CPU.
 - **Small writes** now run at about the same rate as small reads, so the
   client, the HTTP stack and SigV4 verification share the remaining cost.
 
@@ -414,7 +434,9 @@ io_uring. `--io auto` (the default) detects this and falls back to threads;
 | `--region` | `KOSHA_REGION` | `us-east-1` | reported region (signatures for any region are accepted) |
 | `--domain` | `KOSHA_DOMAIN` | none | enables virtual-hosted style, `bucket.<domain>` |
 | `--compression-level` | `KOSHA_COMPRESSION_LEVEL` | `3` | zstd level, `0` disables |
-| `--no-fsync` | `KOSHA_NO_FSYNC` | off | skip fsync of chunk files (metadata commits stay durable) |
+| `--sync` | `KOSHA_SYNC` | `group` | chunk durability: `group` (shared `syncfs`), `file` (fsync file + directory), `none` |
+| `--no-fsync` | `KOSHA_NO_FSYNC` | off | shorthand for `--sync none` (metadata commits stay durable) |
+| `--metrics-public` | `KOSHA_METRICS_PUBLIC` | off | serve `/_kosha/metrics` without authentication |
 | `--io` | `KOSHA_IO` | `auto` | `auto`, `uring` (required), or `threads` |
 | `--node-id` | `KOSHA_NODE_ID` | none | enables cluster mode |
 | `--cluster-listen` | `KOSHA_CLUSTER_LISTEN` | `127.0.0.1:9100` | internal Raft + replication port |
@@ -436,14 +458,16 @@ Tested against the **AWS SDK for Rust** (in CI), **boto3**, the **AWS CLI**,
 |---|---|
 | Auth | SigV4 headers, SigV4 presigned URLs, streaming `aws-chunked` with per-chunk signature verification, unsigned-payload trailers, SigV2 presigned URLs (boto3's default) |
 | Integrity | `x-amz-content-sha256` verified, `Content-MD5`, `x-amz-checksum-crc32` (header or trailer) |
-| Buckets | Create, Delete, Head, List, GetBucketLocation, GetBucketVersioning (unversioned), GetBucketAcl; "not configured" responses for policy/CORS/lifecycle/tagging/encryption/... |
-| Objects | Put, Get (single range, conditional, `response-*` overrides), Head, Delete, DeleteObjects, CopyObject (COPY/REPLACE metadata, copy-source conditions), user metadata and standard headers |
+| Buckets | Create, Delete, Head, List, GetBucketLocation, GetBucketVersioning (unversioned), GetBucketAcl; "not configured" responses for policy/lifecycle/encryption/... |
+| Objects | Put, Get (single range, conditional, `response-*` overrides), Head, Delete, DeleteObjects, CopyObject (COPY/REPLACE metadata and tagging directives, copy-source conditions), user metadata and standard headers |
+| Tagging | `x-amz-tagging` on Put/Copy/CreateMultipartUpload, Get/Put/DeleteObjectTagging, `x-amz-tagging-count`, Get/Put/DeleteBucketTagging |
+| CORS | Get/Put/DeleteBucketCors, unauthenticated `OPTIONS` preflight, CORS headers on matching responses (origin wildcards, credentials, exposed headers, max-age) |
 | Listing | ListObjectsV2 (prefix, delimiter, continuation, start-after, `encoding-type=url`), ListObjects v1 |
 | Multipart | Create, UploadPart, UploadPartCopy (with range), Complete, Abort, ListParts, ListMultipartUploads (paginated) |
 | Writes | Conditional `If-None-Match: *` / `If-Match` on Put, Copy and Complete |
 
 Not implemented yet: versioning, object lock, bucket policies/IAM, lifecycle,
-SSE, tagging writes, SigV2 header auth. Unsupported operations return `501 NotImplemented`.
+SSE, SigV2 header auth. Unsupported operations return `501 NotImplemented`.
 
 ## Layout
 

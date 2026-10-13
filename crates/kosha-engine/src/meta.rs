@@ -11,14 +11,15 @@
 //! fails a precondition therefore leaves no trace, and the batch it belongs to
 //! still commits.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use md5::{Digest, Md5};
 use redb::{
-    Database, ReadTransaction, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction,
+    Database, ReadTransaction, ReadableDatabase, ReadableTable, TableDefinition, TableHandle,
+    WriteTransaction,
 };
 use serde::{Deserialize, Serialize};
 
@@ -33,6 +34,18 @@ const UPLOADS: TableDefinition<&str, &[u8]> = TableDefinition::new("uploads");
 const UPLOAD_INDEX: TableDefinition<&[u8], &str> = TableDefinition::new("upload_index");
 const PARTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("parts");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+/// Request id -> remembered result (exactly-once application of retries).
+const REQUESTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("requests");
+/// Sequence number (BE u64) -> request id, for evicting the oldest ids.
+const REQUEST_SEQ: TableDefinition<&[u8], &[u8]> = TableDefinition::new("request_seq");
+
+/// Byte-keyed tables included in snapshots generically. New tables only need
+/// to be listed here.
+const BYTE_TABLES: &[TableDefinition<&[u8], &[u8]>] = &[REQUESTS, REQUEST_SEQ];
+
+/// How many request ids are remembered for deduplication.
+const REMEMBERED_REQUESTS: u64 = 100_000;
+const REQUEST_SEQ_KEY: &str = "request_seq";
 
 const STATS_KEY: &str = "stats";
 /// Opaque state owned by the consensus layer (applied log id, membership),
@@ -93,6 +106,40 @@ pub enum Command {
         key: String,
         upload_id: String,
     },
+    SetBucketConfig {
+        bucket: String,
+        update: BucketConfigUpdate,
+    },
+    /// Replace an object's tags (empty map deletes them).
+    SetObjectTags {
+        bucket: String,
+        key: String,
+        tags: BTreeMap<String, String>,
+    },
+}
+
+/// Identifies one logical write across retries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RequestId(pub u128);
+
+impl RequestId {
+    pub fn random() -> Self {
+        RequestId(uuid::Uuid::new_v4().as_u128())
+    }
+}
+
+/// A command plus an optional request id. Commands with an id are applied at
+/// most once: re-applying the same id returns the remembered result.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Request {
+    pub id: Option<RequestId>,
+    pub cmd: Command,
+}
+
+impl From<Command> for Request {
+    fn from(cmd: Command) -> Self {
+        Request { id: None, cmd }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -192,6 +239,47 @@ struct Tx<'a> {
 }
 
 impl Tx<'_> {
+    fn remembered(&self, id: RequestId) -> Result<Option<CommandResult>> {
+        let t = self.txn.open_table(REQUESTS)?;
+        let v = t.get(id.0.to_be_bytes().as_slice())?;
+        v.map(|v| dec(v.value())).transpose()
+    }
+
+    /// Remember a result, evicting the oldest id once the window is full.
+    /// Object manifests are dropped from remembered results to keep them
+    /// small; a deduplicated reply carries the object's attributes only.
+    fn remember(&mut self, id: RequestId, result: &CommandResult) -> Result<()> {
+        let slim = match result {
+            Ok(CommandOutput::Object(m)) => Ok(CommandOutput::Object(ObjectMeta {
+                segments: Vec::new(),
+                ..m.clone()
+            })),
+            other => other.clone(),
+        };
+        let mut meta = self.txn.open_table(META)?;
+        let seq: u64 = match meta.get(REQUEST_SEQ_KEY)? {
+            Some(v) => dec(v.value())?,
+            None => 0,
+        };
+        meta.insert(REQUEST_SEQ_KEY, enc(&(seq + 1))?.as_slice())?;
+        drop(meta);
+        let key = id.0.to_be_bytes();
+        self.txn
+            .open_table(REQUESTS)?
+            .insert(key.as_slice(), enc(&slim)?.as_slice())?;
+        let mut order = self.txn.open_table(REQUEST_SEQ)?;
+        order.insert(seq.to_be_bytes().as_slice(), key.as_slice())?;
+        if seq >= REMEMBERED_REQUESTS {
+            let old = (seq - REMEMBERED_REQUESTS).to_be_bytes();
+            let evicted = order.remove(old.as_slice())?.map(|v| v.value().to_vec());
+            drop(order);
+            if let Some(old_id) = evicted {
+                self.txn.open_table(REQUESTS)?.remove(old_id.as_slice())?;
+            }
+        }
+        Ok(())
+    }
+
     fn bucket_exists(&self, bucket: &str) -> Result<bool> {
         Ok(self.txn.open_table(BUCKETS)?.get(bucket)?.is_some())
     }
@@ -542,9 +630,38 @@ impl Tx<'_> {
                 self.remove_upload(&info)?;
                 Ok(CommandOutput::Done)
             }
+            Command::SetBucketConfig { bucket, update } => {
+                let mut t = self.txn.open_table(BUCKETS)?;
+                let mut info: BucketInfo = match t.get(bucket.as_str())? {
+                    Some(v) => dec(v.value())?,
+                    None => return reject(Rejection::NoSuchBucket),
+                };
+                match update {
+                    BucketConfigUpdate::Tags(tags) => info.config.tags = tags,
+                    BucketConfigUpdate::Cors(cors) => info.config.cors = cors,
+                }
+                t.insert(bucket.as_str(), enc(&info)?.as_slice())?;
+                Ok(CommandOutput::Done)
+            }
+            Command::SetObjectTags { bucket, key, tags } => {
+                self.require_bucket(&bucket)?;
+                let Some(mut meta) = self.get_object(&bucket, &key)? else {
+                    return reject(Rejection::NoSuchKey);
+                };
+                meta.attrs.tags = tags;
+                // Same manifest, so chunk references are unchanged.
+                self.txn.open_table(OBJECTS)?.insert(
+                    keys::object_key(&bucket, &key).as_slice(),
+                    enc(&meta)?.as_slice(),
+                )?;
+                Ok(CommandOutput::Object(meta))
+            }
         }
     }
 }
+
+/// Raw key/value rows of one table.
+type TableRows = Vec<(Vec<u8>, Vec<u8>)>;
 
 /// Every table, for snapshots.
 #[derive(Default, Serialize, Deserialize)]
@@ -556,6 +673,9 @@ struct SnapshotData {
     upload_index: Vec<(Vec<u8>, String)>,
     parts: Vec<(Vec<u8>, Vec<u8>)>,
     meta: Vec<(String, Vec<u8>)>,
+    /// Every table in `BYTE_TABLES`, by name.
+    #[serde(default)]
+    tables: Vec<(String, TableRows)>,
 }
 
 pub struct MetaStore {
@@ -581,6 +701,13 @@ impl MetaStore {
     /// Apply commands in order, in one atomic commit together with the
     /// consensus layer's `sm_state` (if given).
     pub fn apply(&self, cmds: Vec<Command>, sm_state: Option<Vec<u8>>) -> Result<Applied> {
+        self.apply_requests(cmds.into_iter().map(Request::from).collect(), sm_state)
+    }
+
+    /// Apply requests in order, in one atomic commit together with the
+    /// consensus layer's `sm_state` (if given). Requests whose id was already
+    /// applied return the remembered result and change nothing.
+    pub fn apply_requests(&self, reqs: Vec<Request>, sm_state: Option<Vec<u8>>) -> Result<Applied> {
         let txn = self.db.begin_write()?;
         let stats = match txn.open_table(META)?.get(STATS_KEY)? {
             Some(v) => dec(v.value())?,
@@ -591,13 +718,23 @@ impl MetaStore {
             stats,
             freed: Vec::new(),
         };
-        let mut results = Vec::with_capacity(cmds.len());
-        for cmd in cmds {
-            results.push(match tx.apply(cmd) {
+        let mut results = Vec::with_capacity(reqs.len());
+        for Request { id, cmd } in reqs {
+            if let Some(id) = id
+                && let Some(prev) = tx.remembered(id)?
+            {
+                results.push(prev);
+                continue;
+            }
+            let result = match tx.apply(cmd) {
                 Ok(out) => Ok(out),
                 Err(Fail::Reject(r)) => Err(r),
                 Err(Fail::Fatal(e)) => return Err(e),
-            });
+            };
+            if let Some(id) = id {
+                tx.remember(id, &result)?;
+            }
+            results.push(result);
         }
         let Tx { stats, freed, .. } = tx;
         {
@@ -684,6 +821,10 @@ impl MetaStore {
             upload_index: dump(&r, UPLOAD_INDEX, b, s)?,
             parts: dump(&r, PARTS, b, b)?,
             meta: dump(&r, META, s, b)?,
+            tables: BYTE_TABLES
+                .iter()
+                .map(|def| Ok((def.name().to_string(), dump(&r, *def, b, b)?)))
+                .collect::<Result<_>>()?,
         };
         let sm_state = data
             .meta
@@ -704,6 +845,9 @@ impl MetaStore {
         txn.delete_table(UPLOAD_INDEX)?;
         txn.delete_table(PARTS)?;
         txn.delete_table(META)?;
+        for def in BYTE_TABLES {
+            txn.delete_table(*def)?;
+        }
         create_tables(&txn)?;
         {
             let mut t = txn.open_table(BUCKETS)?;
@@ -733,6 +877,17 @@ impl MetaStore {
             let mut t = txn.open_table(META)?;
             for (k, v) in &data.meta {
                 t.insert(k.as_str(), v.as_slice())?;
+            }
+            for (name, rows) in &data.tables {
+                let Some(def) = BYTE_TABLES.iter().find(|d| d.name() == name) else {
+                    return Err(Error::Internal(format!(
+                        "snapshot has unknown table {name}"
+                    )));
+                };
+                let mut t = txn.open_table(*def)?;
+                for (k, v) in rows {
+                    t.insert(k.as_slice(), v.as_slice())?;
+                }
             }
         }
         txn.commit()?;
@@ -841,6 +996,9 @@ fn create_tables(txn: &WriteTransaction) -> Result<()> {
     txn.open_table(UPLOAD_INDEX)?;
     txn.open_table(PARTS)?;
     txn.open_table(META)?;
+    for def in BYTE_TABLES {
+        txn.open_table(*def)?;
+    }
     Ok(())
 }
 
@@ -940,6 +1098,7 @@ mod tests {
             info: BucketInfo {
                 name: name.into(),
                 created: Utc::now(),
+                config: Default::default(),
             },
         }
     }
@@ -962,6 +1121,39 @@ mod tests {
         assert!(applied.results[2].is_ok());
         assert_eq!(m.list_buckets().unwrap().len(), 2);
         assert_eq!(m.sm_state().unwrap().as_deref(), Some(&b"applied=3"[..]));
+    }
+
+    #[test]
+    fn requests_apply_at_most_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = MetaStore::open(&dir.path().join("m.redb")).unwrap();
+        let id = RequestId::random();
+        let req = || Request {
+            id: Some(id),
+            cmd: bucket("once"),
+        };
+        assert!(m.apply_requests(vec![req()], None).unwrap().results[0].is_ok());
+        // A retry of the same request returns the original success instead of
+        // BucketAlreadyExists, and changes nothing.
+        assert!(m.apply_requests(vec![req()], None).unwrap().results[0].is_ok());
+        assert_eq!(m.stats().unwrap().buckets, 1);
+        // A different request for the same bucket is a genuine conflict.
+        let other = Request {
+            id: Some(RequestId::random()),
+            cmd: bucket("once"),
+        };
+        assert_eq!(
+            m.apply_requests(vec![other], None).unwrap().results[0]
+                .as_ref()
+                .unwrap_err(),
+            &Rejection::BucketAlreadyExists
+        );
+        // The memory survives a snapshot round trip.
+        let (snap, _) = m.export_snapshot().unwrap();
+        let n = MetaStore::open(&dir.path().join("n.redb")).unwrap();
+        n.import_snapshot(&snap).unwrap();
+        assert!(n.apply_requests(vec![req()], None).unwrap().results[0].is_ok());
+        assert_eq!(n.stats().unwrap().buckets, 1);
     }
 
     #[test]

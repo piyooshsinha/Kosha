@@ -3,7 +3,7 @@ use kosha_engine::*;
 
 fn config(dir: &std::path::Path) -> EngineConfig {
     let mut cfg = EngineConfig::new(dir);
-    cfg.fsync = false;
+    cfg.sync = SyncMode::None;
     cfg.chunking = ChunkerConfig {
         min: 1024,
         avg: 4096,

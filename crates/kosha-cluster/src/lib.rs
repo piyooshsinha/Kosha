@@ -42,7 +42,7 @@ use serde::Serialize;
 pub use crate::repair::RepairReport;
 use crate::rpc::{Client, JoinRequest, LeaderReply, Proposed};
 use crate::types::*;
-pub use crate::types::{KoshaNode, NodeId};
+pub use crate::types::{CommandBatch, KoshaNode, NodeId};
 
 #[derive(Clone, Debug)]
 pub struct ClusterConfig {
@@ -318,6 +318,109 @@ impl Cluster {
         status(&self.inner)
     }
 
+    /// Cluster gauges and counters in Prometheus text format.
+    pub fn prometheus(&self) -> String {
+        use std::fmt::Write;
+        let s = self.status();
+        let mut o = String::new();
+        let mut g = |name: &str, kind: &str, help: &str, v: f64| {
+            let _ = writeln!(o, "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {v}");
+        };
+        g(
+            "kosha_raft_term",
+            "gauge",
+            "Current Raft term.",
+            s.term as f64,
+        );
+        g(
+            "kosha_raft_is_leader",
+            "gauge",
+            "1 if this node is the Raft leader.",
+            (s.leader == Some(s.node_id)) as u8 as f64,
+        );
+        g(
+            "kosha_raft_has_leader",
+            "gauge",
+            "1 if this node knows a leader.",
+            s.leader.is_some() as u8 as f64,
+        );
+        g(
+            "kosha_raft_last_log_index",
+            "gauge",
+            "Last Raft log index on this node.",
+            s.last_log_index.unwrap_or(0) as f64,
+        );
+        g(
+            "kosha_raft_last_applied_index",
+            "gauge",
+            "Last log index applied to the state machine.",
+            s.last_applied.unwrap_or(0) as f64,
+        );
+        g(
+            "kosha_raft_snapshot_index",
+            "gauge",
+            "Log index of the latest snapshot.",
+            s.snapshot_index.unwrap_or(0) as f64,
+        );
+        g(
+            "kosha_cluster_voters",
+            "gauge",
+            "Voting members.",
+            s.nodes.iter().filter(|n| n.voter).count() as f64,
+        );
+        g(
+            "kosha_read_barriers_lease_total",
+            "counter",
+            "Read barriers served from the leader lease.",
+            s.lease_reads as f64,
+        );
+        g(
+            "kosha_read_barriers_quorum_total",
+            "counter",
+            "Read barriers that needed a quorum round-trip.",
+            s.quorum_reads as f64,
+        );
+        g(
+            "kosha_repair_rounds_total",
+            "counter",
+            "Background repair passes.",
+            s.repair.rounds as f64,
+        );
+        g(
+            "kosha_repair_replicas_restored_total",
+            "counter",
+            "Chunk replicas restored by repair.",
+            s.repair.repaired as f64,
+        );
+        g(
+            "kosha_repair_surplus_removed_total",
+            "counter",
+            "Surplus chunk replicas removed.",
+            s.repair.surplus_removed as f64,
+        );
+        g(
+            "kosha_repair_failures_total",
+            "counter",
+            "Chunks repair could not fix.",
+            s.repair.failed as f64,
+        );
+        if let Some(last) = s.last_log_index {
+            let _ = writeln!(
+                o,
+                "# HELP kosha_raft_follower_lag_entries Entries a follower is behind (leader only).\n# TYPE kosha_raft_follower_lag_entries gauge"
+            );
+            for n in s.nodes.iter().filter(|n| n.matched.is_some()) {
+                let _ = writeln!(
+                    o,
+                    "kosha_raft_follower_lag_entries{{node=\"{}\"}} {}",
+                    n.id,
+                    last.saturating_sub(n.matched.unwrap_or(0))
+                );
+            }
+        }
+        o
+    }
+
     /// Wait until some node is leader (useful at startup and in tests).
     pub async fn wait_for_leader(&self, timeout: Duration) -> Result<NodeId, ClusterError> {
         let m = self
@@ -500,7 +603,17 @@ impl Inner {
     /// batch is forwarded to the leader in one RPC, then the follower waits
     /// until it has applied the entry itself (read-your-writes).
     async fn propose_batch(&self, cmds: Vec<Command>) -> kosha_engine::Result<Vec<CommandResult>> {
-        let batch = CommandBatch(cmds);
+        // Ids are fixed before the first attempt: every retry below re-sends
+        // the same ids, so a batch the leader already committed is not
+        // applied twice.
+        let batch = CommandBatch(
+            cmds.into_iter()
+                .map(|cmd| kosha_engine::Request {
+                    id: Some(kosha_engine::RequestId::random()),
+                    cmd,
+                })
+                .collect(),
+        );
         let mut last = String::from("no leader");
         for attempt in 0..RETRIES {
             match self.raft.client_write(batch.clone()).await {

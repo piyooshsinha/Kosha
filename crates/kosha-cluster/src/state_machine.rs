@@ -6,7 +6,7 @@ use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use kosha_engine::{Command, Engine};
+use kosha_engine::{Engine, Request};
 use openraft::storage::{RaftStateMachine, Snapshot};
 use openraft::{EntryPayload, RaftSnapshotBuilder};
 use parking_lot::Mutex;
@@ -111,7 +111,7 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
         I::IntoIter: Send,
     {
         let mut state = self.state.lock().clone();
-        let mut cmds: Vec<Command> = Vec::new();
+        let mut cmds: Vec<Request> = Vec::new();
         // For each entry, the range of `cmds` it contributed.
         let mut slots: Vec<std::ops::Range<usize>> = Vec::new();
         for entry in entries {

@@ -53,6 +53,24 @@ Conditional writes (`If-None-Match: *`) are therefore checked *in log order*.
 If three nodes race to create the same key, exactly one wins. The cluster test
 `conflicting_conditional_writes_on_different_nodes` checks this.
 
+## Exactly-once writes
+
+Cluster writes can be retried. For example, a follower forwards a batch, the
+leader commits it, the reply is lost, and the follower sends it again. To
+make retries harmless, every command gets a 128-bit request id when its
+batch forms, and the id stays fixed across retries.
+
+- The state machine records each id's result in the `requests` table, in
+  the same transaction as the command.
+- A re-delivered id returns the remembered result and changes nothing.
+- The memory is a window of the most recent 100,000 ids, evicted in log
+  order, so every replica evicts identically. It is part of snapshots.
+- Remembered object results omit the chunk manifest to stay small.
+
+Tests: `requests_apply_at_most_once` (state machine) and
+`retried_batches_apply_exactly_once` (the same batch committed twice through
+Raft yields one bucket and two successes).
+
 ## Group commit
 
 Every metadata mutation must be durable before it is acknowledged, and
@@ -181,6 +199,24 @@ the membership change commits, rendezvous rankings no longer include the
 node, and background repair moves its share of chunks to the remaining
 nodes.
 
+## Chunk durability
+
+A chunk is written to a temp file and renamed into place. To survive power
+loss, both the file data and the rename (a directory change) must be durable
+before the metadata that references the chunk commits. `--sync` picks how:
+
+- **`group`** (default): write and rename without syncing, then wait for a
+  shared `syncfs(2)` of the chunk filesystem. Concurrent writers share one
+  call. A writer that arrives while a sync is running waits for the next
+  one, because its writes may postdate it. Measured: 1,335 chunk writes made
+  durable by 731 `syncfs` calls in one run.
+- **`file`**: fsync the file, rename, fsync the directory.
+- **`none`**: no syncs (metadata is still durable).
+
+Earlier versions fsynced the file but not the directory, so a rename could
+be lost on power failure while metadata already referenced the chunk. Both
+`group` and `file` close that gap.
+
 ## Garbage collection
 
 A chunk file may be deleted only when **all** of these hold:
@@ -242,13 +278,6 @@ O(entries returned) rather than O(keys under the prefix).
 
 ## Known limitations
 
-- **Retried forwarded writes are not deduplicated.** If a follower's
-  forwarding RPC fails *after* the leader committed the batch, the follower
-  retries and the commands apply twice. Most commands are idempotent on
-  replay (a re-applied `PutObject` with the same manifest is a no-op for
-  refcounts), but a replayed `CreateBucket` or conditional create would
-  report a spurious conflict to the client. Request ids for exactly-once
-  application are planned.
 - **Repair scans all chunk metadata every pass.** This is O(chunks) per
   node per interval. That is fine up to millions of chunks; beyond that it
   needs an incremental, membership-change-driven scan.
@@ -258,8 +287,9 @@ O(entries returned) rather than O(keys under the prefix).
   millions of objects. Very large namespaces need streaming snapshots.
 - **Internal traffic is not encrypted.** Use a private network until mTLS
   lands.
-- **Chunk files are fsynced one by one.** For 64 KiB–1 MiB objects that is
-  now the dominant write cost; batching chunk fsyncs is next.
+- **`--sync group` flushes the whole chunk filesystem.** Put the data
+  directory on a filesystem Kosha does not share with write-heavy neighbours,
+  or use `--sync file`.
 - A read racing with deletion of the same object can fail mid-stream.
 
 ## Roadmap
@@ -268,15 +298,15 @@ O(entries returned) rather than O(keys under the prefix).
 reads, background re-replication and rebalancing, node removal from the
 console and API, ListMultipartUploads pagination.
 
+Also done: exactly-once retried writes (request ids), group sync for chunk
+data, Prometheus metrics, object and bucket tagging, bucket CORS.
+
 **Next**
-- Request ids for exactly-once application of retried writes.
-- Batched chunk fsyncs (group commit for data, not just metadata).
 - mTLS between nodes.
 - Object versioning (manifests are immutable, so versions are cheap) and
   object lock (WORM).
 - Users, access keys and bucket policies stored in the replicated state machine.
-- Prometheus metrics. io_uring with registered buffers and `O_DIRECT` for
-  large chunks.
+- io_uring with registered buffers and `O_DIRECT` for large chunks.
 
 **Later**
 - Reed–Solomon erasure coding for cold chunks (for example 8+3), with
