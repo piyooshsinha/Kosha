@@ -40,7 +40,7 @@ pub use engine::{
     ChunkPlacement, Consensus, CopySource, Engine, EngineConfig, WriteStats, validate_bucket_name,
 };
 pub use error::{Error, Result};
-pub use io::{IoBackend, IoMode};
+pub use io::{DIRECT_STATS, DirectConfig, DirectStats, IoBackend, IoMode};
 pub use lifecycle::LifecycleReport;
 pub use meta::{Command, CommandOutput, CommandResult, Rejection, Request, RequestId};
 pub use rotation::RotationStatus;

@@ -506,6 +506,22 @@ resubmitted. More requests than ring slots wait in a backlog. `IoMode::Auto`
 probes the kernel for every opcode it needs and falls back to the blocking
 thread pool when io_uring is disabled.
 
+With a `DirectConfig` (`--io-direct`), each ring also owns a pool of 4 KiB-
+aligned buffers. The ring registers them with `IORING_REGISTER_BUFFERS` when
+the memlock limit allows, and uses them unregistered otherwise. A request for
+a file of at least `min_size` claims a buffer, then:
+
+- **Write:** `openat(O_DIRECT)`, copy the aligned prefix into the buffer, and
+  `WRITE_FIXED` it. Then clear `O_DIRECT` with `fcntl` and write the unaligned
+  tail through the page cache, followed by the usual fsync and close.
+- **Read:** `openat(O_DIRECT)` and `READ_FIXED` into the buffer in aligned
+  steps. A short read means end of file, and the data is copied out.
+
+`EINVAL` from the direct open (a filesystem without `O_DIRECT`) reopens
+buffered and disables direct I/O on that ring. With no free buffer, a request
+is served buffered. `DIRECT_STATS` counts direct reads, direct writes and
+fallbacks, and is exported as Prometheus counters.
+
 ## Metadata tables (redb)
 
 | Table | Key | Value |
@@ -566,10 +582,8 @@ rest with online key rotation. Event notifications to webhooks from the replicat
 A chunk-level cold tier on any S3-compatible service, with access-based
 tiering (demote unread objects, promote on read), and erasure coding of
 cold chunks in the background. Reed–Solomon erasure
-coding across nodes.
-
-**Next**
-- io_uring with registered buffers and `O_DIRECT` for large chunks.
+coding across nodes. Optional `O_DIRECT` with registered io_uring buffers for
+large chunk files.
 
 **Deliberately not built (yet)**
 

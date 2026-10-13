@@ -41,6 +41,9 @@ pub struct EngineConfig {
     pub io_mode: IoMode,
     /// Number of io_uring rings (each driven by its own thread).
     pub io_rings: usize,
+    /// Read and write large chunk files with O_DIRECT through registered,
+    /// aligned buffers (io_uring only). `None` keeps the page cache.
+    pub io_direct: Option<crate::io::DirectConfig>,
     /// Unreferenced chunk files younger than this are never deleted. Zero is
     /// safe on a single node; clusters need time for remote uploads to commit.
     pub gc_grace: Duration,
@@ -65,6 +68,7 @@ impl EngineConfig {
             min_part_size: 5 * 1024 * 1024,
             io_mode: IoMode::Auto,
             io_rings: cpus.min(8),
+            io_direct: None,
             gc_grace: Duration::ZERO,
             encryption: None,
         }
@@ -200,7 +204,7 @@ impl Engine {
             // Inline data would sit unencrypted in the metadata.
             cfg.inline_max = 0;
         }
-        let io = IoBackend::new(cfg.io_mode, cfg.io_rings)?;
+        let io = IoBackend::with_direct(cfg.io_mode, cfg.io_rings, cfg.io_direct)?;
         let store = ChunkStore::open(
             &cfg.data_dir.join("chunks"),
             StoreOptions {

@@ -788,6 +788,35 @@ ranged from 1.6× to 3.1× in io_uring's favour. With fewer rings than cores,
 page-cache reads can be *slower* than the thread pool, because they complete
 inline on the ring thread. That is why Kosha defaults to one ring per core.
 
+#### Direct I/O for large chunks (`--io-direct`)
+
+With `--io-direct`, chunk files of at least `--io-direct-min` bytes (default
+256 KiB) are written and read with `O_DIRECT`, bypassing the page cache. Each
+ring has a pool of 4 KiB-aligned buffers, registered with the kernel
+(`READ_FIXED`/`WRITE_FIXED`) when the locked-memory limit allows and used as
+plain aligned buffers otherwise. A write sends its aligned prefix directly and
+the unaligned tail through the page cache. If the filesystem refuses
+`O_DIRECT` (tmpfs, some overlay setups), the ring turns it off and carries on
+buffered. When every buffer is busy, a request goes through the page cache;
+`kosha_direct_fallbacks_total` counts these.
+
+On this VM (virtio disk, ext4) direct I/O is **not faster**. Per run, with
+1 MiB files and the page cache dropped before each pass (`COLD=1`, see
+`iobench`):
+
+| 1 MiB files | io_uring | io_uring + `--io-direct` |
+|---|---|---|
+| writes + fsync | 570–620 MB/s | 390–410 MB/s |
+| reads (cold cache) | 1.7–2.0 GB/s | 1.3–2.0 GB/s |
+| page cache left by 1.5 GB of writes and reads | 1.5 GB | 0.15 GB (from fallbacks) |
+
+What it buys is cache isolation. Large chunk traffic no longer evicts the
+metadata database and the small, hot chunks from memory, and the node's
+memory use does not grow with the data it streams. Turn it on for storage
+nodes on fast NVMe that move mostly large objects. Leave it off (the default)
+otherwise, in particular for workloads that re-read the same large objects,
+which the page cache would serve.
+
 Docker's default seccomp profile and `kernel.io_uring_disabled` block
 io_uring. `--io auto` (the default) detects this and falls back to threads;
 `/_kosha/stats` and the console report which backend is active.
@@ -809,6 +838,8 @@ io_uring. `--io auto` (the default) detects this and falls back to threads;
 | `--no-fsync` | `KOSHA_NO_FSYNC` | off | shorthand for `--sync none` (metadata commits stay durable) |
 | `--metrics-public` | `KOSHA_METRICS_PUBLIC` | off | serve `/_kosha/metrics` without authentication |
 | `--io` | `KOSHA_IO` | `auto` | `auto`, `uring` (required), or `threads` |
+| `--io-direct` | `KOSHA_IO_DIRECT` | off | `O_DIRECT` with registered buffers for large chunk files (io_uring only) |
+| `--io-direct-min` | `KOSHA_IO_DIRECT_MIN` | `262144` | smallest chunk file that uses `O_DIRECT` |
 | `--node-id` | `KOSHA_NODE_ID` | none | enables cluster mode |
 | `--cluster-listen` | `KOSHA_CLUSTER_LISTEN` | `127.0.0.1:9100` | internal Raft + replication port |
 | `--cluster-advertise` | `KOSHA_CLUSTER_ADVERTISE` | `--cluster-listen` | address peers dial |

@@ -238,6 +238,28 @@ async fn metrics_response(st: &AppState) -> S3Result<Response> {
         "Chunks stored in the cold tier.",
         s.cold_chunks,
     );
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let d = &kosha_engine::DIRECT_STATS;
+        counter(
+            &mut out,
+            "kosha_direct_reads_total",
+            "Chunk files read with O_DIRECT.",
+            d.reads.load(Relaxed),
+        );
+        counter(
+            &mut out,
+            "kosha_direct_writes_total",
+            "Chunk files written with O_DIRECT.",
+            d.writes.load(Relaxed),
+        );
+        counter(
+            &mut out,
+            "kosha_direct_fallbacks_total",
+            "Large chunk I/O that went through the page cache instead.",
+            d.fallbacks.load(Relaxed),
+        );
+    }
     let w = st.engine.write_stats();
     counter(
         &mut out,

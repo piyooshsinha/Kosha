@@ -8,7 +8,9 @@ use axum::serve::ListenerExt;
 use clap::Parser;
 use kosha_cluster::tls::{TlsFiles, TlsListener};
 use kosha_cluster::{Cluster, ClusterConfig};
-use kosha_engine::{ChunkKeys, Engine, EngineConfig, IoMode, SyncMode, read_key_file};
+use kosha_engine::{
+    ChunkKeys, DirectConfig, Engine, EngineConfig, IoMode, SyncMode, read_key_file,
+};
 use kosha_s3::{ClusterHooks, Credentials, S3Config};
 use tracing_subscriber::EnvFilter;
 
@@ -143,6 +145,15 @@ struct Args {
     #[arg(long, env = "KOSHA_IO", default_value = "auto")]
     io: IoMode,
 
+    /// Read and write large chunk files with O_DIRECT through registered,
+    /// aligned io_uring buffers, bypassing the page cache.
+    #[arg(long, env = "KOSHA_IO_DIRECT")]
+    io_direct: bool,
+
+    /// Chunk files at least this many bytes use O_DIRECT (with --io-direct).
+    #[arg(long, env = "KOSHA_IO_DIRECT_MIN", default_value_t = 256 * 1024)]
+    io_direct_min: usize,
+
     // ----------------------------------------------------------- cluster
     /// Enable cluster mode with this node id (unique, non-zero).
     #[arg(long, env = "KOSHA_NODE_ID")]
@@ -276,6 +287,12 @@ async fn main() -> anyhow::Result<()> {
         args.sync
     };
     cfg.io_mode = args.io;
+    if args.io_direct {
+        cfg.io_direct = Some(DirectConfig {
+            min_size: args.io_direct_min,
+            ..DirectConfig::default()
+        });
+    }
     if let Some(path) = &args.encryption_key_file {
         let read = |p: &PathBuf| {
             read_key_file(p).with_context(|| format!("loading encryption key {}", p.display()))
