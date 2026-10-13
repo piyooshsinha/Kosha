@@ -376,6 +376,68 @@ async fn bucket_config(ctx: &Ctx, bucket: &str, body: Body) -> S3Result<Option<R
             },
         }));
     }
+    if ctx.has("versioning") {
+        return Ok(Some(match *m {
+            Method::PUT => {
+                let v = crate::protection::parse_versioning(&read_text(ctx, body).await?)?;
+                engine
+                    .set_bucket_config(bucket, BucketConfigUpdate::Versioning(v))
+                    .await?;
+                StatusCode::OK.into_response()
+            }
+            _ => xml_response(crate::protection::render_versioning(
+                engine.bucket(bucket).await?.config.versioning,
+            )),
+        }));
+    }
+    if ctx.has("object-lock") {
+        return Ok(Some(match *m {
+            Method::PUT => {
+                let c = crate::protection::parse_lock_config(&read_text(ctx, body).await?)?;
+                engine
+                    .set_bucket_config(bucket, BucketConfigUpdate::ObjectLock(c))
+                    .await?;
+                StatusCode::OK.into_response()
+            }
+            _ => match engine.bucket(bucket).await?.config.object_lock {
+                Some(c) => xml_response(crate::protection::render_lock_config(&c)),
+                None => {
+                    return Err(S3Error::new(
+                        StatusCode::NOT_FOUND,
+                        "ObjectLockConfigurationNotFoundError",
+                        "Object Lock configuration does not exist for this bucket",
+                    ));
+                }
+            },
+        }));
+    }
+    if ctx.has("lifecycle") {
+        return Ok(Some(match *m {
+            Method::PUT => {
+                let rules = crate::protection::parse_lifecycle(&read_text(ctx, body).await?)?;
+                engine
+                    .set_bucket_config(bucket, BucketConfigUpdate::Lifecycle(Some(rules)))
+                    .await?;
+                StatusCode::OK.into_response()
+            }
+            Method::DELETE => {
+                engine
+                    .set_bucket_config(bucket, BucketConfigUpdate::Lifecycle(None))
+                    .await?;
+                StatusCode::NO_CONTENT.into_response()
+            }
+            _ => match engine.bucket(bucket).await?.config.lifecycle {
+                Some(rules) => xml_response(crate::protection::render_lifecycle(&rules)),
+                None => {
+                    return Err(S3Error::new(
+                        StatusCode::NOT_FOUND,
+                        "NoSuchLifecycleConfiguration",
+                        "The lifecycle configuration does not exist",
+                    ));
+                }
+            },
+        }));
+    }
     Ok(None)
 }
 
@@ -448,7 +510,10 @@ async fn route(ctx: &Ctx, body: Body) -> S3Result<Response> {
         },
         (Some(bucket), None) => {
             let bucket = bucket.as_str();
-            if ctx.has("tagging") || ctx.has("cors") {
+            if ["tagging", "cors", "versioning", "object-lock", "lifecycle"]
+                .iter()
+                .any(|s| ctx.has(s))
+            {
                 if let Some(resp) = bucket_config(ctx, bucket, body).await? {
                     return Ok(resp);
                 }
@@ -457,9 +522,7 @@ async fn route(ctx: &Ctx, body: Body) -> S3Result<Response> {
             match *m {
                 Method::PUT => {
                     for sub in [
-                        "versioning",
                         "policy",
-                        "lifecycle",
                         "acl",
                         "encryption",
                         "object-lock",
@@ -472,14 +535,17 @@ async fn route(ctx: &Ctx, body: Body) -> S3Result<Response> {
                             return Err(S3Error::not_implemented(&format!("PutBucket {sub}")));
                         }
                     }
-                    ctx.engine().create_bucket(bucket).await?;
+                    let lock = ctx
+                        .header("x-amz-bucket-object-lock-enabled")
+                        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+                    ctx.engine().create_bucket_with(bucket, lock).await?;
                     Ok(Response::builder()
                         .header(header::LOCATION, format!("/{bucket}"))
                         .body(Body::empty())
                         .unwrap())
                 }
                 Method::DELETE => {
-                    if ctx.has("policy") || ctx.has("lifecycle") || ctx.has("encryption") {
+                    if ctx.has("policy") || ctx.has("encryption") {
                         ctx.engine().bucket(bucket).await?;
                         return Ok(StatusCode::NO_CONTENT.into_response());
                     }
@@ -505,7 +571,10 @@ async fn route(ctx: &Ctx, body: Body) -> S3Result<Response> {
                 Method::PUT | Method::GET | Method::DELETE if ctx.has("tagging") => {
                     object_tagging(ctx, bucket, key, body).await
                 }
-                Method::PUT if ctx.has("acl") || ctx.has("retention") || ctx.has("legal-hold") => {
+                Method::PUT | Method::GET if ctx.has("retention") || ctx.has("legal-hold") => {
+                    object_lock_subresource(ctx, bucket, key, body).await
+                }
+                Method::PUT if ctx.has("acl") => {
                     Err(S3Error::not_implemented("object subresources"))
                 }
                 Method::PUT if ctx.headers.contains_key("x-amz-copy-source") => {
@@ -520,10 +589,7 @@ async fn route(ctx: &Ctx, body: Body) -> S3Result<Response> {
                         .await?;
                     Ok(StatusCode::NO_CONTENT.into_response())
                 }
-                Method::DELETE => {
-                    ctx.engine().delete_object(bucket, key).await?;
-                    Ok(StatusCode::NO_CONTENT.into_response())
-                }
+                Method::DELETE => delete_object(ctx, bucket, key).await,
                 Method::POST if ctx.has("uploads") => create_upload(ctx, bucket, key).await,
                 Method::POST if ctx.has("uploadId") => {
                     complete_upload(ctx, bucket, key, body).await
@@ -609,11 +675,8 @@ async fn get_bucket(ctx: &Ctx, bucket: &str) -> S3Result<Response> {
         }
         return Ok(xml_response(x.finish("LocationConstraint")));
     }
-    if ctx.has("versioning") {
-        ctx.engine().bucket(bucket).await?;
-        return Ok(xml_response(
-            Xml::new("VersioningConfiguration").finish("VersioningConfiguration"),
-        ));
+    if ctx.has("versions") {
+        return list_versions(ctx, bucket).await;
     }
     if ctx.has("uploads") {
         return list_uploads(ctx, bucket).await;
@@ -646,24 +709,6 @@ async fn get_bucket(ctx: &Ctx, bucket: &str) -> S3Result<Response> {
             "The bucket policy does not exist",
         ),
         (
-            "cors",
-            StatusCode::NOT_FOUND,
-            "NoSuchCORSConfiguration",
-            "The CORS configuration does not exist",
-        ),
-        (
-            "lifecycle",
-            StatusCode::NOT_FOUND,
-            "NoSuchLifecycleConfiguration",
-            "The lifecycle configuration does not exist",
-        ),
-        (
-            "tagging",
-            StatusCode::NOT_FOUND,
-            "NoSuchTagSet",
-            "The TagSet does not exist",
-        ),
-        (
             "website",
             StatusCode::NOT_FOUND,
             "NoSuchWebsiteConfiguration",
@@ -674,12 +719,6 @@ async fn get_bucket(ctx: &Ctx, bucket: &str) -> S3Result<Response> {
             StatusCode::NOT_FOUND,
             "ServerSideEncryptionConfigurationNotFoundError",
             "The server side encryption configuration was not found",
-        ),
-        (
-            "object-lock",
-            StatusCode::NOT_FOUND,
-            "ObjectLockConfigurationNotFoundError",
-            "Object Lock configuration does not exist for this bucket",
         ),
         (
             "replication",
@@ -693,9 +732,6 @@ async fn get_bucket(ctx: &Ctx, bucket: &str) -> S3Result<Response> {
             ctx.engine().bucket(bucket).await?;
             return Err(S3Error::new(status, code, msg));
         }
-    }
-    if ctx.has("versions") {
-        return Err(S3Error::not_implemented("ListObjectVersions"));
     }
     list_objects(ctx, bucket).await
 }
@@ -813,6 +849,8 @@ struct DeleteRequest {
 struct DeleteEntry {
     #[serde(rename = "Key")]
     key: String,
+    #[serde(rename = "VersionId")]
+    version_id: Option<String>,
 }
 
 async fn read_xml<T: for<'de> Deserialize<'de>>(ctx: &Ctx, body: Body) -> S3Result<T> {
@@ -836,12 +874,45 @@ async fn delete_objects(ctx: &Ctx, bucket: &str, body: Body) -> S3Result<Respons
             "at most 1000 keys can be deleted per request",
         ));
     }
-    let keys: Vec<String> = req.objects.into_iter().map(|o| o.key).collect();
-    ctx.engine().delete_objects(bucket, keys.clone()).await?;
+    let targets = req
+        .objects
+        .into_iter()
+        .map(|o| kosha_engine::DeleteTarget {
+            key: o.key,
+            version_id: o.version_id,
+        })
+        .collect();
+    let outcomes = ctx
+        .engine()
+        .delete_targets(
+            bucket,
+            targets,
+            crate::protection::bypass_governance(&ctx.headers),
+        )
+        .await?;
     let mut x = Xml::new("DeleteResult");
-    if !req.quiet {
-        for k in &keys {
-            x.open("Deleted").elem("Key", k).close("Deleted");
+    for o in &outcomes {
+        match &o.error {
+            Some(rej) => {
+                let e = S3Error::from(kosha_engine::Error::from(rej.clone()));
+                x.open("Error")
+                    .elem("Key", &o.key)
+                    .opt("VersionId", o.version_id.as_deref())
+                    .elem("Code", e.code)
+                    .elem("Message", &e.message)
+                    .close("Error");
+            }
+            None if !req.quiet => {
+                x.open("Deleted").elem("Key", &o.key);
+                if o.delete_marker {
+                    x.elem("DeleteMarker", "true");
+                    x.opt("DeleteMarkerVersionId", o.version_id.as_deref());
+                } else {
+                    x.opt("VersionId", o.version_id.as_deref());
+                }
+                x.close("Deleted");
+            }
+            None => {}
         }
     }
     Ok(xml_response(x.finish("DeleteResult")))
@@ -995,29 +1066,204 @@ async fn ingest(ctx: &Ctx, body: Body) -> S3Result<kosha_engine::WrittenData> {
 async fn put_object(ctx: &Ctx, bucket: &str, key: &str, body: Body) -> S3Result<Response> {
     // Fail fast before reading a potentially large body.
     ctx.engine().bucket(bucket).await?;
+    let lock = crate::protection::lock_from_headers(&ctx.headers)?;
+    let attrs = attrs_with_tags(&ctx.headers)?;
     let data = ingest(ctx, body).await?;
     let meta = ctx
         .engine()
-        .put_object(
-            bucket,
-            key,
-            data,
-            attrs_with_tags(&ctx.headers)?,
-            write_condition(ctx),
-        )
+        .put_object_locked(bucket, key, data, attrs, write_condition(ctx), lock)
         .await?;
-    Ok(Response::builder()
+    let resp = Response::builder()
         .header(header::ETAG, quoted(&meta.etag))
         .body(Body::empty())
-        .unwrap())
+        .unwrap();
+    Ok(with_version(resp, meta.version_id.as_deref()))
 }
 
-fn parse_copy_source(v: &str) -> S3Result<(String, String)> {
-    let v = v.split_once("?versionId=").map(|(s, _)| s).unwrap_or(v);
+/// The `versionId` query parameter, if any.
+fn version_param(ctx: &Ctx) -> Option<String> {
+    ctx.q("versionId")
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+/// Add `x-amz-version-id` when the object lives in a versioned bucket.
+fn with_version(mut resp: Response, version_id: Option<&str>) -> Response {
+    if let Some(v) = version_id.and_then(|v| HeaderValue::from_str(v).ok()) {
+        resp.headers_mut().insert("x-amz-version-id", v);
+    }
+    resp
+}
+
+/// The object a GET/HEAD-style request addresses: a specific version, or
+/// the latest. A delete marker answers like S3: 405 for an explicit version,
+/// 404 with `x-amz-delete-marker` for the latest.
+async fn resolve_object(ctx: &Ctx, bucket: &str, key: &str) -> S3Result<ObjectMeta> {
+    match version_param(ctx) {
+        Some(v) => {
+            let info = ctx.engine().head_version(bucket, key, &v).await?;
+            match info.meta {
+                Some(m) => Ok(m),
+                None => {
+                    let mut e = S3Error::new(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "MethodNotAllowed",
+                        "The specified method is not allowed against this resource.",
+                    );
+                    e.headers.push(("x-amz-delete-marker", "true".into()));
+                    e.headers.push(("x-amz-version-id", info.version_id));
+                    Err(e)
+                }
+            }
+        }
+        None => match ctx.engine().head_object(bucket, key).await {
+            Ok(m) => Ok(m),
+            Err(kosha_engine::Error::NoSuchKey) => {
+                let mut e = S3Error::from(kosha_engine::Error::NoSuchKey);
+                if let Ok(Some(marker)) = ctx.engine().latest_delete_marker(bucket, key).await {
+                    e.headers.push(("x-amz-delete-marker", "true".into()));
+                    e.headers.push(("x-amz-version-id", marker));
+                }
+                Err(e)
+            }
+            Err(e) => Err(e.into()),
+        },
+    }
+}
+
+/// DELETE on an object: with `versionId`, permanently remove that version;
+/// otherwise delete (or add a delete marker in a versioned bucket).
+async fn delete_object(ctx: &Ctx, bucket: &str, key: &str) -> S3Result<Response> {
+    let target = kosha_engine::DeleteTarget {
+        key: key.into(),
+        version_id: version_param(ctx),
+    };
+    let mut outcomes = ctx
+        .engine()
+        .delete_targets(
+            bucket,
+            vec![target],
+            crate::protection::bypass_governance(&ctx.headers),
+        )
+        .await?;
+    let o = outcomes.pop().unwrap_or_default();
+    if let Some(rej) = o.error {
+        return Err(kosha_engine::Error::from(rej).into());
+    }
+    let mut resp = with_version(
+        StatusCode::NO_CONTENT.into_response(),
+        o.version_id.as_deref(),
+    );
+    if o.delete_marker {
+        resp.headers_mut()
+            .insert("x-amz-delete-marker", HeaderValue::from_static("true"));
+    }
+    Ok(resp)
+}
+
+/// GET/PUT ?retention and ?legal-hold.
+async fn object_lock_subresource(
+    ctx: &Ctx,
+    bucket: &str,
+    key: &str,
+    body: Body,
+) -> S3Result<Response> {
+    use crate::protection::*;
+    let engine = ctx.engine();
+    let retention = ctx.has("retention");
+    if ctx.method == Method::GET {
+        let meta = resolve_object(ctx, bucket, key).await?;
+        if retention {
+            return match &meta.lock.retention {
+                Some(r) => Ok(xml_response(render_retention(r))),
+                None => Err(S3Error::new(
+                    StatusCode::NOT_FOUND,
+                    "NoSuchObjectLockConfiguration",
+                    "The specified object does not have a ObjectLock configuration",
+                )),
+            };
+        }
+        return Ok(xml_response(render_legal_hold(meta.lock.legal_hold)));
+    }
+    let text = read_text(ctx, body).await?;
+    let m = if retention {
+        engine
+            .set_object_lock(
+                bucket,
+                key,
+                version_param(ctx),
+                Some(parse_retention(&text)?),
+                None,
+                bypass_governance(&ctx.headers),
+            )
+            .await?
+    } else {
+        engine
+            .set_object_lock(
+                bucket,
+                key,
+                version_param(ctx),
+                None,
+                Some(parse_legal_hold(&text)?),
+                false,
+            )
+            .await?
+    };
+    Ok(with_version(
+        StatusCode::OK.into_response(),
+        m.version_id.as_deref(),
+    ))
+}
+
+async fn list_versions(ctx: &Ctx, bucket: &str) -> S3Result<Response> {
+    let max = match ctx.q("max-keys") {
+        Some(v) => v
+            .parse::<usize>()
+            .map_err(|_| S3Error::invalid_argument("max-keys must be a non-negative integer"))?
+            .min(MAX_KEYS),
+        None => MAX_KEYS,
+    };
+    let prefix = ctx.q("prefix").unwrap_or_default();
+    let delimiter = ctx.q("delimiter").filter(|d| !d.is_empty());
+    let key_marker = ctx.q("key-marker").unwrap_or_default();
+    let version_marker = ctx.q("version-id-marker").unwrap_or_default();
+    let page = ctx
+        .engine()
+        .list_versions(
+            bucket,
+            kosha_engine::VersionListQuery {
+                prefix: prefix.into(),
+                delimiter: delimiter.map(str::to_string),
+                key_marker: (!key_marker.is_empty()).then(|| key_marker.to_string()),
+                version_marker: (!version_marker.is_empty()).then(|| version_marker.to_string()),
+                max_keys: max,
+            },
+        )
+        .await?;
+    Ok(xml_response(crate::protection::render_versions(
+        bucket,
+        prefix,
+        delimiter,
+        key_marker,
+        version_marker,
+        max,
+        &page,
+        OWNER_ID,
+    )))
+}
+
+/// `bucket/key[?versionId=...]`, URL-encoded, optional leading slash.
+fn parse_copy_source_version(v: &str) -> S3Result<(String, String, Option<String>)> {
+    let (v, version) = match v.split_once("?versionId=") {
+        Some((s, ver)) => (s, Some(decode_path(ver)).filter(|x| !x.is_empty())),
+        None => (v, None),
+    };
     let decoded = decode_path(v);
     let decoded = decoded.strip_prefix('/').unwrap_or(&decoded);
     match decoded.split_once('/') {
-        Some((b, k)) if !b.is_empty() && !k.is_empty() => Ok((b.to_string(), k.to_string())),
+        Some((b, k)) if !b.is_empty() && !k.is_empty() => {
+            Ok((b.to_string(), k.to_string(), version))
+        }
         _ => Err(S3Error::invalid_argument(
             "x-amz-copy-source must be bucket/key",
         )),
@@ -1025,17 +1271,27 @@ fn parse_copy_source(v: &str) -> S3Result<(String, String)> {
 }
 
 async fn copy_object(ctx: &Ctx, bucket: &str, key: &str) -> S3Result<Response> {
-    let (sb, sk) = parse_copy_source(ctx.header("x-amz-copy-source").unwrap_or_default())?;
+    let (sb, sk, sv) =
+        parse_copy_source_version(ctx.header("x-amz-copy-source").unwrap_or_default())?;
     let replace = ctx
         .header("x-amz-metadata-directive")
         .is_some_and(|d| d.eq_ignore_ascii_case("REPLACE"));
-    if sb == bucket && sk == key && !replace {
+    if sb == bucket && sk == key && sv.is_none() && !replace {
         return Err(S3Error::invalid_request(
             "This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata.",
         ));
     }
-    let src = ctx.engine().head_object(&sb, &sk).await?;
+    let src = match &sv {
+        Some(v) => ctx
+            .engine()
+            .head_version(&sb, &sk, v)
+            .await?
+            .meta
+            .ok_or_else(|| S3Error::invalid_request("The source of a copy request may not specifically refer to a delete marker by version id."))?,
+        None => ctx.engine().head_object(&sb, &sk).await?,
+    };
     check_copy_conditions(ctx, &src)?;
+    let lock = crate::protection::lock_from_headers(&ctx.headers)?;
     let replace_tags = ctx
         .header("x-amz-tagging-directive")
         .is_some_and(|d| d.eq_ignore_ascii_case("REPLACE"));
@@ -1051,12 +1307,34 @@ async fn copy_object(ctx: &Ctx, bucket: &str, key: &str) -> S3Result<Response> {
     };
     let meta = ctx
         .engine()
-        .copy_object(&sb, &sk, bucket, key, Some(attrs), write_condition(ctx))
+        .copy_object_with(
+            kosha_engine::CopySource {
+                bucket: sb,
+                key: sk,
+                version_id: sv,
+            },
+            bucket,
+            key,
+            Some(attrs),
+            write_condition(ctx),
+            lock,
+        )
         .await?;
     let mut x = Xml::new("CopyObjectResult");
     x.elem("LastModified", iso8601(&meta.last_modified))
         .elem("ETag", quoted(&meta.etag));
-    Ok(xml_response(x.finish("CopyObjectResult")))
+    let mut resp = with_version(
+        xml_response(x.finish("CopyObjectResult")),
+        meta.version_id.as_deref(),
+    );
+    if let Some(v) = src
+        .version_id
+        .as_deref()
+        .and_then(|v| HeaderValue::from_str(v).ok())
+    {
+        resp.headers_mut().insert("x-amz-copy-source-version-id", v);
+    }
+    Ok(resp)
 }
 
 fn check_copy_conditions(ctx: &Ctx, src: &ObjectMeta) -> S3Result<()> {
@@ -1147,7 +1425,7 @@ fn parse_range(v: &str, size: u64) -> S3Result<Option<(u64, u64)>> {
 }
 
 async fn get_object(ctx: &Ctx, bucket: &str, key: &str) -> S3Result<Response> {
-    let meta = ctx.engine().head_object(bucket, key).await?;
+    let meta = resolve_object(ctx, bucket, key).await?;
 
     // Conditional requests (RFC 7232 precedence).
     if let Some(m) = ctx.header("if-match") {
@@ -1171,6 +1449,12 @@ async fn get_object(ctx: &Ctx, bucket: &str, key: &str) -> S3Result<Response> {
         .header(header::ETAG, quoted(&meta.etag))
         .header(header::LAST_MODIFIED, http_date(&meta.last_modified))
         .header(header::ACCEPT_RANGES, "bytes");
+    if let Some(v) = &meta.version_id {
+        b = b.header("x-amz-version-id", v);
+    }
+    for (k, v) in crate::protection::lock_headers(&meta.lock) {
+        b = b.header(k, v);
+    }
     if not_modified {
         return Ok(b
             .status(StatusCode::NOT_MODIFIED)
@@ -1228,7 +1512,10 @@ async fn get_object(ctx: &Ctx, bucket: &str, key: &str) -> S3Result<Response> {
 async fn create_upload(ctx: &Ctx, bucket: &str, key: &str) -> S3Result<Response> {
     let info = ctx
         .engine()
-        .create_upload(bucket, key, attrs_with_tags(&ctx.headers)?)
+        .create_upload_with(bucket, key, attrs_with_tags(&ctx.headers)?, {
+            let lock = crate::protection::lock_from_headers(&ctx.headers)?;
+            (lock != kosha_engine::ObjectLockState::default()).then_some(lock)
+        })
         .await?;
     let mut x = Xml::new("InitiateMultipartUploadResult");
     x.elem("Bucket", bucket)
@@ -1275,8 +1562,16 @@ async fn upload_part_copy(
     n: u32,
     src: &str,
 ) -> S3Result<Response> {
-    let (sb, sk) = parse_copy_source(src)?;
-    let meta = ctx.engine().head_object(&sb, &sk).await?;
+    let (sb, sk, sv) = parse_copy_source_version(src)?;
+    let meta = match &sv {
+        Some(v) => ctx
+            .engine()
+            .head_version(&sb, &sk, v)
+            .await?
+            .meta
+            .ok_or_else(|| S3Error::invalid_request("The source of a copy request may not specifically refer to a delete marker by version id."))?,
+        None => ctx.engine().head_object(&sb, &sk).await?,
+    };
     check_copy_conditions(ctx, &meta)?;
     let (start, end) = match ctx.header("x-amz-copy-source-range") {
         Some(r) => parse_range(r, meta.size)?
@@ -1329,7 +1624,10 @@ async fn complete_upload(ctx: &Ctx, bucket: &str, key: &str, body: Body) -> S3Re
         .elem("Bucket", bucket)
         .elem("Key", key)
         .elem("ETag", quoted(&meta.etag));
-    Ok(xml_response(x.finish("CompleteMultipartUploadResult")))
+    Ok(with_version(
+        xml_response(x.finish("CompleteMultipartUploadResult")),
+        meta.version_id.as_deref(),
+    ))
 }
 
 async fn list_parts(ctx: &Ctx, bucket: &str, key: &str) -> S3Result<Response> {
@@ -1398,9 +1696,13 @@ mod tests {
     #[test]
     fn copy_source() {
         assert_eq!(
-            parse_copy_source("/bkt/a%20b/c.txt?versionId=x").unwrap(),
-            ("bkt".into(), "a b/c.txt".into())
+            parse_copy_source_version("/bkt/a%20b/c.txt?versionId=x").unwrap(),
+            ("bkt".into(), "a b/c.txt".into(), Some("x".into()))
         );
-        assert!(parse_copy_source("bkt").is_err());
+        assert_eq!(
+            parse_copy_source_version("bkt/k").unwrap(),
+            ("bkt".into(), "k".into(), None)
+        );
+        assert!(parse_copy_source_version("bkt").is_err());
     }
 }

@@ -27,21 +27,24 @@ use crate::error::{Error, Result};
 use crate::keys;
 use crate::types::*;
 
-const BUCKETS: TableDefinition<&str, &[u8]> = TableDefinition::new("buckets");
-const OBJECTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("objects");
+pub(crate) const BUCKETS: TableDefinition<&str, &[u8]> = TableDefinition::new("buckets");
+pub(crate) const OBJECTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("objects");
 const CHUNKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("chunks");
 const UPLOADS: TableDefinition<&str, &[u8]> = TableDefinition::new("uploads");
 const UPLOAD_INDEX: TableDefinition<&[u8], &str> = TableDefinition::new("upload_index");
 const PARTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("parts");
-const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+pub(crate) const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 /// Request id -> remembered result (exactly-once application of retries).
 const REQUESTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("requests");
 /// Sequence number (BE u64) -> request id, for evicting the oldest ids.
 const REQUEST_SEQ: TableDefinition<&[u8], &[u8]> = TableDefinition::new("request_seq");
 
+/// Every version of every key in versioned buckets (see `versions.rs`).
+pub(crate) const VERSIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("versions");
+
 /// Byte-keyed tables included in snapshots generically. New tables only need
 /// to be listed here.
-const BYTE_TABLES: &[TableDefinition<&[u8], &[u8]>] = &[REQUESTS, REQUEST_SEQ];
+const BYTE_TABLES: &[TableDefinition<&[u8], &[u8]>] = &[REQUESTS, REQUEST_SEQ, VERSIONS];
 
 /// How many request ids are remembered for deduplication.
 const REMEMBERED_REQUESTS: u64 = 100_000;
@@ -71,11 +74,17 @@ pub enum Command {
     },
     DeleteObjects {
         bucket: String,
-        keys: Vec<String>,
+        targets: Vec<DeleteTarget>,
+        bypass_governance: bool,
+        now: DateTime<Utc>,
     },
     CopyObject {
         src_bucket: String,
         src_key: String,
+        #[serde(default)]
+        src_version: Option<String>,
+        #[serde(default)]
+        lock: ObjectLockState,
         dst_bucket: String,
         dst_key: String,
         attrs: Option<ObjectAttrs>,
@@ -114,7 +123,20 @@ pub enum Command {
     SetObjectTags {
         bucket: String,
         key: String,
+        #[serde(default)]
+        version_id: Option<String>,
         tags: BTreeMap<String, String>,
+    },
+    /// PutObjectRetention / PutObjectLegalHold.
+    SetObjectLock {
+        bucket: String,
+        key: String,
+        version_id: Option<String>,
+        /// `Some(None)` removes retention.
+        retention: Option<Option<Retention>>,
+        legal_hold: Option<bool>,
+        bypass_governance: bool,
+        now: DateTime<Utc>,
     },
 }
 
@@ -146,7 +168,7 @@ impl From<Command> for Request {
 pub enum CommandOutput {
     Done,
     Object(ObjectMeta),
-    Deleted(Vec<bool>),
+    Deleted(Vec<DeleteOutcome>),
 }
 
 /// A command rejected by a precondition. Deterministic, so it is part of
@@ -162,6 +184,11 @@ pub enum Rejection {
     InvalidPartOrder,
     EntityTooSmall,
     PreconditionFailed,
+    NoSuchVersion,
+    InvalidRequest(String),
+    InvalidBucketState(String),
+    AccessDenied(String),
+    MethodNotAllowed(String),
 }
 
 impl From<Rejection> for Error {
@@ -176,6 +203,11 @@ impl From<Rejection> for Error {
             Rejection::InvalidPartOrder => Error::InvalidPartOrder,
             Rejection::EntityTooSmall => Error::EntityTooSmall,
             Rejection::PreconditionFailed => Error::PreconditionFailed,
+            Rejection::NoSuchVersion => Error::NoSuchVersion,
+            Rejection::InvalidRequest(m) => Error::InvalidRequest(m),
+            Rejection::InvalidBucketState(m) => Error::InvalidBucketState(m),
+            Rejection::AccessDenied(m) => Error::AccessDenied(m),
+            Rejection::MethodNotAllowed(m) => Error::MethodNotAllowed(m),
         }
     }
 }
@@ -183,7 +215,7 @@ impl From<Rejection> for Error {
 pub type CommandResult = std::result::Result<CommandOutput, Rejection>;
 
 /// Internal: either a precondition rejection or a real storage failure.
-enum Fail {
+pub(crate) enum Fail {
     Reject(Rejection),
     Fatal(Error),
 }
@@ -194,9 +226,9 @@ impl<E: Into<Error>> From<E> for Fail {
     }
 }
 
-type Step<T> = std::result::Result<T, Fail>;
+pub(crate) type Step<T> = std::result::Result<T, Fail>;
 
-fn reject<T>(r: Rejection) -> Step<T> {
+pub(crate) fn reject<T>(r: Rejection) -> Step<T> {
     Err(Fail::Reject(r))
 }
 
@@ -232,10 +264,10 @@ fn check_condition(current: Option<&ObjectMeta>, cond: &WriteCondition) -> Step<
 }
 
 /// Mutation context for one metadata transaction.
-struct Tx<'a> {
-    txn: &'a WriteTransaction,
-    stats: Stats,
-    freed: Vec<ChunkId>,
+pub(crate) struct Tx<'a> {
+    pub(crate) txn: &'a WriteTransaction,
+    pub(crate) stats: Stats,
+    pub(crate) freed: Vec<ChunkId>,
 }
 
 impl Tx<'_> {
@@ -292,7 +324,11 @@ impl Tx<'_> {
         }
     }
 
-    fn add_refs(&mut self, segments: &[Segment], stored: &HashMap<ChunkId, u64>) -> Result<()> {
+    pub(crate) fn add_refs(
+        &mut self,
+        segments: &[Segment],
+        stored: &HashMap<ChunkId, u64>,
+    ) -> Result<()> {
         let mut chunks = self.txn.open_table(CHUNKS)?;
         for seg in segments {
             let Segment::Chunk { id, len } = seg else {
@@ -326,7 +362,7 @@ impl Tx<'_> {
         Ok(())
     }
 
-    fn drop_refs(&mut self, segments: &[Segment]) -> Result<()> {
+    pub(crate) fn drop_refs(&mut self, segments: &[Segment]) -> Result<()> {
         let mut chunks = self.txn.open_table(CHUNKS)?;
         for seg in segments {
             let Segment::Chunk { id, .. } = seg else {
@@ -351,14 +387,14 @@ impl Tx<'_> {
         Ok(())
     }
 
-    fn get_object(&self, bucket: &str, key: &str) -> Result<Option<ObjectMeta>> {
+    pub(crate) fn get_object(&self, bucket: &str, key: &str) -> Result<Option<ObjectMeta>> {
         let t = self.txn.open_table(OBJECTS)?;
         let v = t.get(keys::object_key(bucket, key).as_slice())?;
         v.map(|v| dec(v.value())).transpose()
     }
 
     /// Insert or replace an object whose chunk references have already been added.
-    fn put_object(&mut self, bucket: &str, key: &str, meta: &ObjectMeta) -> Result<()> {
+    pub(crate) fn put_object(&mut self, bucket: &str, key: &str, meta: &ObjectMeta) -> Result<()> {
         let mut t = self.txn.open_table(OBJECTS)?;
         let k = keys::object_key(bucket, key);
         let old = t
@@ -376,7 +412,7 @@ impl Tx<'_> {
         Ok(())
     }
 
-    fn delete_object(&mut self, bucket: &str, key: &str) -> Result<bool> {
+    pub(crate) fn delete_object(&mut self, bucket: &str, key: &str) -> Result<bool> {
         let mut t = self.txn.open_table(OBJECTS)?;
         let old = t
             .remove(keys::object_key(bucket, key).as_slice())?
@@ -449,13 +485,19 @@ impl Tx<'_> {
             Command::DeleteBucket { name } => {
                 self.require_bucket(&name)?;
                 let (s, e) = keys::bucket_range(&name);
-                if self
+                let has_objects = self
                     .txn
                     .open_table(OBJECTS)?
                     .range(s.as_slice()..e.as_slice())?
                     .next()
-                    .is_some()
-                {
+                    .is_some();
+                let has_versions = self
+                    .txn
+                    .open_table(VERSIONS)?
+                    .range(s.as_slice()..e.as_slice())?
+                    .next()
+                    .is_some();
+                if has_objects || has_versions {
                     return reject(Rejection::BucketNotEmpty);
                 }
                 // Abandon in-progress multipart uploads along with the bucket.
@@ -487,42 +529,96 @@ impl Tx<'_> {
                 stored,
                 cond,
             } => {
-                self.require_bucket(&bucket)?;
+                let info = self.bucket_info(&bucket)?;
                 check_condition(self.get_object(&bucket, &key)?.as_ref(), &cond)?;
+                if info.config.object_lock.is_none() && meta.lock != ObjectLockState::default() {
+                    return reject(Rejection::InvalidRequest(
+                        "Object Lock headers require a bucket with Object Lock enabled".into(),
+                    ));
+                }
                 self.add_refs(&meta.segments, &stored.into_iter().collect())?;
-                self.put_object(&bucket, &key, &meta)?;
+                let meta = self.write_object(&info, &key, meta)?;
                 Ok(CommandOutput::Object(meta))
             }
-            Command::DeleteObjects { bucket, keys } => {
-                self.require_bucket(&bucket)?;
-                let existed = keys
-                    .iter()
-                    .map(|k| self.delete_object(&bucket, k))
-                    .collect::<Result<Vec<_>>>()?;
-                Ok(CommandOutput::Deleted(existed))
+            Command::DeleteObjects {
+                bucket,
+                targets,
+                bypass_governance,
+                now,
+            } => {
+                let info = self.bucket_info(&bucket)?;
+                let mut outcomes = Vec::with_capacity(targets.len());
+                for t in targets {
+                    let outcome = match &t.version_id {
+                        None => self.delete_current(&info, &t.key, now)?,
+                        Some(v) => {
+                            match self.delete_version(&info, &t.key, v, bypass_governance, now) {
+                                Ok(o) => o,
+                                Err(Fail::Reject(r)) => DeleteOutcome {
+                                    key: t.key.clone(),
+                                    version_id: Some(v.clone()),
+                                    error: Some(r),
+                                    ..Default::default()
+                                },
+                                Err(Fail::Fatal(e)) => return Err(Fail::Fatal(e)),
+                            }
+                        }
+                    };
+                    outcomes.push(outcome);
+                }
+                Ok(CommandOutput::Deleted(outcomes))
             }
             Command::CopyObject {
                 src_bucket,
                 src_key,
+                src_version,
+                lock,
                 dst_bucket,
                 dst_key,
                 attrs,
                 now,
                 cond,
             } => {
-                self.require_bucket(&src_bucket)?;
-                self.require_bucket(&dst_bucket)?;
-                let Some(src) = self.get_object(&src_bucket, &src_key)? else {
+                let src_info = self.bucket_info(&src_bucket)?;
+                let dst_info = self.bucket_info(&dst_bucket)?;
+                let src = match &src_version {
+                    None => self.get_object(&src_bucket, &src_key)?,
+                    Some(v) if src_info.config.versioning == Versioning::Unversioned => {
+                        if v != crate::versions::NULL_VERSION {
+                            return reject(Rejection::NoSuchVersion);
+                        }
+                        self.get_object(&src_bucket, &src_key)?
+                    }
+                    Some(v) => match self.find_version(&src_bucket, &src_key, v)? {
+                        Some((_, sv)) => match sv.meta {
+                            Some(m) => Some(m),
+                            None => {
+                                return reject(Rejection::InvalidRequest(
+                                    "the source version is a delete marker".into(),
+                                ));
+                            }
+                        },
+                        None => return reject(Rejection::NoSuchVersion),
+                    },
+                };
+                let Some(src) = src else {
                     return reject(Rejection::NoSuchKey);
                 };
                 check_condition(self.get_object(&dst_bucket, &dst_key)?.as_ref(), &cond)?;
+                if dst_info.config.object_lock.is_none() && lock != ObjectLockState::default() {
+                    return reject(Rejection::InvalidRequest(
+                        "Object Lock headers require a bucket with Object Lock enabled".into(),
+                    ));
+                }
                 let meta = ObjectMeta {
                     last_modified: now,
                     attrs: attrs.unwrap_or_else(|| src.attrs.clone()),
+                    version_id: None,
+                    lock,
                     ..src
                 };
                 self.add_refs(&meta.segments, &HashMap::new())?;
-                self.put_object(&dst_bucket, &dst_key, &meta)?;
+                let meta = self.write_object(&dst_info, &dst_key, meta)?;
                 Ok(CommandOutput::Object(meta))
             }
             Command::CreateUpload { info } => {
@@ -608,16 +704,19 @@ impl Tx<'_> {
                 }
                 check_condition(self.get_object(&bucket, &key)?.as_ref(), &cond)?;
 
+                let bucket_info = self.bucket_info(&bucket)?;
                 let meta = ObjectMeta {
                     size,
                     etag: format!("{}-{}", hex::encode(md5s.finalize()), requested.len()),
                     last_modified: now,
                     attrs: info.attrs.clone(),
                     segments,
+                    version_id: None,
+                    lock: info.lock.clone().unwrap_or_default(),
                 };
                 // Reference the chunks from the object before the parts release them.
                 self.add_refs(&meta.segments, &HashMap::new())?;
-                self.put_object(&bucket, &key, &meta)?;
+                let meta = self.write_object(&bucket_info, &key, meta)?;
                 self.remove_upload(&info)?;
                 Ok(CommandOutput::Object(meta))
             }
@@ -631,28 +730,78 @@ impl Tx<'_> {
                 Ok(CommandOutput::Done)
             }
             Command::SetBucketConfig { bucket, update } => {
-                let mut t = self.txn.open_table(BUCKETS)?;
+                let t = self.txn.open_table(BUCKETS)?;
                 let mut info: BucketInfo = match t.get(bucket.as_str())? {
                     Some(v) => dec(v.value())?,
                     None => return reject(Rejection::NoSuchBucket),
                 };
+                drop(t);
                 match update {
                     BucketConfigUpdate::Tags(tags) => info.config.tags = tags,
                     BucketConfigUpdate::Cors(cors) => info.config.cors = cors,
+                    BucketConfigUpdate::Lifecycle(rules) => info.config.lifecycle = rules,
+                    BucketConfigUpdate::Versioning(v) => {
+                        if v == Versioning::Unversioned {
+                            return reject(Rejection::InvalidRequest(
+                                "versioning can only be Enabled or Suspended".into(),
+                            ));
+                        }
+                        if v == Versioning::Suspended && info.config.object_lock.is_some() {
+                            return reject(Rejection::InvalidBucketState(
+                                "An Object Lock configuration is present on this bucket, so the versioning state cannot be changed.".into(),
+                            ));
+                        }
+                        if info.config.versioning == Versioning::Unversioned {
+                            self.migrate_to_versioned(&bucket)?;
+                        }
+                        info.config.versioning = v;
+                    }
+                    BucketConfigUpdate::ObjectLock(cfg) => {
+                        if info.config.versioning != Versioning::Enabled {
+                            return reject(Rejection::InvalidBucketState(
+                                "Versioning must be 'Enabled' on the bucket to apply a Object Lock configuration".into(),
+                            ));
+                        }
+                        info.config.object_lock = Some(cfg);
+                    }
                 }
-                t.insert(bucket.as_str(), enc(&info)?.as_slice())?;
+                self.txn
+                    .open_table(BUCKETS)?
+                    .insert(bucket.as_str(), enc(&info)?.as_slice())?;
                 Ok(CommandOutput::Done)
             }
-            Command::SetObjectTags { bucket, key, tags } => {
-                self.require_bucket(&bucket)?;
-                let Some(mut meta) = self.get_object(&bucket, &key)? else {
-                    return reject(Rejection::NoSuchKey);
-                };
-                meta.attrs.tags = tags;
+            Command::SetObjectTags {
+                bucket,
+                key,
+                version_id,
+                tags,
+            } => {
+                let info = self.bucket_info(&bucket)?;
                 // Same manifest, so chunk references are unchanged.
-                self.txn.open_table(OBJECTS)?.insert(
-                    keys::object_key(&bucket, &key).as_slice(),
-                    enc(&meta)?.as_slice(),
+                let meta = self.update_version(&info, &key, version_id.as_deref(), |m| {
+                    m.attrs.tags = tags;
+                    Ok(())
+                })?;
+                Ok(CommandOutput::Object(meta))
+            }
+            Command::SetObjectLock {
+                bucket,
+                key,
+                version_id,
+                retention,
+                legal_hold,
+                bypass_governance,
+                now,
+            } => {
+                let info = self.bucket_info(&bucket)?;
+                let meta = self.set_lock(
+                    &info,
+                    &key,
+                    version_id.as_deref(),
+                    retention,
+                    legal_hold,
+                    bypass_governance,
+                    now,
                 )?;
                 Ok(CommandOutput::Object(meta))
             }
@@ -679,7 +828,7 @@ struct SnapshotData {
 }
 
 pub struct MetaStore {
-    db: Database,
+    pub(crate) db: Database,
 }
 
 /// What one applied batch produced.

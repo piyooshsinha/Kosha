@@ -11,6 +11,8 @@ pub struct S3Error {
     pub message: String,
     pub resource: Option<String>,
     pub request_id: Option<String>,
+    /// Extra response headers (e.g. `x-amz-delete-marker`).
+    pub headers: Vec<(&'static str, String)>,
 }
 
 pub type S3Result<T> = Result<T, S3Error>;
@@ -23,6 +25,7 @@ impl S3Error {
             message: message.into(),
             resource: None,
             request_id: None,
+            headers: Vec::new(),
         }
     }
 
@@ -86,6 +89,11 @@ impl From<kosha_engine::Error> for S3Error {
             E::PreconditionFailed => (StatusCode::PRECONDITION_FAILED, "PreconditionFailed"),
             E::BadDigest => (StatusCode::BAD_REQUEST, "BadDigest"),
             E::Body(_) => (StatusCode::BAD_REQUEST, "IncompleteBody"),
+            E::NoSuchVersion => (StatusCode::NOT_FOUND, "NoSuchVersion"),
+            E::InvalidRequest(_) => (StatusCode::BAD_REQUEST, "InvalidRequest"),
+            E::InvalidBucketState(_) => (StatusCode::CONFLICT, "InvalidBucketState"),
+            E::AccessDenied(_) => (StatusCode::FORBIDDEN, "AccessDenied"),
+            E::MethodNotAllowed(_) => (StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed"),
             E::Corrupt(_) | E::Io(_) | E::Meta(_) | E::Internal(_) => {
                 tracing::error!(error = %msg, "internal storage error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "InternalError")
@@ -108,6 +116,11 @@ impl IntoResponse for S3Error {
             escape(self.request_id.as_deref().unwrap_or_default()),
         );
         let mut resp = (self.status, body).into_response();
+        for (k, v) in &self.headers {
+            if let Ok(v) = axum::http::HeaderValue::from_str(v) {
+                resp.headers_mut().insert(*k, v);
+            }
+        }
         resp.headers_mut()
             .insert("content-type", HeaderValue::from_static("application/xml"));
         resp

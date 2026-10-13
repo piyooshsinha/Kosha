@@ -235,6 +235,50 @@ check. Chunks freed by a command are collected right after it is applied. A
 sweeper re-checks every chunk file every 10 minutes, which reclaims orphans
 from aborted uploads and chunks deferred by the grace period.
 
+## Versioning
+
+Each version is a row in the `versions` table keyed by
+`bucket \0 key \0 (u64::MAX - seq)` (big-endian), so a key's versions sort
+newest first and ListObjectVersions is a single ordered scan. `seq` comes
+from a counter in the state machine, so every node assigns the same version
+ids; ids are shown as 16 hex digits, or `null` for versions written while
+versioning was off or suspended.
+
+`objects` keeps mirroring the latest non-marker version, so unversioned
+reads and listings cost exactly what they did before. In a versioned bucket
+the version rows own the chunk references; deleting a version releases them
+and recomputes `objects` from the next-newest version. Because versions are
+manifests over shared chunks, a new version of a 1 GiB file that changes a
+few MiB stores only those chunks.
+
+Turning versioning on migrates existing objects to `null` versions in the
+same transaction. Keys may not contain NUL, which keeps the key encoding
+unambiguous.
+
+## Object Lock
+
+Retention (`GOVERNANCE` or `COMPLIANCE` with a retain-until date) and legal
+hold are stored on each version. Every check runs inside the state machine
+against the command's own timestamp, so all replicas reach the same verdict:
+
+- A version under retention or legal hold cannot be deleted, and a locked
+  `null` version cannot be overwritten.
+- `GOVERNANCE` can be bypassed with `x-amz-bypass-governance-retention`.
+  `COMPLIANCE` cannot be bypassed, shortened or removed.
+- Legal hold blocks deletion even with the bypass header.
+- Lock-enabled buckets are always versioned, and versioning cannot be
+  suspended on them.
+
+## Lifecycle
+
+A pass (every `--lifecycle-interval-secs`, on the leader only) evaluates
+each bucket's rules and *proposes ordinary commands*: DeleteObjects for
+expired current objects, noncurrent versions and lone delete markers, and
+AbortUpload for stale multipart uploads. Lifecycle therefore gets
+replication, ordering and Object Lock checks for free; locked versions are
+reported as refused and left in place. A version counts as noncurrent from
+the moment its successor was written.
+
 ## Raft details
 
 - The log is stored in redb (`raft/raft-log.redb`). Each append is one fsynced
@@ -270,6 +314,8 @@ thread pool when io_uring is disabled.
 | `objects` | `bucket \0 key` | manifest: size, ETag, attrs, segments |
 | `chunks` | BLAKE3 id | refcount, raw length, stored length |
 | `uploads` / `upload_index` / `parts` | upload id / `bucket \0 key \0 id` / `id \0 part#` | multipart state |
+| `versions` | `bucket \0 key \0 (MAX - seq)` | version: manifest or delete marker, lock state |
+| `requests` / `request_seq` | request id / sequence | results of recent writes, for exactly-once retries |
 | `meta` | `stats`, `sm_state` | counters, consensus state |
 
 The `bucket \0 key` encoding makes B-tree order equal S3 listing order. A
@@ -291,6 +337,9 @@ O(entries returned) rather than O(keys under the prefix).
   directory on a filesystem Kosha does not share with write-heavy neighbours,
   or use `--sync file`.
 - A read racing with deletion of the same object can fail mid-stream.
+- **Lifecycle passes scan every rule's prefix** and look up tags per object
+  when a rule filters on tags. Expiration does not support transitions to
+  other storage classes.
 
 ## Roadmap
 
@@ -299,12 +348,11 @@ reads, background re-replication and rebalancing, node removal from the
 console and API, ListMultipartUploads pagination.
 
 Also done: exactly-once retried writes (request ids), group sync for chunk
-data, Prometheus metrics, object and bucket tagging, bucket CORS.
+data, Prometheus metrics, object and bucket tagging, bucket CORS. Versioning, Object Lock (retention and legal hold) and lifecycle
+rules.
 
 **Next**
 - mTLS between nodes.
-- Object versioning (manifests are immutable, so versions are cheap) and
-  object lock (WORM).
 - Users, access keys and bucket policies stored in the replicated state machine.
 - io_uring with registered buffers and `O_DIRECT` for large chunks.
 

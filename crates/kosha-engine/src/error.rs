@@ -26,6 +26,16 @@ pub enum Error {
     EntityTooSmall,
     #[error("precondition failed")]
     PreconditionFailed,
+    #[error("the specified version does not exist")]
+    NoSuchVersion,
+    #[error("{0}")]
+    InvalidRequest(String),
+    #[error("{0}")]
+    InvalidBucketState(String),
+    #[error("{0}")]
+    AccessDenied(String),
+    #[error("{0}")]
+    MethodNotAllowed(String),
     #[error("content digest does not match")]
     BadDigest,
     #[error("data corruption detected: {0}")]

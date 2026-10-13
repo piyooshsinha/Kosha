@@ -108,6 +108,11 @@ struct Args {
     #[arg(long, env = "KOSHA_REPAIR_INTERVAL_SECS", default_value_t = 60)]
     repair_interval_secs: u64,
 
+    /// Seconds between lifecycle passes (expiration, noncurrent versions,
+    /// abandoned uploads). 0 disables lifecycle processing.
+    #[arg(long, env = "KOSHA_LIFECYCLE_INTERVAL_SECS", default_value_t = 3600)]
+    lifecycle_interval_secs: u64,
+
     /// Seconds an unreferenced chunk file is kept before it may be collected
     /// (gives uploads on other nodes time to commit).
     #[arg(long, env = "KOSHA_GC_GRACE_SECS", default_value_t = 900)]
@@ -227,6 +232,21 @@ async fn main() -> anyhow::Result<()> {
     };
 
     engine.spawn_sweeper(Duration::from_secs(600));
+    if args.lifecycle_interval_secs > 0 {
+        // Lifecycle actions are replicated commands; in a cluster only the
+        // leader proposes them, so passes do not race each other.
+        let gate: Arc<dyn Fn() -> bool + Send + Sync> = match &cluster {
+            Some(c) => {
+                let c = c.clone();
+                Arc::new(move || {
+                    let s = c.status();
+                    s.leader == Some(s.node_id)
+                })
+            }
+            None => Arc::new(|| true),
+        };
+        engine.spawn_lifecycle(Duration::from_secs(args.lifecycle_interval_secs), gate);
+    }
 
     let app = ui::router().merge(kosha_s3::router(engine, s3));
     let listener = tokio::net::TcpListener::bind(args.listen)

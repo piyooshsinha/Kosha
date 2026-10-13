@@ -6,6 +6,7 @@ mod config;
 mod error;
 mod handlers;
 mod metrics;
+mod protection;
 mod xml;
 
 use std::sync::Arc;

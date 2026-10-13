@@ -67,6 +67,14 @@ impl EngineConfig {
     }
 }
 
+/// Where a copy reads from.
+#[derive(Clone, Debug)]
+pub struct CopySource {
+    pub bucket: String,
+    pub key: String,
+    pub version_id: Option<String>,
+}
+
 /// Counters describing how well writes are being batched.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WriteStats {
@@ -137,6 +145,10 @@ pub fn validate_bucket_name(name: &str) -> Result<()> {
 fn validate_key(key: &str) -> Result<()> {
     if key.is_empty() {
         return Err(Error::InvalidKey("key must not be empty".into()));
+    }
+    // NUL separates key from version sequence in the versions table.
+    if key.contains('\0') {
+        return Err(Error::InvalidKey("key must not contain NUL".into()));
     }
     if key.len() > MAX_KEY_LEN {
         return Err(Error::InvalidKey("key is longer than 1024 bytes".into()));
@@ -344,11 +356,21 @@ impl Engine {
     // ---------------------------------------------------------------- buckets
 
     pub async fn create_bucket(&self, name: &str) -> Result<BucketInfo> {
+        self.create_bucket_with(name, false).await
+    }
+
+    /// Create a bucket, optionally with Object Lock (which implies versioning).
+    pub async fn create_bucket_with(&self, name: &str, object_lock: bool) -> Result<BucketInfo> {
         validate_bucket_name(name)?;
+        let mut config = BucketConfig::default();
+        if object_lock {
+            config.versioning = Versioning::Enabled;
+            config.object_lock = Some(ObjectLockConfig::default());
+        }
         let info = BucketInfo {
             name: name.to_string(),
             created: Utc::now(),
-            config: BucketConfig::default(),
+            config,
         };
         self.propose(Command::CreateBucket { info: info.clone() })
             .await?;
@@ -377,11 +399,48 @@ impl Engine {
         key: &str,
         tags: std::collections::BTreeMap<String, String>,
     ) -> Result<ObjectMeta> {
+        self.set_version_tags(bucket, key, None, tags).await
+    }
+
+    /// Replace the tags of one version (`None` = latest).
+    pub async fn set_version_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<String>,
+        tags: std::collections::BTreeMap<String, String>,
+    ) -> Result<ObjectMeta> {
         expect_object(
             self.propose(Command::SetObjectTags {
                 bucket: bucket.into(),
                 key: key.into(),
+                version_id,
                 tags,
+            })
+            .await?,
+        )
+    }
+
+    /// PutObjectRetention / PutObjectLegalHold. `retention: Some(None)`
+    /// removes retention (only allowed when that does not weaken a lock).
+    pub async fn set_object_lock(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<String>,
+        retention: Option<Option<Retention>>,
+        legal_hold: Option<bool>,
+        bypass_governance: bool,
+    ) -> Result<ObjectMeta> {
+        expect_object(
+            self.propose(Command::SetObjectLock {
+                bucket: bucket.into(),
+                key: key.into(),
+                version_id,
+                retention,
+                legal_hold,
+                bypass_governance,
+                now: Utc::now(),
             })
             .await?,
         )
@@ -412,6 +471,20 @@ impl Engine {
         attrs: ObjectAttrs,
         cond: WriteCondition,
     ) -> Result<ObjectMeta> {
+        self.put_object_locked(bucket, key, data, attrs, cond, ObjectLockState::default())
+            .await
+    }
+
+    /// PutObject with explicit Object Lock settings for the new version.
+    pub async fn put_object_locked(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: WrittenData,
+        attrs: ObjectAttrs,
+        cond: WriteCondition,
+        lock: ObjectLockState,
+    ) -> Result<ObjectMeta> {
         validate_key(key)?;
         let meta = ObjectMeta {
             size: data.size,
@@ -419,6 +492,8 @@ impl Engine {
             last_modified: Utc::now(),
             attrs,
             segments: data.segments.clone(),
+            version_id: None,
+            lock,
         };
         let out = self
             .propose(Command::PutObject {
@@ -437,6 +512,29 @@ impl Engine {
     pub async fn head_object(&self, bucket: &str, key: &str) -> Result<ObjectMeta> {
         let (bucket, key) = (bucket.to_string(), key.to_string());
         self.query(move |m| m.head_object(&bucket, &key)).await
+    }
+
+    /// One specific version (a delete marker has `meta: None`).
+    pub async fn head_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Result<VersionInfo> {
+        let (bucket, key, v) = (bucket.to_string(), key.to_string(), version_id.to_string());
+        self.query(move |m| m.head_version(&bucket, &key, &v)).await
+    }
+
+    /// The id of `key`'s latest version when it is a delete marker.
+    pub async fn latest_delete_marker(&self, bucket: &str, key: &str) -> Result<Option<String>> {
+        let (bucket, key) = (bucket.to_string(), key.to_string());
+        self.query(move |m| m.latest_delete_marker(&bucket, &key))
+            .await
+    }
+
+    pub async fn list_versions(&self, bucket: &str, q: VersionListQuery) -> Result<VersionPage> {
+        let bucket = bucket.to_string();
+        self.query(move |m| m.list_versions(&bucket, &q)).await
     }
 
     /// Stream bytes `[start, end)` of an object, touching only the chunks
@@ -484,6 +582,8 @@ impl Engine {
             .boxed()
     }
 
+    /// Delete the current object (or add a delete marker in a versioned
+    /// bucket). Returns whether there was an object.
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<bool> {
         Ok(self
             .delete_objects(bucket, vec![key.to_string()])
@@ -494,10 +594,35 @@ impl Engine {
 
     /// Delete many keys in one atomic commit. Returns which keys existed.
     pub async fn delete_objects(&self, bucket: &str, keys: Vec<String>) -> Result<Vec<bool>> {
+        let targets = keys
+            .into_iter()
+            .map(|key| DeleteTarget {
+                key,
+                version_id: None,
+            })
+            .collect();
+        Ok(self
+            .delete_targets(bucket, targets, false)
+            .await?
+            .into_iter()
+            .map(|o| o.existed)
+            .collect())
+    }
+
+    /// Delete keys and/or specific versions in one atomic commit. Targets
+    /// refused by Object Lock come back with `error` set; the rest proceed.
+    pub async fn delete_targets(
+        &self,
+        bucket: &str,
+        targets: Vec<DeleteTarget>,
+        bypass_governance: bool,
+    ) -> Result<Vec<DeleteOutcome>> {
         match self
             .propose(Command::DeleteObjects {
                 bucket: bucket.into(),
-                keys,
+                targets,
+                bypass_governance,
+                now: Utc::now(),
             })
             .await?
         {
@@ -519,11 +644,38 @@ impl Engine {
         new_attrs: Option<ObjectAttrs>,
         cond: WriteCondition,
     ) -> Result<ObjectMeta> {
+        self.copy_object_with(
+            CopySource {
+                bucket: src_bucket.into(),
+                key: src_key.into(),
+                version_id: None,
+            },
+            dst_bucket,
+            dst_key,
+            new_attrs,
+            cond,
+            ObjectLockState::default(),
+        )
+        .await
+    }
+
+    /// Copy a specific source version, with Object Lock settings for the copy.
+    pub async fn copy_object_with(
+        &self,
+        src: CopySource,
+        dst_bucket: &str,
+        dst_key: &str,
+        new_attrs: Option<ObjectAttrs>,
+        cond: WriteCondition,
+        lock: ObjectLockState,
+    ) -> Result<ObjectMeta> {
         validate_key(dst_key)?;
         expect_object(
             self.propose(Command::CopyObject {
-                src_bucket: src_bucket.into(),
-                src_key: src_key.into(),
+                src_bucket: src.bucket,
+                src_key: src.key,
+                src_version: src.version_id,
+                lock,
                 dst_bucket: dst_bucket.into(),
                 dst_key: dst_key.into(),
                 attrs: new_attrs,
@@ -547,6 +699,17 @@ impl Engine {
         key: &str,
         attrs: ObjectAttrs,
     ) -> Result<UploadInfo> {
+        self.create_upload_with(bucket, key, attrs, None).await
+    }
+
+    /// CreateMultipartUpload with Object Lock settings for the final object.
+    pub async fn create_upload_with(
+        &self,
+        bucket: &str,
+        key: &str,
+        attrs: ObjectAttrs,
+        lock: Option<ObjectLockState>,
+    ) -> Result<UploadInfo> {
         validate_key(key)?;
         let info = UploadInfo {
             upload_id: uuid::Uuid::new_v4().simple().to_string(),
@@ -554,6 +717,7 @@ impl Engine {
             key: key.to_string(),
             attrs,
             initiated: Utc::now(),
+            lock,
         };
         self.propose(Command::CreateUpload { info: info.clone() })
             .await?;

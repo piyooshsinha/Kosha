@@ -87,6 +87,11 @@ pub struct ObjectMeta {
     pub last_modified: DateTime<Utc>,
     pub attrs: ObjectAttrs,
     pub segments: Vec<Segment>,
+    /// Version id in versioned buckets (`"null"` for the null version).
+    #[serde(default)]
+    pub version_id: Option<String>,
+    #[serde(default)]
+    pub lock: ObjectLockState,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -104,6 +109,118 @@ pub struct BucketConfig {
     pub tags: BTreeMap<String, String>,
     #[serde(default)]
     pub cors: Option<Vec<CorsRule>>,
+    #[serde(default)]
+    pub versioning: Versioning,
+    /// `Some` when Object Lock is enabled for the bucket.
+    #[serde(default)]
+    pub object_lock: Option<ObjectLockConfig>,
+    #[serde(default)]
+    pub lifecycle: Option<Vec<LifecycleRule>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Versioning {
+    /// Never enabled: one version per key, no version records.
+    #[default]
+    Unversioned,
+    Enabled,
+    Suspended,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RetentionMode {
+    /// Removable or shortenable with `x-amz-bypass-governance-retention`.
+    Governance,
+    /// Nobody can delete the version or shorten retention until it expires.
+    Compliance,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectLockConfig {
+    pub default_retention: Option<DefaultRetention>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DefaultRetention {
+    pub mode: RetentionMode,
+    pub days: u32,
+}
+
+/// Object Lock state of one object version.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectLockState {
+    pub retention: Option<Retention>,
+    pub legal_hold: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Retention {
+    pub mode: RetentionMode,
+    pub until: DateTime<Utc>,
+}
+
+/// One lifecycle rule (a subset of S3's LifecycleConfiguration).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleRule {
+    pub id: Option<String>,
+    pub enabled: bool,
+    pub prefix: String,
+    /// All of these tags must be present on an object for the rule to apply.
+    pub tags: BTreeMap<String, String>,
+    pub expiration_days: Option<u32>,
+    pub expiration_date: Option<DateTime<Utc>>,
+    pub expired_object_delete_marker: bool,
+    pub noncurrent_days: Option<u32>,
+    pub abort_incomplete_days: Option<u32>,
+}
+
+/// One version of an object, as returned by version listings and lookups.
+#[derive(Clone, Debug)]
+pub struct VersionInfo {
+    pub key: String,
+    pub version_id: String,
+    pub is_latest: bool,
+    pub last_modified: DateTime<Utc>,
+    /// `None` for a delete marker.
+    pub meta: Option<ObjectMeta>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct VersionListQuery {
+    pub prefix: String,
+    pub delimiter: Option<String>,
+    pub key_marker: Option<String>,
+    pub version_marker: Option<String>,
+    pub max_keys: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct VersionPage {
+    pub versions: Vec<VersionInfo>,
+    pub common_prefixes: Vec<String>,
+    pub is_truncated: bool,
+    pub next_key_marker: Option<String>,
+    pub next_version_marker: Option<String>,
+}
+
+/// One key (optionally one version) to delete.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DeleteTarget {
+    pub key: String,
+    pub version_id: Option<String>,
+}
+
+/// What happened to one delete target.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DeleteOutcome {
+    pub key: String,
+    /// Version removed, or delete marker created.
+    pub version_id: Option<String>,
+    pub delete_marker: bool,
+    /// Whether something was there to delete.
+    pub existed: bool,
+    /// Set when this target was refused (others in the request proceed).
+    pub error: Option<crate::meta::Rejection>,
 }
 
 /// One cross-origin rule, as in S3's CORSConfiguration.
@@ -122,6 +239,9 @@ pub struct CorsRule {
 pub enum BucketConfigUpdate {
     Tags(BTreeMap<String, String>),
     Cors(Option<Vec<CorsRule>>),
+    Versioning(Versioning),
+    ObjectLock(ObjectLockConfig),
+    Lifecycle(Option<Vec<LifecycleRule>>),
 }
 
 /// Summary of one object returned by listings.
@@ -167,6 +287,9 @@ pub struct UploadInfo {
     pub key: String,
     pub attrs: ObjectAttrs,
     pub initiated: DateTime<Utc>,
+    /// Explicit Object Lock settings requested at upload creation.
+    #[serde(default)]
+    pub lock: Option<ObjectLockState>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -26,6 +26,7 @@ with io_uring.
 | Durability after node loss | manual rebuild | **self-healing**: background re-replication restores every chunk's replica count |
 | Retried writes | may apply twice | **exactly-once**: request ids make a re-delivered write return its original result |
 | Data durability cost | fsync per file | **group sync**: concurrent chunk writes share one `syncfs`, including the directory entry |
+| Versions | full copies per version | **versions share chunks**: a new version stores only the chunks that changed |
 | Admin UI | separate product | **built-in web console**, compiled into the binary |
 
 **Contents:**
@@ -96,6 +97,32 @@ s3k cp s3://photos/2026/holiday.jpg s3://photos/backup.jpg   # server-side copy:
 s3k presign s3://photos/2026/holiday.jpg --expires-in 3600   # shareable link
 s3k rm s3://photos/2026/holiday.jpg
 ```
+
+### Versioning, Object Lock and lifecycle
+
+```sh
+alias s3api='aws --endpoint-url http://localhost:9000 s3api'
+
+# Keep every version. Versions share chunks, so a new version costs only its changed bytes.
+s3api put-bucket-versioning --bucket docs --versioning-configuration Status=Enabled
+s3api list-object-versions --bucket docs --prefix report.txt
+s3api get-object --bucket docs --key report.txt --version-id 0000000000000001 old.txt
+
+# WORM: a COMPLIANCE-retained version cannot be deleted or shortened by anyone until it expires.
+s3api create-bucket --bucket vault --object-lock-enabled-for-bucket
+s3api put-object-lock-configuration --bucket vault --object-lock-configuration \
+  '{"ObjectLockEnabled":"Enabled","Rule":{"DefaultRetention":{"Mode":"COMPLIANCE","Days":30}}}'
+s3api put-object-legal-hold --bucket vault --key ledger.csv --legal-hold Status=ON
+
+# Expire logs after 30 days, old versions after 7, abandoned uploads after 2.
+s3api put-bucket-lifecycle-configuration --bucket docs --lifecycle-configuration \
+  '{"Rules":[{"ID":"tidy","Status":"Enabled","Filter":{"Prefix":"logs/"},"Expiration":{"Days":30},
+    "NoncurrentVersionExpiration":{"NoncurrentDays":7},"AbortIncompleteMultipartUpload":{"DaysAfterInitiation":2}}]}'
+```
+
+Lifecycle runs every `--lifecycle-interval-secs` (default one hour). Its
+deletions go through the same replicated command path as client deletes, so
+Object Lock still protects locked versions.
 
 ### Python (boto3)
 
@@ -448,6 +475,7 @@ io_uring. `--io auto` (the default) detects this and falls back to threads;
 | `--gc-grace-secs` | `KOSHA_GC_GRACE_SECS` | `900` | cluster: keep unreferenced chunks this long |
 | `--repair-interval-secs` | `KOSHA_REPAIR_INTERVAL_SECS` | `60` | cluster: background re-replication/rebalancing pass (`0` disables) |
 | `--no-lease-reads` | `KOSHA_NO_LEASE_READS` | off | cluster: prove leadership with a quorum round-trip on every read |
+| `--lifecycle-interval-secs` | `KOSHA_LIFECYCLE_INTERVAL_SECS` | `3600` | how often lifecycle rules run (leader only in a cluster; `0` disables) |
 
 ## S3 compatibility
 
@@ -458,16 +486,19 @@ Tested against the **AWS SDK for Rust** (in CI), **boto3**, the **AWS CLI**,
 |---|---|
 | Auth | SigV4 headers, SigV4 presigned URLs, streaming `aws-chunked` with per-chunk signature verification, unsigned-payload trailers, SigV2 presigned URLs (boto3's default) |
 | Integrity | `x-amz-content-sha256` verified, `Content-MD5`, `x-amz-checksum-crc32` (header or trailer) |
-| Buckets | Create, Delete, Head, List, GetBucketLocation, GetBucketVersioning (unversioned), GetBucketAcl; "not configured" responses for policy/lifecycle/encryption/... |
+| Buckets | Create, Delete, Head, List, GetBucketLocation, GetBucketAcl; "not configured" responses for policy/encryption/... |
 | Objects | Put, Get (single range, conditional, `response-*` overrides), Head, Delete, DeleteObjects, CopyObject (COPY/REPLACE metadata and tagging directives, copy-source conditions), user metadata and standard headers |
 | Tagging | `x-amz-tagging` on Put/Copy/CreateMultipartUpload, Get/Put/DeleteObjectTagging, `x-amz-tagging-count`, Get/Put/DeleteBucketTagging |
 | CORS | Get/Put/DeleteBucketCors, unauthenticated `OPTIONS` preflight, CORS headers on matching responses (origin wildcards, credentials, exposed headers, max-age) |
+| Versioning | Get/PutBucketVersioning (Enabled, Suspended), `versionId` on Get/Head/Delete/Copy source/tagging, delete markers, null versions, ListObjectVersions (prefix, delimiter, key/version markers), versioned DeleteObjects |
+| Object Lock | buckets created with `x-amz-bucket-object-lock-enabled`, Get/PutObjectLockConfiguration (default retention), Get/PutObjectRetention (GOVERNANCE with `x-amz-bypass-governance-retention`, COMPLIANCE), Get/PutObjectLegalHold, `x-amz-object-lock-*` headers on Put/Copy/CreateMultipartUpload |
+| Lifecycle | Get/Put/DeleteBucketLifecycleConfiguration: expiration (days or date), noncurrent version expiration, expired delete marker cleanup, AbortIncompleteMultipartUpload; filters by prefix and tags |
 | Listing | ListObjectsV2 (prefix, delimiter, continuation, start-after, `encoding-type=url`), ListObjects v1 |
 | Multipart | Create, UploadPart, UploadPartCopy (with range), Complete, Abort, ListParts, ListMultipartUploads (paginated) |
 | Writes | Conditional `If-None-Match: *` / `If-Match` on Put, Copy and Complete |
 
-Not implemented yet: versioning, object lock, bucket policies/IAM, lifecycle,
-SSE, SigV2 header auth. Unsupported operations return `501 NotImplemented`.
+Not implemented yet: bucket policies/IAM, SSE, SigV2 header auth, lifecycle
+transitions to other storage classes. Unsupported operations return `501 NotImplemented`.
 
 ## Layout
 

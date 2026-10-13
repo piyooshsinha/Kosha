@@ -705,3 +705,339 @@ async fn tagging_and_cors() {
         Some("NoSuchCORSConfiguration")
     );
 }
+
+#[tokio::test]
+async fn versioning_object_lock_and_lifecycle() {
+    use aws_sdk_s3::types::{
+        BucketLifecycleConfiguration, BucketVersioningStatus, DefaultRetention, ExpirationStatus,
+        LifecycleExpiration, LifecycleRule, LifecycleRuleFilter, NoncurrentVersionExpiration,
+        ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHold, ObjectLockLegalHoldStatus,
+        ObjectLockRetentionMode, ObjectLockRule, VersioningConfiguration,
+    };
+    let s = start().await;
+    let c = client(&s, SK);
+
+    // ---- versioning
+    c.create_bucket().bucket("hist").send().await.unwrap();
+    c.put_bucket_versioning()
+        .bucket("hist")
+        .versioning_configuration(
+            VersioningConfiguration::builder()
+                .status(BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let st = c
+        .get_bucket_versioning()
+        .bucket("hist")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(st.status(), Some(&BucketVersioningStatus::Enabled));
+    let v1 = c
+        .put_object()
+        .bucket("hist")
+        .key("doc")
+        .body(ByteStream::from_static(b"one"))
+        .send()
+        .await
+        .unwrap();
+    let v2 = c
+        .put_object()
+        .bucket("hist")
+        .key("doc")
+        .body(ByteStream::from_static(b"two"))
+        .send()
+        .await
+        .unwrap();
+    let (id1, id2) = (
+        v1.version_id().unwrap().to_string(),
+        v2.version_id().unwrap().to_string(),
+    );
+    assert_ne!(id1, id2);
+    let old = c
+        .get_object()
+        .bucket("hist")
+        .key("doc")
+        .version_id(&id1)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(old.version_id(), Some(id1.as_str()));
+    assert_eq!(body(old).await, b"one");
+
+    let del = c
+        .delete_object()
+        .bucket("hist")
+        .key("doc")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.delete_marker(), Some(true));
+    let marker = del.version_id().unwrap().to_string();
+    let err = c
+        .get_object()
+        .bucket("hist")
+        .key("doc")
+        .send()
+        .await
+        .unwrap_err();
+    let raw = err.raw_response().unwrap();
+    assert_eq!(raw.status().as_u16(), 404);
+    assert_eq!(raw.headers().get("x-amz-delete-marker"), Some("true"));
+
+    let listed = c
+        .list_object_versions()
+        .bucket("hist")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listed.versions().len(), 2);
+    assert_eq!(listed.delete_markers().len(), 1);
+    assert!(listed.delete_markers()[0].is_latest().unwrap());
+
+    // Removing the marker undeletes; versioned DeleteObjects removes old versions.
+    c.delete_object()
+        .bucket("hist")
+        .key("doc")
+        .version_id(&marker)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        body(
+            c.get_object()
+                .bucket("hist")
+                .key("doc")
+                .send()
+                .await
+                .unwrap()
+        )
+        .await,
+        b"two"
+    );
+    let ids = vec![
+        ObjectIdentifier::builder()
+            .key("doc")
+            .version_id(&id1)
+            .build()
+            .unwrap(),
+    ];
+    let out = c
+        .delete_objects()
+        .bucket("hist")
+        .delete(Delete::builder().set_objects(Some(ids)).build().unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(out.deleted()[0].version_id(), Some(id1.as_str()));
+    assert_eq!(
+        c.list_object_versions()
+            .bucket("hist")
+            .send()
+            .await
+            .unwrap()
+            .versions()
+            .len(),
+        1
+    );
+
+    // ---- object lock
+    c.create_bucket()
+        .bucket("vault")
+        .object_lock_enabled_for_bucket(true)
+        .send()
+        .await
+        .unwrap();
+    c.put_object_lock_configuration()
+        .bucket("vault")
+        .object_lock_configuration(
+            ObjectLockConfiguration::builder()
+                .object_lock_enabled(ObjectLockEnabled::Enabled)
+                .rule(
+                    ObjectLockRule::builder()
+                        .default_retention(
+                            DefaultRetention::builder()
+                                .mode(ObjectLockRetentionMode::Governance)
+                                .days(1)
+                                .build(),
+                        )
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let cfg = c
+        .get_object_lock_configuration()
+        .bucket("vault")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        cfg.object_lock_configuration()
+            .unwrap()
+            .rule()
+            .unwrap()
+            .default_retention()
+            .unwrap()
+            .days(),
+        Some(1)
+    );
+    let put = c
+        .put_object()
+        .bucket("vault")
+        .key("rec")
+        .body(ByteStream::from_static(b"keep"))
+        .send()
+        .await
+        .unwrap();
+    let vid = put.version_id().unwrap().to_string();
+    let ret = c
+        .get_object_retention()
+        .bucket("vault")
+        .key("rec")
+        .version_id(&vid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        ret.retention().unwrap().mode(),
+        Some(&ObjectLockRetentionMode::Governance)
+    );
+    let head = c
+        .head_object()
+        .bucket("vault")
+        .key("rec")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        head.object_lock_mode().map(|m| m.as_str()),
+        Some("GOVERNANCE")
+    );
+
+    let err = c
+        .delete_object()
+        .bucket("vault")
+        .key("rec")
+        .version_id(&vid)
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(err.into_service_error().meta().code(), Some("AccessDenied"));
+
+    // Legal hold beats governance bypass.
+    c.put_object_legal_hold()
+        .bucket("vault")
+        .key("rec")
+        .version_id(&vid)
+        .legal_hold(
+            ObjectLockLegalHold::builder()
+                .status(ObjectLockLegalHoldStatus::On)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        c.get_object_legal_hold()
+            .bucket("vault")
+            .key("rec")
+            .version_id(&vid)
+            .send()
+            .await
+            .unwrap()
+            .legal_hold()
+            .unwrap()
+            .status(),
+        Some(&ObjectLockLegalHoldStatus::On)
+    );
+    let err = c
+        .delete_object()
+        .bucket("vault")
+        .key("rec")
+        .version_id(&vid)
+        .bypass_governance_retention(true)
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(err.into_service_error().meta().code(), Some("AccessDenied"));
+    c.put_object_legal_hold()
+        .bucket("vault")
+        .key("rec")
+        .version_id(&vid)
+        .legal_hold(
+            ObjectLockLegalHold::builder()
+                .status(ObjectLockLegalHoldStatus::Off)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    c.delete_object()
+        .bucket("vault")
+        .key("rec")
+        .version_id(&vid)
+        .bypass_governance_retention(true)
+        .send()
+        .await
+        .unwrap();
+
+    // ---- lifecycle configuration
+    let rule = LifecycleRule::builder()
+        .id("logs")
+        .status(ExpirationStatus::Enabled)
+        .filter(LifecycleRuleFilter::builder().prefix("logs/").build())
+        .expiration(LifecycleExpiration::builder().days(30).build())
+        .noncurrent_version_expiration(
+            NoncurrentVersionExpiration::builder()
+                .noncurrent_days(7)
+                .build(),
+        )
+        .build()
+        .unwrap();
+    c.put_bucket_lifecycle_configuration()
+        .bucket("hist")
+        .lifecycle_configuration(
+            BucketLifecycleConfiguration::builder()
+                .rules(rule)
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let got = c
+        .get_bucket_lifecycle_configuration()
+        .bucket("hist")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(got.rules()[0].expiration().unwrap().days(), Some(30));
+    assert_eq!(
+        got.rules()[0]
+            .noncurrent_version_expiration()
+            .unwrap()
+            .noncurrent_days(),
+        Some(7)
+    );
+    c.delete_bucket_lifecycle()
+        .bucket("hist")
+        .send()
+        .await
+        .unwrap();
+    let err = c
+        .get_bucket_lifecycle_configuration()
+        .bucket("hist")
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.into_service_error().meta().code(),
+        Some("NoSuchLifecycleConfiguration")
+    );
+}
