@@ -18,6 +18,10 @@
 //!   confirms it holds the chunk, so the replica count never drops below
 //!   target.
 //!
+//! Erasure-coded chunks are kept per shard instead: each node rebuilds the
+//! shard index it is responsible for (see `ec::assignment`) from any `k`
+//! others, and drops shards it holds for others once their holder confirms.
+//!
 //! Chunks not yet referenced by metadata (in-flight uploads) are never
 //! touched here; the garbage collector owns those.
 
@@ -94,8 +98,94 @@ impl Inner {
             .collect()
     }
 
+    /// Keep this node's shard of an erasure-coded chunk. `None` means the
+    /// chunk turned out to be replicated (written while the cluster was too
+    /// small), so the replica logic applies.
+    async fn maintain_shards(
+        &self,
+        id: ChunkId,
+        len: u32,
+        layout: crate::erasure::Layout,
+        ranked: &[(NodeId, KoshaNode)],
+        live: &BTreeSet<NodeId>,
+    ) -> Option<Action> {
+        let store = self.engine.chunk_store();
+        let me = self.cfg.node_id;
+        let local = store.shard_indices(&id);
+        let mine = crate::ec::assignment(ranked, live, layout, me);
+        if local.is_empty() && mine.is_none() {
+            return None;
+        }
+        if let Some(s) = mine
+            && !local.contains(&s)
+        {
+            if local.is_empty() {
+                // Does any voter hold shards of it at all?
+                let hex = id.to_hex();
+                let any = futures::future::join_all(
+                    ranked
+                        .iter()
+                        .filter(|(n, _)| *n != me && live.contains(n))
+                        .map(|(_, node)| self.client.shard_indices(&node.addr, &hex)),
+                )
+                .await
+                .into_iter()
+                .any(|r| r.is_ok_and(|v| !v.is_empty()));
+                if !any {
+                    return None;
+                }
+            }
+            return Some(match self.rebuild_shard(&id, len, s).await {
+                Some(shard) => match store.put_shard(id, s, shard).await {
+                    Ok(()) => Action::Repaired,
+                    Err(e) => {
+                        tracing::warn!(chunk = %id.to_hex(), shard = s, error = %e, "storing rebuilt shard failed");
+                        Action::Failed
+                    }
+                },
+                None => {
+                    tracing::warn!(chunk = %id.to_hex(), shard = s, "not enough shards to rebuild");
+                    Action::Failed
+                }
+            });
+        }
+        // Shards this node holds but is not responsible for: drop each once
+        // its responsible node is live and confirms it.
+        let mut removed = false;
+        for t in local.into_iter().filter(|t| Some(*t) != mine) {
+            let Some((h, node)) = crate::ec::holder(ranked, live, layout, t) else {
+                continue;
+            };
+            if h == me {
+                continue;
+            }
+            let confirmed = self
+                .client
+                .shard_indices(&node.addr, &id.to_hex())
+                .await
+                .is_ok_and(|v| v.contains(&t));
+            if confirmed && store.remove_shard(&id, t).unwrap_or(false) {
+                removed = true;
+            }
+        }
+        Some(if removed {
+            Action::Removed
+        } else {
+            Action::Keep
+        })
+    }
+
     async fn maintain_chunk(&self, id: ChunkId, len: u32, live: &BTreeSet<NodeId>) -> Action {
         let ranked = rank_voters(self, &id);
+        if let Some(layout) = self
+            .cfg
+            .erasure
+            .filter(|_| len as usize >= self.cfg.erasure_min_len)
+            && !self.engine.chunk_store().has(&id)
+            && let Some(action) = self.maintain_shards(id, len, layout, &ranked, live).await
+        {
+            return action;
+        }
         let want = self.cfg.replication.clamp(1, ranked.len().max(1));
         let me = self.cfg.node_id;
         let designated_all: Vec<&(NodeId, KoshaNode)> = ranked.iter().take(want).collect();

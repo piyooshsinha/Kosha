@@ -168,6 +168,16 @@ struct Args {
     #[arg(long, env = "KOSHA_REPLICATION", default_value_t = 2)]
     replication: usize,
 
+    /// Erasure-code large chunks as K data + M parity shards instead of
+    /// keeping --replication full copies (e.g. 4+2: 1.5x storage, survives
+    /// any 2 node failures). Needs at least K+M nodes; the same on every node.
+    #[arg(long, env = "KOSHA_ERASURE")]
+    erasure: Option<String>,
+
+    /// Chunks smaller than this many bytes stay replicated.
+    #[arg(long, env = "KOSHA_ERASURE_MIN_CHUNK", default_value_t = 128 * 1024)]
+    erasure_min_chunk: usize,
+
     /// Prove leadership with a quorum round-trip on every read instead of using
     /// a leader lease (slower; for environments with unreliable clocks).
     #[arg(long, env = "KOSHA_NO_LEASE_READS")]
@@ -329,6 +339,13 @@ async fn main() -> anyhow::Result<()> {
             ccfg.lease_reads = !args.no_lease_reads;
             ccfg.repair_interval = (args.repair_interval_secs > 0)
                 .then(|| Duration::from_secs(args.repair_interval_secs));
+            ccfg.erasure = args
+                .erasure
+                .as_deref()
+                .map(kosha_cluster::ErasureLayout::parse)
+                .transpose()
+                .map_err(anyhow::Error::msg)?;
+            ccfg.erasure_min_len = args.erasure_min_chunk;
             ccfg.tls = args.cluster_tls_cert.clone().map(|cert| TlsFiles {
                 cert,
                 key: args.cluster_tls_key.clone().expect("required by clap"),

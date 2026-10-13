@@ -17,6 +17,8 @@
 // openraft's trait signatures fix the (large) `StorageError` type.
 #![allow(clippy::result_large_err)]
 
+mod ec;
+mod erasure;
 mod lease;
 mod log_store;
 mod network;
@@ -40,6 +42,7 @@ use openraft::error::{CheckIsLeaderError, ClientWriteError, RaftError};
 use openraft::{ChangeMembers, ServerState};
 use serde::Serialize;
 
+pub use crate::erasure::Layout as ErasureLayout;
 pub use crate::repair::RepairReport;
 use crate::rpc::{Client, JoinRequest, LeaderReply, Proposed};
 use crate::types::*;
@@ -75,6 +78,10 @@ pub struct ClusterConfig {
     /// Mutual TLS for internal traffic. Every node presents `cert` and
     /// accepts only peers whose certificates `ca` signed.
     pub tls: Option<tls::TlsFiles>,
+    /// Erasure-code chunks of at least `erasure_min_len` bytes as K+M
+    /// shards instead of replicating them (needs K+M voters).
+    pub erasure: Option<erasure::Layout>,
+    pub erasure_min_len: usize,
 }
 
 impl ClusterConfig {
@@ -99,6 +106,8 @@ impl ClusterConfig {
             lease_reads: true,
             repair_interval: Some(Duration::from_secs(60)),
             tls: None,
+            erasure: None,
+            erasure_min_len: 128 * 1024,
         }
     }
 }
@@ -285,6 +294,7 @@ impl Cluster {
                 .engine
                 .encryption_fingerprint()
                 .map(str::to_string),
+            erasure: self.inner.cfg.erasure,
         };
         let mut target = seed.to_string();
         let mut last_err = String::new();
@@ -862,6 +872,9 @@ impl Inner {
 
     async fn place(self: Arc<Self>, id: ChunkId, data: Bytes) -> kosha_engine::Result<u64> {
         let ranked = rank_voters(&self, &id);
+        if let Some(layout) = self.ec_layout(data.len(), ranked.len()) {
+            return self.place_shards(id, data, layout).await;
+        }
         let want = self.cfg.replication.clamp(1, ranked.len().max(1));
         let mut stored = 0u64;
         let mut ok = 0usize;
@@ -912,7 +925,25 @@ impl Inner {
                 Err(e) => tracing::warn!(error = %e, "local replica unusable, fetching remotely"),
             }
         }
-        let ranked = rank_voters(&self, &id);
+        // Large chunks are probably erasure coded; try shards first. Either
+        // way both layouts are tried, so changing the setting is safe.
+        let ec_first = self
+            .cfg
+            .erasure
+            .is_some_and(|_| len as usize >= self.cfg.erasure_min_len);
+        if ec_first && let Ok(b) = self.fetch_shards(id, len).await {
+            return Ok(b);
+        }
+        match self.fetch_replica(id, len).await {
+            Ok(b) => Ok(b),
+            Err(e) if !ec_first => self.fetch_shards(id, len).await.map_err(|_| e),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn fetch_replica(&self, id: ChunkId, len: u32) -> kosha_engine::Result<Bytes> {
+        let store = self.engine.chunk_store();
+        let ranked = rank_voters(self, &id);
         let want = self.cfg.replication.clamp(1, ranked.len().max(1));
         let should_hold = ranked
             .iter()

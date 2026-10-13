@@ -279,6 +279,41 @@ replication, ordering and Object Lock checks for free; locked versions are
 reported as refused and left in place. A version counts as noncurrent from
 the moment its successor was written.
 
+## Erasure coding
+
+With `--erasure K+M`, a chunk of at least `erasure_min_len` bytes is placed
+as shards instead of copies. The writing node:
+
+1. encodes the chunk to its stored form (compression, then encryption);
+2. splits it into K equal data shards and computes M parity shards
+   (Reed–Solomon over GF(2^8));
+3. frames each shard with a 48-byte header: index, K, M, the stored-form
+   length, and a BLAKE3 checksum of the shard;
+4. sends shard `i` to the `i`-th voter of the chunk's rendezvous ranking.
+   A node that fails gets its shard handed to the next node beyond K+M.
+
+Shards are files named `<id>.s<i>` beside full chunk files. The same pins,
+grace period, sweeper, eviction and garbage collection apply to them.
+
+**Reads** prefer a local full copy, then the K data shards from their
+designated nodes (concatenation, no decoding). If any are missing or fail
+their checksum, the reader asks every voter which shards it holds,
+reconstructs from any K, and verifies the chunk against its content address.
+
+**Ownership:** the shard index a node is responsible for is a pure function
+of the ranking and the set of live voters (`ec::assignment`). Rank `i < K+M`
+owns index `i` while it is live. Indices of dead designated nodes go, in
+order, to the live nodes ranked after K+M. One failure therefore moves only
+the failed node's shards.
+
+**Repair:** each node rebuilds its own missing index from any K others.
+Holders of shards they are no longer responsible for drop them once the
+responsible node is live and confirms its copy.
+
+**Mixed layouts:** chunks written while fewer than K+M voters existed are
+replicated. Repair recognises them because no voter holds shards of them,
+and reads always try both layouts.
+
 ## Cold tier
 
 Tiering works on chunks, so it composes with dedup. Each chunk record keeps
@@ -480,7 +515,8 @@ Versioning, Object Lock (retention and legal hold) and lifecycle rules.
 Users, identity and bucket policies (with anonymous access), SigV2 header
 auth, HTTPS, mutual TLS between nodes, and dedup-preserving encryption at
 rest. Event notifications to webhooks from the replicated metadata log.
-A chunk-level cold tier on any S3-compatible service.
+A chunk-level cold tier on any S3-compatible service. Reed–Solomon erasure
+coding across nodes.
 
 **Next**
 - io_uring with registered buffers and `O_DIRECT` for large chunks.
@@ -488,9 +524,25 @@ A chunk-level cold tier on any S3-compatible service.
   background under a new key).
 
 **Later**
-- Reed–Solomon erasure coding for cold chunks (for example 8+3), with
-  replication for hot ones.
-- Metadata sharding: multiple Raft groups by bucket or key range.
+- Erasure-coding chunks in the background once they turn cold, instead of
+  choosing the layout at write time.
 - Access-driven tiering: demote chunks by read frequency rather than by
   lifecycle rules, and promote hot chunks back on read.
-- Per-bucket trained zstd dictionaries and similarity-aware placement.
+
+**Deliberately not built (yet)**
+
+- **Metadata sharding (multiple Raft groups).** One Raft group already
+  carries ~1,400 commits/s of 4 KiB PUTs on a shared 4-core VM (group commit
+  batches them into far fewer log entries), and metadata is tiny next to
+  data. Sharding would add cross-shard transactions for `CopyObject` and
+  versioned deletes, a placement directory, and per-shard leaders and
+  leases. That cost is justified only once a measured workload saturates the
+  single group. The state machine is already deterministic and key-ordered,
+  so splitting by bucket later is a contained change.
+- **Per-bucket trained zstd dictionaries.** Dictionaries pay off for many
+  small, similar records (JSON events, log lines). Kosha's chunks are
+  256 KiB–4 MiB, where zstd already finds the redundancy inside each chunk,
+  and the adaptive probe already skips incompressible data. Dictionaries
+  would also add a versioned, replicated dictionary store that every read
+  depends on. They are worth building only with evidence from a workload of
+  small, similar objects.

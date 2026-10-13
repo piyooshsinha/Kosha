@@ -41,6 +41,9 @@ pub struct JoinRequest {
     /// Every member must store chunks under the same key.
     #[serde(default)]
     pub encryption: Option<String>,
+    /// The joiner's erasure layout; every member must use the same.
+    #[serde(default)]
+    pub erasure: Option<crate::erasure::Layout>,
 }
 
 #[derive(Clone)]
@@ -161,6 +164,57 @@ impl Client {
             Err(RpcError::Status(404, _)) => Ok(false),
             Err(e) => Err(e),
         }
+    }
+
+    /// Store a framed erasure-coded shard on `addr`.
+    pub async fn put_shard(
+        &self,
+        addr: &str,
+        id: &str,
+        index: u8,
+        data: Bytes,
+    ) -> Result<(), RpcError> {
+        self.send(
+            self.http
+                .put(format!("{}://{addr}/shard/{id}/{index}", self.scheme))
+                .body(data),
+            Duration::from_secs(60),
+        )
+        .await
+        .map(drop)
+    }
+
+    /// A framed shard, or `None` if `addr` does not hold it.
+    pub async fn get_shard(
+        &self,
+        addr: &str,
+        id: &str,
+        index: u8,
+    ) -> Result<Option<Bytes>, RpcError> {
+        match self
+            .send(
+                self.http
+                    .get(format!("{}://{addr}/shard/{id}/{index}", self.scheme)),
+                Duration::from_secs(60),
+            )
+            .await
+        {
+            Ok(b) => Ok(Some(b)),
+            Err(RpcError::Status(404, _)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Indices of the shards of `id` held by `addr`.
+    pub async fn shard_indices(&self, addr: &str, id: &str) -> Result<Vec<u8>, RpcError> {
+        let body = self
+            .send(
+                self.http
+                    .get(format!("{}://{addr}/shard/{id}", self.scheme)),
+                Duration::from_secs(5),
+            )
+            .await?;
+        decode(&body)
     }
 
     pub async fn get_chunk(&self, addr: &str, id: &str, len: u32) -> Result<Bytes, RpcError> {

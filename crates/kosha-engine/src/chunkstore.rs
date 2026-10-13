@@ -158,6 +158,107 @@ impl ChunkStore {
         self.path_of(id).exists()
     }
 
+    fn shard_path(&self, id: &ChunkId, index: u8) -> PathBuf {
+        let mut p = self.path_of(id);
+        p.set_extension(format!("s{index}"));
+        p
+    }
+
+    /// Erasure-coded shards of `id` held by this node.
+    pub fn shard_indices(&self, id: &ChunkId) -> Vec<u8> {
+        let main = self.path_of(id);
+        let prefix = format!("{}.s", id.to_hex());
+        let Ok(dir) = fs::read_dir(main.parent().expect("chunk path has parent")) else {
+            return Vec::new();
+        };
+        let mut out: Vec<u8> = dir
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().to_str()?.strip_prefix(&prefix)?.parse().ok())
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// Store one shard (opaque bytes, checked by the caller) durably.
+    /// Like a replica, it is protected by the GC grace period until the
+    /// upload that wrote it commits.
+    pub async fn put_shard(&self, id: ChunkId, index: u8, data: Bytes) -> Result<()> {
+        let path = self.shard_path(&id, index);
+        if fs::metadata(&path).is_ok() {
+            touch(&path);
+            return Ok(());
+        }
+        fs::create_dir_all(path.parent().expect("chunk path has parent"))?;
+        let tmp = self.tmp.join(format!(
+            "{}.s{index}.{}",
+            id.to_hex(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let prepared = Prepared::Write {
+            chunk: StoredChunk {
+                id,
+                len: 0,
+                stored_len: data.len() as u64,
+            },
+            tmp,
+            path,
+            buf: data.to_vec(),
+        };
+        // commit_prepared releases a pin on failure; hold one for symmetry.
+        self.pin(id);
+        let r = self.commit_prepared(prepared).await;
+        if r.is_ok() {
+            self.unpin(&id);
+        }
+        r.map(drop)
+    }
+
+    pub async fn get_shard(&self, id: &ChunkId, index: u8) -> Result<Option<Bytes>> {
+        match self
+            .opts
+            .io
+            .read_file(self.shard_path(id, index), 64 * 1024)
+            .await
+        {
+            Ok(b) => Ok(Some(Bytes::from(b))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Delete one shard unless an upload has the chunk pinned.
+    pub fn remove_shard(&self, id: &ChunkId, index: u8) -> Result<bool> {
+        let pins = self.pins.lock();
+        if pins.contains_key(id) {
+            return Ok(false);
+        }
+        let r = match fs::remove_file(self.shard_path(id, index)) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+        };
+        drop(pins);
+        r
+    }
+
+    /// Remove a chunk's full copy and every shard. Returns whether anything
+    /// was removed. The caller holds the pin lock.
+    fn remove_all(&self, id: &ChunkId) -> Result<bool> {
+        let mut removed = false;
+        for path in std::iter::once(self.path_of(id)).chain(
+            self.shard_indices(id)
+                .into_iter()
+                .map(|i| self.shard_path(id, i)),
+        ) {
+            match fs::remove_file(&path) {
+                Ok(()) => removed = true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(removed)
+    }
+
     /// Hash, pin and persist a chunk. The caller owns the pin and must
     /// release it with [`unpin`](Self::unpin) once the reference is committed
     /// (or abandoned).
@@ -335,10 +436,8 @@ impl ChunkStore {
             if pins.contains_key(id) || !still_evicted(id)? {
                 continue;
             }
-            match fs::remove_file(self.path_of(id)) {
-                Ok(()) => removed += 1,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
+            if self.remove_all(id)? {
+                removed += 1;
             }
             drop(pins);
         }
@@ -387,13 +486,18 @@ impl ChunkStore {
         for id in candidates {
             let path = self.path_of(id);
             let pins = self.pins.lock();
-            if pins.contains_key(id) || !self.old_enough(&path) || !is_unreferenced(id)? {
+            let newest = std::iter::once(path.clone())
+                .chain(
+                    self.shard_indices(id)
+                        .into_iter()
+                        .map(|i| self.shard_path(id, i)),
+                )
+                .all(|p| self.old_enough(&p));
+            if pins.contains_key(id) || !newest || !is_unreferenced(id)? {
                 continue;
             }
-            match fs::remove_file(&path) {
-                Ok(()) => removed += 1,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
+            if self.remove_all(id)? {
+                removed += 1;
             }
             drop(pins);
         }
@@ -433,7 +537,9 @@ impl ChunkStore {
                 }
                 for f in fs::read_dir(l2.path())? {
                     let name = f?.file_name();
-                    let Some(hex) = name.to_str() else { continue };
+                    let Some(name) = name.to_str() else { continue };
+                    // `<hex>` (full copy) or `<hex>.s<i>` (shard).
+                    let hex = name.split('.').next().unwrap_or(name);
                     if let Ok(bytes) = hex::decode(hex)
                         && let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice())
                     {
@@ -442,6 +548,8 @@ impl ChunkStore {
                 }
             }
         }
+        candidates.sort();
+        candidates.dedup();
         self.collect(&candidates, is_unreferenced)
     }
 }

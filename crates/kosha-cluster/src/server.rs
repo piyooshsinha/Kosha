@@ -37,6 +37,8 @@ pub fn router(inner: Arc<Inner>) -> Router {
             "/chunk/{id}",
             get(get_chunk).put(put_chunk).head(head_chunk),
         )
+        .route("/shard/{id}", get(list_shards))
+        .route("/shard/{id}/{index}", get(get_shard).put(put_shard))
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(inner.clone(), authenticate))
         .with_state(inner)
@@ -133,6 +135,16 @@ async fn join(State(inner): St, body: Bytes) -> Response {
             show(req.encryption.as_deref())
         ))));
     }
+    if req.erasure != inner.cfg.erasure {
+        let show = |l: Option<crate::erasure::Layout>| {
+            l.map_or("replication".to_string(), |l| format!("erasure {l}"))
+        };
+        return msgpack(&Reply::Ok(Err(format!(
+            "erasure coding mismatch: the cluster uses {}, the joining node {}",
+            show(inner.cfg.erasure),
+            show(req.erasure)
+        ))));
+    }
     // Catch the new node up as a learner first, then promote it.
     match inner.raft.add_learner(req.id, req.node.clone(), true).await {
         Ok(_) => {}
@@ -215,5 +227,42 @@ async fn get_chunk(
     match store.get(&id, q.len).await {
         Ok(b) => Response::new(Body::from(b)),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn put_shard(
+    State(inner): St,
+    Path((id, index)): Path<(String, u8)>,
+    body: Bytes,
+) -> Response {
+    let Some(id) = parse_id(&id) else {
+        return bad_request("invalid chunk id");
+    };
+    // Refuse damaged or mislabelled shards before they reach the disk.
+    match crate::erasure::parse(&body) {
+        Some(s) if s.index == index => {}
+        _ => return bad_request("shard failed verification"),
+    }
+    match inner.engine.chunk_store().put_shard(id, index, body).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn get_shard(State(inner): St, Path((id, index)): Path<(String, u8)>) -> Response {
+    let Some(id) = parse_id(&id) else {
+        return bad_request("invalid chunk id");
+    };
+    match inner.engine.chunk_store().get_shard(&id, index).await {
+        Ok(Some(b)) => Response::new(Body::from(b)),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn list_shards(State(inner): St, Path(id): Path<String>) -> Response {
+    match parse_id(&id) {
+        Some(id) => msgpack(&inner.engine.chunk_store().shard_indices(&id)),
+        None => bad_request("invalid chunk id"),
     }
 }

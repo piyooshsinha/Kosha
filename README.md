@@ -23,6 +23,7 @@ with io_uring.
 | Consistency | eventually consistent or proprietary | **linearizable** reads and writes on any node (ReadIndex) |
 | Concurrency control | last writer wins | adds **conditional writes** (`If-None-Match: *`, `If-Match`) evaluated in the Raft log |
 | Write path | one commit per request | **group commit**: concurrent writes share one durable transaction / one Raft entry |
+| Redundancy | full copies (2–3×) | **replication or Reed–Solomon erasure coding** (e.g. 4+2: 1.5× storage, survives 2 failures) |
 | Durability after node loss | manual rebuild | **self-healing**: background re-replication restores every chunk's replica count |
 | Retried writes | may apply twice | **exactly-once**: request ids make a re-delivered write return its original result |
 | Data durability cost | fsync per file | **group sync**: concurrent chunk writes share one `syncfs`, including the directory entry |
@@ -326,6 +327,51 @@ Things to know:
 - Internal traffic (port 9100) is authenticated by the shared secret. Without
   `--cluster-tls-*` it is plain HTTP, so **either enable mutual TLS
   ([Security](#cluster-mutual-tls)) or keep it on a private network.**
+
+### Erasure coding
+
+By default each chunk is stored as `--replication` full copies. With
+`--erasure K+M` (the same on every node), chunks of at least
+`--erasure-min-chunk` bytes (default 128 KiB) are instead split into K data
+and M parity shards on K+M different nodes. Any K shards rebuild the chunk.
+
+| | Storage | Survives |
+|---|---|---|
+| `--replication 2` | 2× | 1 failed node |
+| `--replication 3` | 3× | 2 failed nodes |
+| `--erasure 2+1` | 1.5× | 1 failed node |
+| `--erasure 4+2` | 1.5× | 2 failed nodes |
+| `--erasure 8+3` | 1.375× | 3 failed nodes |
+
+- **What gets split** is the chunk's stored form, already compressed and
+  encrypted. Every shard carries a BLAKE3 checksum, so a damaged shard is
+  detected and treated as missing.
+- **Healthy reads** fetch only the K data shards and concatenate them, with
+  no decoding.
+- **Degraded reads** use parity, and the result is verified against the
+  chunk's address.
+- **Repair:** when a node dies, the next node in the chunk's ranking rebuilds
+  its shards from any K others. Only that node's shards move, and the
+  repaired data is re-verified like everything else.
+- **Small chunks**, and clusters with fewer than K+M nodes, use replication.
+  Reads try both layouts, so changing the setting later is safe.
+- **For self-healing**, run at least K+M+1 nodes, so a failed node's shards
+  have somewhere to go.
+- A node with a different `--erasure` setting is refused when it joins.
+
+Measured on 4 nodes (24 × 16 MiB objects, same VM, alternating runs):
+
+| | Disk used | PUT | GET |
+|---|---|---|---|
+| `--replication 2` | 774 MB | 97–101 MiB/s | 681–693 MiB/s |
+| `--erasure 2+1` | **585 MB** (−24%) | 95–106 MiB/s | 550–571 MiB/s |
+
+GETs are ~18% slower because every chunk is gathered from two nodes; writes
+are unchanged.
+
+In a test, a node was SIGKILLed while holding 50 MB of 2+1 data. Reads stayed
+correct, and repair rebuilt its 33 shards on the remaining nodes (back to
+1.5×).
 
 ### Try a cluster on one machine
 
@@ -700,6 +746,8 @@ io_uring. `--io auto` (the default) detects this and falls back to threads;
 | `--replication` | `KOSHA_REPLICATION` | `2` | copies of each chunk |
 | `--gc-grace-secs` | `KOSHA_GC_GRACE_SECS` | `900` | cluster: keep unreferenced chunks this long |
 | `--repair-interval-secs` | `KOSHA_REPAIR_INTERVAL_SECS` | `60` | cluster: background re-replication/rebalancing pass (`0` disables) |
+| `--erasure K+M` | `KOSHA_ERASURE` | none | cluster: Reed–Solomon erasure coding instead of replication for large chunks |
+| `--erasure-min-chunk` | `KOSHA_ERASURE_MIN_CHUNK` | `131072` | cluster: smaller chunks stay replicated |
 | `--no-lease-reads` | `KOSHA_NO_LEASE_READS` | off | cluster: prove leadership with a quorum round-trip on every read |
 | `--tls-cert` / `--tls-key` | `KOSHA_TLS_CERT` / `KOSHA_TLS_KEY` | none | serve S3 and the console over HTTPS |
 | `--encryption-key-file` | `KOSHA_ENCRYPTION_KEY_FILE` | none | encrypt object data at rest (64 hex chars); fixed per data directory |

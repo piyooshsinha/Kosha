@@ -15,6 +15,7 @@ kosha-engine = { version = "0.1.0", path = "../kosha-engine" }
 openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 parking_lot = "0.12.5"
 redb = "4.3.0"
+reed-solomon-erasure = "6.0.0"
 reqwest = { version = "0.13.5", default-features = false, features = ["stream", "rustls-no-provider"] }
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
