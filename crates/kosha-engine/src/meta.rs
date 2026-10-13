@@ -40,11 +40,13 @@ const REQUESTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("requests")
 const REQUEST_SEQ: TableDefinition<&[u8], &[u8]> = TableDefinition::new("request_seq");
 
 /// Every version of every key in versioned buckets (see `versions.rs`).
+/// access key -> `User`.
+pub(crate) const USERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("users");
 pub(crate) const VERSIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("versions");
 
 /// Byte-keyed tables included in snapshots generically. New tables only need
 /// to be listed here.
-const BYTE_TABLES: &[TableDefinition<&[u8], &[u8]>] = &[REQUESTS, REQUEST_SEQ, VERSIONS];
+const BYTE_TABLES: &[TableDefinition<&[u8], &[u8]>] = &[REQUESTS, REQUEST_SEQ, VERSIONS, USERS];
 
 /// How many request ids are remembered for deduplication.
 const REMEMBERED_REQUESTS: u64 = 100_000;
@@ -138,6 +140,14 @@ pub enum Command {
         bypass_governance: bool,
         now: DateTime<Utc>,
     },
+    /// Create a user (`create`) or replace an existing one.
+    PutUser {
+        user: User,
+        create: bool,
+    },
+    DeleteUser {
+        access_key: String,
+    },
 }
 
 /// Identifies one logical write across retries.
@@ -189,6 +199,8 @@ pub enum Rejection {
     InvalidBucketState(String),
     AccessDenied(String),
     MethodNotAllowed(String),
+    NoSuchUser,
+    UserAlreadyExists(String),
 }
 
 impl From<Rejection> for Error {
@@ -208,6 +220,8 @@ impl From<Rejection> for Error {
             Rejection::InvalidBucketState(m) => Error::InvalidBucketState(m),
             Rejection::AccessDenied(m) => Error::AccessDenied(m),
             Rejection::MethodNotAllowed(m) => Error::MethodNotAllowed(m),
+            Rejection::NoSuchUser => Error::NoSuchUser,
+            Rejection::UserAlreadyExists(m) => Error::UserAlreadyExists(m),
         }
     }
 }
@@ -740,6 +754,7 @@ impl Tx<'_> {
                     BucketConfigUpdate::Tags(tags) => info.config.tags = tags,
                     BucketConfigUpdate::Cors(cors) => info.config.cors = cors,
                     BucketConfigUpdate::Lifecycle(rules) => info.config.lifecycle = rules,
+                    BucketConfigUpdate::Policy(policy) => info.config.policy = policy,
                     BucketConfigUpdate::Versioning(v) => {
                         if v == Versioning::Unversioned {
                             return reject(Rejection::InvalidRequest(
@@ -804,6 +819,14 @@ impl Tx<'_> {
                     now,
                 )?;
                 Ok(CommandOutput::Object(meta))
+            }
+            Command::PutUser { user, create } => {
+                self.put_user(user, create)?;
+                Ok(CommandOutput::Done)
+            }
+            Command::DeleteUser { access_key } => {
+                self.delete_user(&access_key)?;
+                Ok(CommandOutput::Done)
             }
         }
     }

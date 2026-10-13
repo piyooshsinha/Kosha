@@ -36,6 +36,10 @@ pub enum Error {
     AccessDenied(String),
     #[error("{0}")]
     MethodNotAllowed(String),
+    #[error("the user does not exist")]
+    NoSuchUser,
+    #[error("{0}")]
+    UserAlreadyExists(String),
     #[error("content digest does not match")]
     BadDigest,
     #[error("data corruption detected: {0}")]

@@ -17,6 +17,7 @@ use crate::AppState;
 use crate::auth::{self, AuthRequest, Payload};
 use crate::body::{BodySource, check_md5, content_md5};
 use crate::error::{S3Error, S3Result};
+use crate::iam::{self, Policy, PolicyKind, Principal, RequestFacts};
 use crate::xml::{Xml, iso8601};
 
 const MAX_XML_BODY: usize = 8 * 1024 * 1024;
@@ -40,6 +41,51 @@ struct Ctx {
     bucket: Option<String>,
     key: Option<String>,
     payload: Payload,
+    authz: Authz,
+}
+
+/// Authorization state of one request.
+pub(crate) struct Authz {
+    /// Root key, or no credentials configured: everything is allowed.
+    open: bool,
+    identity: Option<Policy>,
+    facts: RequestFacts,
+    /// Parsed bucket policies, by bucket, loaded on first use.
+    buckets: parking_lot::Mutex<std::collections::HashMap<String, Option<Arc<Policy>>>>,
+}
+
+impl Authz {
+    fn bucket_policy(&self, engine: &kosha_engine::Engine, bucket: &str) -> Option<Arc<Policy>> {
+        self.buckets
+            .lock()
+            .entry(bucket.to_string())
+            .or_insert_with(|| {
+                let doc = engine.bucket_local(bucket).ok()?.config.policy?;
+                Policy::parse(&doc, PolicyKind::Bucket(bucket))
+                    .ok()
+                    .map(Arc::new)
+            })
+            .clone()
+    }
+
+    fn allows(
+        &self,
+        engine: &kosha_engine::Engine,
+        bucket: Option<&str>,
+        check: &iam::Check,
+    ) -> bool {
+        if self.open {
+            return true;
+        }
+        let bp = bucket.and_then(|b| self.bucket_policy(engine, b));
+        iam::decide(
+            self.identity.as_ref(),
+            bp.as_deref(),
+            check.action,
+            &check.resource,
+            &self.facts,
+        )
+    }
 }
 
 impl Ctx {
@@ -60,6 +106,20 @@ impl Ctx {
 
     fn engine(&self) -> &kosha_engine::Engine {
         &self.st.engine
+    }
+
+    /// Require `action` on `resource` (in `bucket`, whose policy applies).
+    fn authorize(&self, action: &'static str, bucket: &str, resource: String) -> S3Result<()> {
+        let check = iam::Check { action, resource };
+        if self.authz.allows(&self.st.engine, Some(bucket), &check) {
+            Ok(())
+        } else {
+            Err(S3Error::access_denied("Access Denied"))
+        }
+    }
+
+    fn may(&self, action: &'static str, bucket: &str, resource: String) -> bool {
+        self.authorize(action, bucket, resource).is_ok()
     }
 
     fn resource(&self) -> String {
@@ -221,7 +281,7 @@ async fn handle(st: Arc<AppState>, req: Request) -> S3Result<Response> {
     }
 
     let query = auth::parse_query(parts.uri.query());
-    let payload = auth::authenticate(
+    let authn = auth::authenticate(
         &st.cfg.credentials,
         &AuthRequest {
             method: &parts.method,
@@ -230,7 +290,43 @@ async fn handle(st: Arc<AppState>, req: Request) -> S3Result<Response> {
             headers: &parts.headers,
         },
     )?;
+    let payload = authn.payload;
+    let open = st.cfg.credentials.is_empty()
+        || authn
+            .access_key
+            .as_deref()
+            .is_some_and(|k| st.cfg.credentials.is_root(k));
+    let (principal, identity) = match (&authn.access_key, open) {
+        (_, true) | (None, false) => (Principal::Anonymous, None),
+        (Some(ak), false) => {
+            let user = st
+                .engine
+                .user_local(ak)?
+                .ok_or_else(|| S3Error::access_denied("unknown access key"))?;
+            let identity = user
+                .policy
+                .as_deref()
+                .and_then(|p| Policy::parse(p, PolicyKind::Identity).ok());
+            (
+                Principal::User {
+                    name: user.name,
+                    access_key: user.access_key,
+                },
+                identity,
+            )
+        }
+    };
 
+    if raw_path.starts_with("/_kosha/") && !open {
+        return Err(S3Error::access_denied(if authn.access_key.is_none() {
+            "anonymous access is disabled"
+        } else {
+            "administration requires a root access key"
+        }));
+    }
+    if let Some(rest) = raw_path.strip_prefix("/_kosha/admin/") {
+        return crate::admin::handle(&st, &parts.method, rest, body, payload, &parts.headers).await;
+    }
     if raw_path == "/_kosha/stats" {
         return stats(&st).await;
     }
@@ -268,6 +364,30 @@ async fn handle(st: Arc<AppState>, req: Request) -> S3Result<Response> {
     }
 
     let (bucket, key) = resolve_target(&st, &parts.headers, &raw_path);
+    let mut facts = RequestFacts::new(principal);
+    if !open {
+        request_facts(&mut facts, &st, &parts, &query, &authn.access_key);
+    }
+    let authz = Authz {
+        open,
+        identity,
+        facts,
+        buckets: Default::default(),
+    };
+    for check in iam::required(
+        &parts.method,
+        bucket.as_deref(),
+        key.as_deref(),
+        &query,
+        &parts.headers,
+    ) {
+        if !authz.allows(&st.engine, bucket.as_deref(), &check) {
+            if authn.access_key.is_none() && bucket.is_none() {
+                return Err(S3Error::access_denied("anonymous access is disabled"));
+            }
+            return Err(S3Error::access_denied("Access Denied"));
+        }
+    }
     let ctx = Ctx {
         st,
         method: parts.method,
@@ -276,8 +396,19 @@ async fn handle(st: Arc<AppState>, req: Request) -> S3Result<Response> {
         bucket,
         key,
         payload,
+        authz,
     };
     let result = route(&ctx, body).await.map_err(|e| {
+        // Like S3: without s3:ListBucket, a missing key reads as AccessDenied
+        // so callers cannot probe which keys exist.
+        let e = match (&ctx.bucket, e.code) {
+            (Some(b), "NoSuchKey" | "NoSuchVersion")
+                if !ctx.may("s3:ListBucket", b, iam::bucket_arn(b)) =>
+            {
+                S3Error::access_denied("Access Denied")
+            }
+            _ => e,
+        };
         if e.resource.is_none() {
             e.with_resource(ctx.resource())
         } else {
@@ -303,6 +434,129 @@ async fn handle(st: Arc<AppState>, req: Request) -> S3Result<Response> {
             Ok(resp)
         }
         _ => result,
+    }
+}
+
+/// Condition keys available to policies.
+fn request_facts(
+    facts: &mut RequestFacts,
+    st: &AppState,
+    parts: &axum::http::request::Parts,
+    query: &[(String, String)],
+    access_key: &Option<String>,
+) {
+    if let Some(ci) = parts
+        .extensions
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+    {
+        facts.set("aws:SourceIp", ci.0.ip().to_string());
+    }
+    facts.set("aws:SecureTransport", st.cfg.secure_transport.to_string());
+    facts.set("aws:CurrentTime", Utc::now().to_rfc3339());
+    facts.set("aws:EpochTime", Utc::now().timestamp().to_string());
+    for (h, key) in [
+        ("user-agent", "aws:UserAgent"),
+        ("referer", "aws:Referer"),
+        (
+            "x-amz-server-side-encryption",
+            "s3:x-amz-server-side-encryption",
+        ),
+        ("x-amz-acl", "s3:x-amz-acl"),
+        ("x-amz-copy-source", "s3:x-amz-copy-source"),
+        ("x-amz-metadata-directive", "s3:x-amz-metadata-directive"),
+        ("x-amz-storage-class", "s3:x-amz-storage-class"),
+        ("x-amz-object-lock-mode", "s3:object-lock-mode"),
+    ] {
+        if let Some(v) = parts.headers.get(h).and_then(|v| v.to_str().ok()) {
+            facts.set(key, v);
+        }
+    }
+    for (q, key) in [
+        ("prefix", "s3:prefix"),
+        ("delimiter", "s3:delimiter"),
+        ("max-keys", "s3:max-keys"),
+        ("versionId", "s3:VersionId"),
+    ] {
+        if let Some((_, v)) = query.iter().find(|(k, _)| k == q) {
+            facts.set(key, v.clone());
+        }
+    }
+    if access_key.is_some() {
+        let v4 = parts
+            .headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("AWS4"))
+            || query.iter().any(|(k, _)| k == "X-Amz-Signature");
+        facts.set(
+            "s3:signatureversion",
+            if v4 { "AWS4-HMAC-SHA256" } else { "AWS" },
+        );
+        let header = parts.headers.contains_key("authorization");
+        facts.set(
+            "s3:authType",
+            if header {
+                "REST-HEADER"
+            } else {
+                "REST-QUERY-STRING"
+            },
+        );
+    }
+}
+
+/// Get/Put/DeleteBucketPolicy and GetBucketPolicyStatus.
+async fn bucket_policy(ctx: &Ctx, bucket: &str, body: Body) -> S3Result<Response> {
+    let engine = ctx.engine();
+    if ctx.has("policyStatus") {
+        let info = engine.bucket(bucket).await?;
+        let public = info
+            .config
+            .policy
+            .as_deref()
+            .and_then(|p| Policy::parse(p, PolicyKind::Bucket(bucket)).ok())
+            .is_some_and(|p| p.is_public());
+        let mut x = Xml::new("PolicyStatus");
+        x.elem("IsPublic", if public { "true" } else { "false" });
+        return Ok(xml_response(x.finish("PolicyStatus")));
+    }
+    match ctx.method {
+        Method::GET => {
+            let info = engine.bucket(bucket).await?;
+            let Some(doc) = info.config.policy else {
+                return Err(S3Error::new(
+                    StatusCode::NOT_FOUND,
+                    "NoSuchBucketPolicy",
+                    "The bucket policy does not exist",
+                ));
+            };
+            Ok(Response::builder()
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(doc))
+                .unwrap())
+        }
+        Method::PUT => {
+            let doc = read_text(ctx, body).await?;
+            if doc.len() > 20 * 1024 {
+                return Err(S3Error::new(
+                    StatusCode::BAD_REQUEST,
+                    "PolicyTooLarge",
+                    "Policies must be at most 20 KiB",
+                ));
+            }
+            Policy::parse(&doc, PolicyKind::Bucket(bucket))
+                .map_err(|e| S3Error::new(StatusCode::BAD_REQUEST, "MalformedPolicy", e))?;
+            engine
+                .set_bucket_config(bucket, BucketConfigUpdate::Policy(Some(doc)))
+                .await?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+        Method::DELETE => {
+            engine
+                .set_bucket_config(bucket, BucketConfigUpdate::Policy(None))
+                .await?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+        _ => Err(S3Error::not_implemented("this bucket policy operation")),
     }
 }
 
@@ -510,6 +764,9 @@ async fn route(ctx: &Ctx, body: Body) -> S3Result<Response> {
         },
         (Some(bucket), None) => {
             let bucket = bucket.as_str();
+            if ctx.has("policy") || ctx.has("policyStatus") {
+                return bucket_policy(ctx, bucket, body).await;
+            }
             if ["tagging", "cors", "versioning", "object-lock", "lifecycle"]
                 .iter()
                 .any(|s| ctx.has(s))
@@ -522,7 +779,6 @@ async fn route(ctx: &Ctx, body: Body) -> S3Result<Response> {
             match *m {
                 Method::PUT => {
                     for sub in [
-                        "policy",
                         "acl",
                         "encryption",
                         "object-lock",
@@ -545,7 +801,7 @@ async fn route(ctx: &Ctx, body: Body) -> S3Result<Response> {
                         .unwrap())
                 }
                 Method::DELETE => {
-                    if ctx.has("policy") || ctx.has("encryption") {
+                    if ctx.has("encryption") {
                         ctx.engine().bucket(bucket).await?;
                         return Ok(StatusCode::NO_CONTENT.into_response());
                     }
@@ -702,12 +958,6 @@ async fn get_bucket(ctx: &Ctx, bucket: &str) -> S3Result<Response> {
     // Configuration that Kosha does not store yet: answer the way S3 does
     // for a bucket where it was never set.
     let absent = [
-        (
-            "policy",
-            StatusCode::NOT_FOUND,
-            "NoSuchBucketPolicy",
-            "The bucket policy does not exist",
-        ),
         (
             "website",
             StatusCode::NOT_FOUND,
@@ -874,6 +1124,8 @@ async fn delete_objects(ctx: &Ctx, bucket: &str, body: Body) -> S3Result<Respons
             "at most 1000 keys can be deleted per request",
         ));
     }
+    let bypass = crate::protection::bypass_governance(&ctx.headers);
+    let mut denied = Vec::new();
     let targets = req
         .objects
         .into_iter()
@@ -881,15 +1133,35 @@ async fn delete_objects(ctx: &Ctx, bucket: &str, body: Body) -> S3Result<Respons
             key: o.key,
             version_id: o.version_id,
         })
-        .collect();
-    let outcomes = ctx
-        .engine()
-        .delete_targets(
-            bucket,
-            targets,
-            crate::protection::bypass_governance(&ctx.headers),
-        )
-        .await?;
+        .filter(|t| {
+            let arn = iam::object_arn(bucket, &t.key);
+            let action = if t.version_id.is_some() {
+                "s3:DeleteObjectVersion"
+            } else {
+                "s3:DeleteObject"
+            };
+            let ok = ctx.may(action, bucket, arn.clone())
+                && (!bypass || ctx.may("s3:BypassGovernanceRetention", bucket, arn));
+            if !ok {
+                denied.push(kosha_engine::DeleteOutcome {
+                    key: t.key.clone(),
+                    version_id: t.version_id.clone(),
+                    delete_marker: false,
+                    existed: false,
+                    error: Some(kosha_engine::Rejection::AccessDenied(
+                        "Access Denied".into(),
+                    )),
+                });
+            }
+            ok
+        })
+        .collect::<Vec<_>>();
+    let mut outcomes = if targets.is_empty() {
+        Vec::new()
+    } else {
+        ctx.engine().delete_targets(bucket, targets, bypass).await?
+    };
+    outcomes.extend(denied);
     let mut x = Xml::new("DeleteResult");
     for o in &outcomes {
         match &o.error {
@@ -1270,9 +1542,20 @@ fn parse_copy_source_version(v: &str) -> S3Result<(String, String, Option<String
     }
 }
 
+/// Copying needs read access to the source as well.
+fn authorize_copy_source(ctx: &Ctx, sb: &str, sk: &str, sv: &Option<String>) -> S3Result<()> {
+    let action = if sv.is_some() {
+        "s3:GetObjectVersion"
+    } else {
+        "s3:GetObject"
+    };
+    ctx.authorize(action, sb, iam::object_arn(sb, sk))
+}
+
 async fn copy_object(ctx: &Ctx, bucket: &str, key: &str) -> S3Result<Response> {
     let (sb, sk, sv) =
         parse_copy_source_version(ctx.header("x-amz-copy-source").unwrap_or_default())?;
+    authorize_copy_source(ctx, &sb, &sk, &sv)?;
     let replace = ctx
         .header("x-amz-metadata-directive")
         .is_some_and(|d| d.eq_ignore_ascii_case("REPLACE"));
@@ -1563,6 +1846,7 @@ async fn upload_part_copy(
     src: &str,
 ) -> S3Result<Response> {
     let (sb, sk, sv) = parse_copy_source_version(src)?;
+    authorize_copy_source(ctx, &sb, &sk, &sv)?;
     let meta = match &sv {
         Some(v) => ctx
             .engine()

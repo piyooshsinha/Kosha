@@ -2,6 +2,7 @@
 //! (aws-chunked) payload signatures.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use axum::http::{HeaderMap, Method};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
@@ -24,9 +25,25 @@ const AWS_URI: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'~');
 const AWS_PATH: &AsciiSet = &AWS_URI.remove(b'/');
 
-#[derive(Clone, Debug, Default)]
+/// Looks up the secret of a non-root access key (users stored in the
+/// replicated metadata).
+pub type KeyLookup = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+/// Root keys (from the command line) plus an optional lookup for user keys.
+/// Root keys bypass policies; user keys are subject to them.
+#[derive(Clone, Default)]
 pub struct Credentials {
     keys: HashMap<String, String>,
+    users: Option<KeyLookup>,
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("root_keys", &self.keys.len())
+            .field("users", &self.users.is_some())
+            .finish()
+    }
 }
 
 impl Credentials {
@@ -39,9 +56,42 @@ impl Credentials {
         self
     }
 
+    /// Resolve keys that are not root keys through `lookup`.
+    pub fn with_users(mut self, lookup: KeyLookup) -> Self {
+        self.users = Some(lookup);
+        self
+    }
+
+    /// No root keys: development mode, every request is allowed.
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
+
+    pub fn is_root(&self, access_key: &str) -> bool {
+        self.keys.contains_key(access_key)
+    }
+
+    fn secret(&self, access_key: &str) -> S3Result<String> {
+        self.keys
+            .get(access_key)
+            .cloned()
+            .or_else(|| self.users.as_ref().and_then(|u| u(access_key)))
+            .ok_or_else(|| {
+                S3Error::new(
+                    axum::http::StatusCode::FORBIDDEN,
+                    "InvalidAccessKeyId",
+                    "The AWS Access Key Id you provided does not exist in our records.",
+                )
+            })
+    }
+}
+
+/// Result of authentication: how to read the body, and who signed.
+#[derive(Clone, Debug)]
+pub struct Authenticated {
+    pub payload: Payload,
+    /// `None` for unsigned (anonymous) requests.
+    pub access_key: Option<String>,
 }
 
 /// How the request body is protected, as declared by `x-amz-content-sha256`.
@@ -254,33 +304,43 @@ pub struct AuthRequest<'a> {
     pub headers: &'a HeaderMap,
 }
 
-/// Authenticate a request. With empty credentials every request is allowed
-/// (anonymous mode), but the payload declaration is still honoured so
-/// aws-chunked bodies decode correctly.
-pub fn authenticate(creds: &Credentials, req: &AuthRequest<'_>) -> S3Result<Payload> {
+/// Authenticate a request. Unsigned requests are returned as anonymous
+/// (whether they may proceed is up to authorization). The payload
+/// declaration is honoured either way so aws-chunked bodies decode.
+pub fn authenticate(creds: &Credentials, req: &AuthRequest<'_>) -> S3Result<Authenticated> {
     let decl = payload_from_header(req.headers)?;
     let presigned = req.query.iter().any(|(k, _)| k == "X-Amz-Signature");
-    let has_header = req.headers.contains_key("authorization");
-
-    let presigned_v2 = req.query.iter().any(|(k, _)| k == "AWSAccessKeyId");
-    if creds.is_empty() || (!presigned && !presigned_v2 && !has_header) {
-        if !creds.is_empty() {
-            return Err(S3Error::access_denied("anonymous access is disabled"));
-        }
-        return Ok(match decl {
-            PayloadDecl::Unsigned => Payload::Unsigned,
-            PayloadDecl::Sha256(h) => Payload::Sha256(h),
-            PayloadDecl::StreamingSigned | PayloadDecl::StreamingUnsigned => {
-                Payload::StreamingUnsigned
-            }
+    let auth_header = req
+        .headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok());
+    let presigned_v2 = req.query.iter().any(|(k, _)| k == "AWSAccessKeyId")
+        && req.query.iter().any(|(k, _)| k == "Signature");
+    let unsigned = |decl: PayloadDecl| match decl {
+        PayloadDecl::Unsigned => Payload::Unsigned,
+        PayloadDecl::Sha256(h) => Payload::Sha256(h),
+        PayloadDecl::StreamingSigned | PayloadDecl::StreamingUnsigned => Payload::StreamingUnsigned,
+    };
+    if creds.is_empty() || (!presigned && !presigned_v2 && auth_header.is_none()) {
+        return Ok(Authenticated {
+            payload: unsigned(decl),
+            access_key: None,
         });
     }
 
-    if req.query.iter().any(|(k, _)| k == "Signature")
-        && req.query.iter().any(|(k, _)| k == "AWSAccessKeyId")
-    {
-        verify_v2_presigned(creds, req)?;
-        return Ok(Payload::Unsigned);
+    if presigned_v2 {
+        let access_key = verify_v2(creds, req, None)?;
+        return Ok(Authenticated {
+            payload: Payload::Unsigned,
+            access_key: Some(access_key),
+        });
+    }
+    if let Some(v2) = auth_header.and_then(|h| h.strip_prefix("AWS ")) {
+        let access_key = verify_v2(creds, req, Some(v2))?;
+        return Ok(Authenticated {
+            payload: unsigned(decl),
+            access_key: Some(access_key),
+        });
     }
 
     let now = Utc::now();
@@ -377,13 +437,7 @@ pub fn authenticate(creds: &Credentials, req: &AuthRequest<'_>) -> S3Result<Payl
             "credential date does not match X-Amz-Date",
         ));
     }
-    let secret = creds.keys.get(&parts.access_key).ok_or_else(|| {
-        S3Error::new(
-            axum::http::StatusCode::FORBIDDEN,
-            "InvalidAccessKeyId",
-            "The AWS Access Key Id you provided does not exist in our records.",
-        )
-    })?;
+    let secret = creds.secret(&parts.access_key)?;
 
     let signed: Vec<&str> = parts.signed_headers.iter().map(String::as_str).collect();
     if !signed.contains(&"host") {
@@ -409,14 +463,15 @@ pub fn authenticate(creds: &Credentials, req: &AuthRequest<'_>) -> S3Result<Payl
         scope,
         hex::encode(Sha256::digest(canonical_request.as_bytes())),
     );
-    let key = signing_key(secret, &parts.date, &parts.region, &parts.service);
+    let key = signing_key(&secret, &parts.date, &parts.region, &parts.service);
     let expected = hex::encode(hmac(&key, string_to_sign.as_bytes()));
     if !ct_eq(expected.as_bytes(), parts.signature.as_bytes()) {
         tracing::debug!(%canonical_request, "signature mismatch");
         return Err(S3Error::signature_mismatch());
     }
 
-    Ok(match decl {
+    let access_key = parts.access_key.clone();
+    let payload = match decl {
         _ if presigned => Payload::Unsigned,
         PayloadDecl::Unsigned => Payload::Unsigned,
         PayloadDecl::Sha256(h) => Payload::Sha256(h),
@@ -427,6 +482,10 @@ pub fn authenticate(creds: &Credentials, req: &AuthRequest<'_>) -> S3Result<Payl
             scope,
             prev_signature: expected,
         }),
+    };
+    Ok(Authenticated {
+        payload,
+        access_key: Some(access_key),
     })
 }
 
@@ -459,9 +518,10 @@ const V2_SUBRESOURCES: &[&str] = &[
     "website",
 ];
 
-/// Legacy SigV2 query-string authentication. boto3 still produces these
-/// presigned URLs by default, so they are accepted for GET/PUT/HEAD/DELETE.
-fn verify_v2_presigned(creds: &Credentials, req: &AuthRequest<'_>) -> S3Result<()> {
+/// Legacy SigV2: presigned URLs (boto3's default) when `header` is `None`,
+/// otherwise the `Authorization: AWS <key>:<signature>` header (the
+/// `AWS ` prefix already stripped). Returns the access key.
+fn verify_v2(creds: &Credentials, req: &AuthRequest<'_>, header: Option<&str>) -> S3Result<String> {
     let q = |k: &str| {
         req.query
             .iter()
@@ -469,20 +529,44 @@ fn verify_v2_presigned(creds: &Credentials, req: &AuthRequest<'_>) -> S3Result<(
             .map(|(_, v)| v.as_str())
             .ok_or_else(|| S3Error::access_denied(format!("missing {k}")))
     };
-    let expires = q("Expires")?;
-    let expires_at: i64 = expires
-        .parse()
-        .map_err(|_| S3Error::access_denied("invalid Expires"))?;
-    if Utc::now().timestamp() > expires_at {
-        return Err(S3Error::access_denied("Request has expired"));
-    }
-    let secret = creds.keys.get(q("AWSAccessKeyId")?).ok_or_else(|| {
-        S3Error::new(
-            axum::http::StatusCode::FORBIDDEN,
-            "InvalidAccessKeyId",
-            "The AWS Access Key Id you provided does not exist in our records.",
-        )
-    })?;
+    let (access_key, signature, date_line) = match header {
+        None => {
+            let expires = q("Expires")?;
+            let expires_at: i64 = expires
+                .parse()
+                .map_err(|_| S3Error::access_denied("invalid Expires"))?;
+            if Utc::now().timestamp() > expires_at {
+                return Err(S3Error::access_denied("Request has expired"));
+            }
+            (q("AWSAccessKeyId")?, q("Signature")?, expires.to_string())
+        }
+        Some(h) => {
+            let (key, sig) = h
+                .split_once(':')
+                .ok_or_else(|| S3Error::access_denied("malformed Authorization header"))?;
+            // The request time is x-amz-date when present (and then the Date
+            // line is empty), otherwise the Date header.
+            let get = |n: &str| req.headers.get(n).and_then(|v| v.to_str().ok());
+            let (when, line) = match (get("x-amz-date"), get("date")) {
+                (Some(d), _) => (d, String::new()),
+                (None, Some(d)) => (d, d.to_string()),
+                (None, None) => return Err(S3Error::access_denied("missing Date header")),
+            };
+            let t = DateTime::parse_from_rfc2822(when)
+                .map(|t| t.with_timezone(&Utc))
+                .or_else(|_| parse_amz_date(when))
+                .map_err(|_| S3Error::access_denied("invalid Date header"))?;
+            if (Utc::now() - t).num_seconds().abs() > MAX_SKEW_SECS {
+                return Err(S3Error::new(
+                    axum::http::StatusCode::FORBIDDEN,
+                    "RequestTimeTooSkewed",
+                    "The difference between the request time and the server's time is too large.",
+                ));
+            }
+            (key, sig, line)
+        }
+    };
+    let secret = creds.secret(access_key)?;
 
     let header = |n: &str| {
         req.headers
@@ -510,41 +594,46 @@ fn verify_v2_presigned(creds: &Credentials, req: &AuthRequest<'_>) -> S3Result<(
         .filter(|(k, _)| V2_SUBRESOURCES.contains(&k.as_str()))
         .collect();
     sub.sort();
-    let mut resource = req.raw_path.to_string();
-    if !sub.is_empty() {
-        resource.push('?');
-        resource.push_str(
-            &sub.iter()
-                .map(|(k, v)| {
-                    if v.is_empty() {
-                        k.clone()
-                    } else {
-                        format!("{k}={v}")
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("&"),
+    let subresources = (!sub.is_empty()).then(|| {
+        sub.iter()
+            .map(|(k, v)| {
+                if v.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{k}={v}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("&")
+    });
+    let amz_lines: String = amz.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
+    let sign = |path: &str| {
+        let mut resource = path.to_string();
+        if let Some(s) = &subresources {
+            resource.push('?');
+            resource.push_str(s);
+        }
+        let string_to_sign = format!(
+            "{}\n{}\n{}\n{}\n{amz_lines}{resource}",
+            req.method.as_str(),
+            header("content-md5"),
+            header("content-type"),
+            date_line,
         );
-    }
-    let string_to_sign = format!(
-        "{}\n{}\n{}\n{}\n{}{}",
-        req.method.as_str(),
-        header("content-md5"),
-        header("content-type"),
-        expires,
-        amz.iter()
-            .map(|(k, v)| format!("{k}:{v}\n"))
-            .collect::<String>(),
-        resource,
-    );
-    let mut m = Hmac::<sha1::Sha1>::new_from_slice(secret.as_bytes()).expect("any key length");
-    m.update(string_to_sign.as_bytes());
-    use base64::Engine as _;
-    let expected = base64::engine::general_purpose::STANDARD.encode(m.finalize().into_bytes());
-    if !ct_eq(expected.as_bytes(), q("Signature")?.as_bytes()) {
+        let mut m = Hmac::<sha1::Sha1>::new_from_slice(secret.as_bytes()).expect("any key length");
+        m.update(string_to_sign.as_bytes());
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(m.finalize().into_bytes())
+    };
+    let matches = |path: &str| ct_eq(sign(path).as_bytes(), signature.as_bytes());
+    // botocore signs bucket-level requests as `/bucket/` while sending
+    // `/bucket`, so accept both spellings of a bucket resource.
+    let path = req.raw_path;
+    let is_bucket = path.len() > 1 && !path[1..].contains('/');
+    if !matches(path) && !(is_bucket && matches(&format!("{path}/"))) {
         return Err(S3Error::signature_mismatch());
     }
-    Ok(())
+    Ok(access_key.to_string())
 }
 
 #[cfg(test)]

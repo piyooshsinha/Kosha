@@ -71,6 +71,16 @@ export interface ClusterStatus {
   };
 }
 
+export interface User {
+  access_key: string;
+  name: string;
+  policy: unknown;
+  enabled: boolean;
+  created: string;
+  /** Only present right after creation or rotation. */
+  secret_key?: string;
+}
+
 export class S3Error extends Error {
   constructor(
     public status: number,
@@ -228,6 +238,51 @@ export class S3 {
 
   async removeNode(id: number) {
     await this.request("DELETE", `/_kosha/cluster/nodes/${id}`);
+  }
+
+  private json(method: string, path: string, body?: unknown) {
+    return this.request(method, path, [], body === undefined ? undefined : JSON.stringify(body), {
+      "content-type": "application/json",
+    });
+  }
+
+  async listUsers(): Promise<User[]> {
+    return (await (await this.json("GET", "/_kosha/admin/users")).json()).users;
+  }
+
+  async createUser(name: string, policy: unknown): Promise<User> {
+    return (await this.json("POST", "/_kosha/admin/users", { name, policy })).json();
+  }
+
+  async updateUser(
+    accessKey: string,
+    change: { policy?: unknown; enabled?: boolean; rotate_secret?: boolean },
+  ): Promise<User> {
+    return (await this.json("PUT", `/_kosha/admin/users/${awsEncode(accessKey)}`, change)).json();
+  }
+
+  async deleteUser(accessKey: string) {
+    await this.request("DELETE", `/_kosha/admin/users/${awsEncode(accessKey)}`);
+  }
+
+  /** The bucket policy as JSON text, or null when none is set. */
+  async getBucketPolicy(bucket: string): Promise<string | null> {
+    try {
+      return await (await this.request("GET", `/${awsEncode(bucket)}`, [["policy", ""]])).text();
+    } catch (e) {
+      if (e instanceof S3Error && e.code === "NoSuchBucketPolicy") return null;
+      throw e;
+    }
+  }
+
+  async putBucketPolicy(bucket: string, policy: string | null) {
+    if (policy === null) {
+      await this.request("DELETE", `/${awsEncode(bucket)}`, [["policy", ""]]);
+    } else {
+      await this.request("PUT", `/${awsEncode(bucket)}`, [["policy", ""]], policy, {
+        "content-type": "application/json",
+      });
+    }
   }
 
   async cluster(): Promise<ClusterStatus> {

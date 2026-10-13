@@ -324,6 +324,21 @@ impl Engine {
         result.map_err(Error::from)
     }
 
+    pub(crate) async fn propose_cmd(&self, cmd: Command) -> Result<CommandOutput> {
+        self.propose(cmd).await
+    }
+
+    pub(crate) fn meta(&self) -> &MetaStore {
+        &self.inner.meta
+    }
+
+    pub(crate) async fn query_meta<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&MetaStore) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        self.query(f).await
+    }
+
     /// Read from the local state machine after a linearizability barrier.
     async fn query<T: Send + 'static>(
         &self,

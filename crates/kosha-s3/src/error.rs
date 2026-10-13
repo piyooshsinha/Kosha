@@ -94,6 +94,8 @@ impl From<kosha_engine::Error> for S3Error {
             E::InvalidBucketState(_) => (StatusCode::CONFLICT, "InvalidBucketState"),
             E::AccessDenied(_) => (StatusCode::FORBIDDEN, "AccessDenied"),
             E::MethodNotAllowed(_) => (StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed"),
+            E::NoSuchUser => (StatusCode::NOT_FOUND, "NoSuchEntity"),
+            E::UserAlreadyExists(_) => (StatusCode::CONFLICT, "EntityAlreadyExists"),
             E::Corrupt(_) | E::Io(_) | E::Meta(_) | E::Internal(_) => {
                 tracing::error!(error = %msg, "internal storage error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "InternalError")

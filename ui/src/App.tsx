@@ -6,6 +6,7 @@ import { Overview } from "./components/Overview.tsx";
 import { Buckets } from "./components/Buckets.tsx";
 import { Browser } from "./components/Browser.tsx";
 import { ClusterView } from "./components/Cluster.tsx";
+import { Users } from "./components/Users.tsx";
 import { Toasts, useToasts } from "./components/Toasts.tsx";
 
 const SESSION_KEY = "kosha.session";
@@ -14,7 +15,8 @@ export type Route =
   | { page: "overview" }
   | { page: "buckets" }
   | { page: "browse"; bucket: string; prefix: string }
-  | { page: "cluster" };
+  | { page: "cluster" }
+  | { page: "users" };
 
 function parseRoute(hash: string): Route {
   const parts = hash.replace(/^#\/?/, "").split("/");
@@ -23,6 +25,8 @@ function parseRoute(hash: string): Route {
       return { page: "buckets" };
     case "cluster":
       return { page: "cluster" };
+    case "users":
+      return { page: "users" };
     case "b":
       if (parts[1]) {
         return {
@@ -45,6 +49,8 @@ export function href(r: Route): string {
       return "#/buckets";
     case "cluster":
       return "#/cluster";
+    case "users":
+      return "#/users";
     case "browse":
       return `#/b/${encodeURIComponent(r.bucket)}/${r.prefix.split("/").map(encodeURIComponent).join("/")}`;
   }
@@ -95,6 +101,7 @@ export function App() {
   const nav: { label: string; route: Route; active: boolean; icon: string }[] = [
     { label: "Overview", route: { page: "overview" }, active: route.page === "overview", icon: "◎" },
     { label: "Buckets", route: { page: "buckets" }, active: route.page === "buckets" || route.page === "browse", icon: "▤" },
+    { label: "Users", route: { page: "users" }, active: route.page === "users", icon: "◉" },
     { label: "Cluster", route: { page: "cluster" }, active: route.page === "cluster", icon: "⬡" },
   ];
 
@@ -131,6 +138,7 @@ export function App() {
         {route.page === "buckets" && <Buckets s3={s3} toast={toasts.push} />}
         {route.page === "browse" && <Browser s3={s3} bucket={route.bucket} prefix={route.prefix} toast={toasts.push} />}
         {route.page === "cluster" && <ClusterView s3={s3} toast={toasts.push} />}
+        {route.page === "users" && <Users s3={s3} toast={toasts.push} />}
       </main>
       <Toasts items={toasts.items} dismiss={toasts.dismiss} />
     </div>

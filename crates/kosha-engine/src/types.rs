@@ -116,6 +116,10 @@ pub struct BucketConfig {
     pub object_lock: Option<ObjectLockConfig>,
     #[serde(default)]
     pub lifecycle: Option<Vec<LifecycleRule>>,
+    /// Bucket policy (IAM JSON). The engine stores it; the S3 layer
+    /// validates and evaluates it.
+    #[serde(default)]
+    pub policy: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,6 +246,27 @@ pub enum BucketConfigUpdate {
     Versioning(Versioning),
     ObjectLock(ObjectLockConfig),
     Lifecycle(Option<Vec<LifecycleRule>>),
+    Policy(Option<String>),
+}
+
+/// An access key that is not a root key. Its permissions come from its
+/// identity policy and from bucket policies.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct User {
+    pub access_key: String,
+    pub secret_key: String,
+    /// Unique, human-readable; bucket policies refer to users by name.
+    pub name: String,
+    /// Identity policy (IAM JSON).
+    #[serde(default)]
+    pub policy: Option<String>,
+    #[serde(default = "enabled_default")]
+    pub enabled: bool,
+    pub created: DateTime<Utc>,
+}
+
+fn enabled_default() -> bool {
+    true
 }
 
 /// Summary of one object returned by listings.

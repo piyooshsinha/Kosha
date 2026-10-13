@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use axum::serve::ListenerExt;
 use clap::Parser;
+use kosha_cluster::tls::{TlsFiles, TlsListener};
 use kosha_cluster::{Cluster, ClusterConfig};
 use kosha_engine::{Engine, EngineConfig, IoMode, SyncMode};
 use kosha_s3::{ClusterHooks, Credentials, S3Config};
@@ -62,6 +64,14 @@ struct Args {
     #[arg(long, env = "KOSHA_METRICS_PUBLIC")]
     metrics_public: bool,
 
+    /// PEM certificate (chain) for serving the S3 API and console over HTTPS.
+    #[arg(long, env = "KOSHA_TLS_CERT", requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+
+    /// PEM private key for --tls-cert.
+    #[arg(long, env = "KOSHA_TLS_KEY", requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
+
     /// Chunk I/O backend: auto (io_uring if available), uring, threads.
     #[arg(long, env = "KOSHA_IO", default_value = "auto")]
     io: IoMode,
@@ -86,6 +96,20 @@ struct Args {
     /// Shared secret for internal cluster traffic (same on every node).
     #[arg(long, env = "KOSHA_CLUSTER_SECRET", hide_env_values = true)]
     cluster_secret: Option<String>,
+
+    /// PEM certificate this node presents to peers (mutual TLS for all
+    /// internal traffic). Needs --cluster-tls-key and --cluster-tls-ca.
+    #[arg(long, env = "KOSHA_CLUSTER_TLS_CERT", requires_all = ["cluster_tls_key", "cluster_tls_ca"])]
+    cluster_tls_cert: Option<PathBuf>,
+
+    /// PEM private key for --cluster-tls-cert.
+    #[arg(long, env = "KOSHA_CLUSTER_TLS_KEY", requires = "cluster_tls_cert")]
+    cluster_tls_key: Option<PathBuf>,
+
+    /// PEM CA certificate(s) that sign every node's certificate. Peers
+    /// without a certificate from this CA are refused.
+    #[arg(long, env = "KOSHA_CLUSTER_TLS_CA", requires = "cluster_tls_cert")]
+    cluster_tls_ca: Option<PathBuf>,
 
     /// Bootstrap a new cluster with this node as its first member.
     #[arg(long, env = "KOSHA_INIT")]
@@ -186,6 +210,7 @@ async fn main() -> anyhow::Result<()> {
         domain: args.domain.clone(),
         cluster: None,
         metrics_public: args.metrics_public,
+        secure_transport: args.tls_cert.is_some(),
     };
 
     let cluster = match args.node_id {
@@ -214,6 +239,16 @@ async fn main() -> anyhow::Result<()> {
             ccfg.lease_reads = !args.no_lease_reads;
             ccfg.repair_interval = (args.repair_interval_secs > 0)
                 .then(|| Duration::from_secs(args.repair_interval_secs));
+            ccfg.tls = args.cluster_tls_cert.clone().map(|cert| TlsFiles {
+                cert,
+                key: args.cluster_tls_key.clone().expect("required by clap"),
+                ca: args.cluster_tls_ca.clone(),
+            });
+            if ccfg.tls.is_none() {
+                tracing::warn!(
+                    "internal cluster traffic is not encrypted: use --cluster-tls-* outside a trusted network"
+                );
+            }
             let cluster = Cluster::start(engine.clone(), ccfg).await?;
             if args.init {
                 cluster.initialize().await?;
@@ -248,22 +283,47 @@ async fn main() -> anyhow::Result<()> {
         engine.spawn_lifecycle(Duration::from_secs(args.lifecycle_interval_secs), gate);
     }
 
-    let app = ui::router().merge(kosha_s3::router(engine, s3));
+    let app = ui::router()
+        .merge(kosha_s3::router(engine, s3))
+        .into_make_service_with_connect_info::<SocketAddr>();
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await
         .with_context(|| format!("binding {}", args.listen))?;
+    let scheme = if args.tls_cert.is_some() {
+        "https"
+    } else {
+        "http"
+    };
     tracing::info!(
         listen = %args.listen,
-        console = %format!("http://{}/_kosha/ui/", args.listen),
+        console = %format!("{scheme}://{}/_kosha/ui/", args.listen),
         mode = if clustered { "cluster" } else { "single-node" },
         "Kosha is ready"
     );
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!("shutting down");
-        })
-        .await?;
+    let shutdown = async {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("shutting down");
+    };
+    match (&args.tls_cert, &args.tls_key) {
+        (Some(cert), Some(key)) => {
+            let tls = TlsFiles {
+                cert: cert.clone(),
+                key: key.clone(),
+                ca: None,
+            }
+            .server_config()?;
+            // `tap_io` gives the listener axum's `ConnectInfo` support.
+            let listener = TlsListener::new(listener, tls)?.tap_io(|_| {});
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown)
+                .await?
+        }
+        _ => {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown)
+                .await?
+        }
+    }
     if let Some(c) = cluster {
         c.shutdown().await;
     }

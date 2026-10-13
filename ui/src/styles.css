@@ -857,3 +857,47 @@ details summary {
     width: 100%;
   }
 }
+
+.nowrap {
+  white-space: nowrap;
+}
+.strong {
+  font-weight: 600;
+}
+.danger-text {
+  color: var(--danger);
+}
+.policy-editor {
+  display: grid;
+  gap: 8px;
+  padding: 8px 0;
+}
+.policy-editor textarea {
+  width: 100%;
+  box-sizing: border-box;
+  font-size: 12.5px;
+  line-height: 1.5;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--text);
+  resize: vertical;
+}
+.secret-card {
+  margin-bottom: 16px;
+  display: grid;
+  gap: 8px;
+}
+.secret-card h3 {
+  margin: 0;
+}
+.secret-card .props {
+  word-break: break-all;
+}
+.inline-form select {
+  width: auto;
+}
+.secret-card > button {
+  justify-self: start;
+}

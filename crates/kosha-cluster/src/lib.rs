@@ -24,6 +24,7 @@ mod repair;
 mod rpc;
 mod server;
 mod state_machine;
+pub mod tls;
 mod types;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -71,6 +72,9 @@ pub struct ClusterConfig {
     pub lease_reads: bool,
     /// Run background re-replication/rebalancing this often (`None` disables).
     pub repair_interval: Option<Duration>,
+    /// Mutual TLS for internal traffic. Every node presents `cert` and
+    /// accepts only peers whose certificates `ca` signed.
+    pub tls: Option<tls::TlsFiles>,
 }
 
 impl ClusterConfig {
@@ -94,6 +98,7 @@ impl ClusterConfig {
             logs_to_keep: 1_000,
             lease_reads: true,
             repair_interval: Some(Duration::from_secs(60)),
+            tls: None,
         }
     }
 }
@@ -147,7 +152,16 @@ impl Cluster {
             engine.clone(),
             cfg.data_dir.join("raft-snapshot.bin"),
         )?;
-        let client = Client::new(cfg.secret.clone());
+        if cfg.tls.as_ref().is_some_and(|t| t.ca.is_none()) {
+            return Err(ClusterError::Join(
+                "cluster TLS needs a CA to verify peers".into(),
+            ));
+        }
+        let client = Client::new(
+            cfg.secret.clone(),
+            cfg.tls.as_ref().map(|t| t.client_config()).transpose()?,
+        );
+        let server_tls = cfg.tls.as_ref().map(|t| t.server_config()).transpose()?;
 
         let raft_cfg = openraft::Config {
             cluster_name: "kosha".into(),
@@ -197,11 +211,21 @@ impl Cluster {
 
         let listener = tokio::net::TcpListener::bind(cfg.listen).await?;
         let app = server::router(inner.clone());
-        let server = tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, app).await {
-                tracing::error!(error = %e, "cluster endpoint stopped");
+        let server = match server_tls {
+            Some(tls) => {
+                let listener = tls::TlsListener::new(listener, tls)?;
+                tokio::spawn(async move {
+                    if let Err(e) = axum::serve(listener, app).await {
+                        tracing::error!(error = %e, "cluster endpoint stopped");
+                    }
+                })
             }
-        });
+            None => tokio::spawn(async move {
+                if let Err(e) = axum::serve(listener, app).await {
+                    tracing::error!(error = %e, "cluster endpoint stopped");
+                }
+            }),
+        };
         tracing::info!(node = cfg.node_id, listen = %cfg.listen, "cluster endpoint ready");
         Ok(Cluster {
             inner,

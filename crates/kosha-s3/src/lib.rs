@@ -1,10 +1,12 @@
 //! S3-compatible HTTP front end for the Kosha storage engine.
 
+mod admin;
 mod auth;
 mod body;
 mod config;
 mod error;
 mod handlers;
+pub mod iam;
 mod metrics;
 mod protection;
 mod xml;
@@ -14,7 +16,7 @@ use std::sync::Arc;
 use axum::Router;
 use kosha_engine::Engine;
 
-pub use auth::Credentials;
+pub use auth::{Credentials, KeyLookup};
 pub use error::{S3Error, S3Result};
 
 #[derive(Clone, Debug)]
@@ -30,6 +32,8 @@ pub struct S3Config {
     pub cluster: Option<Arc<dyn ClusterHooks>>,
     /// Serve `/_kosha/metrics` without authentication (for Prometheus).
     pub metrics_public: bool,
+    /// Requests arrive over TLS (`aws:SecureTransport` in policies).
+    pub secure_transport: bool,
 }
 
 /// What the S3 front end needs from a cluster, for `/_kosha/cluster*`.
@@ -58,6 +62,7 @@ impl Default for S3Config {
             domain: None,
             cluster: None,
             metrics_public: false,
+            secure_transport: false,
         }
     }
 }
@@ -69,7 +74,20 @@ pub(crate) struct AppState {
 }
 
 /// Build the S3 API router.
-pub fn router(engine: Engine, cfg: S3Config) -> Router {
+///
+/// Besides the root keys in `cfg.credentials`, users stored in the engine
+/// can authenticate; their access is governed by policies.
+pub fn router(engine: Engine, mut cfg: S3Config) -> Router {
+    if !cfg.credentials.is_empty() {
+        let e = engine.clone();
+        cfg.credentials = cfg.credentials.with_users(Arc::new(move |ak: &str| {
+            e.user_local(ak)
+                .ok()
+                .flatten()
+                .filter(|u| u.enabled)
+                .map(|u| u.secret_key)
+        }));
+    }
     let state = Arc::new(AppState {
         engine,
         cfg,

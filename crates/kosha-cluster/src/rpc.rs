@@ -43,6 +43,8 @@ pub struct JoinRequest {
 pub struct Client {
     http: reqwest::Client,
     secret: String,
+    /// `http` or `https` (mutual TLS).
+    scheme: &'static str,
 }
 
 pub fn encode<T: Serialize>(v: &T) -> Vec<u8> {
@@ -54,14 +56,27 @@ pub fn decode<T: DeserializeOwned>(b: &[u8]) -> Result<T, RpcError> {
 }
 
 impl Client {
-    pub fn new(secret: String) -> Self {
-        let http = reqwest::Client::builder()
+    pub fn new(secret: String, tls: Option<rustls::ClientConfig>) -> Self {
+        // reqwest needs a process-wide rustls provider even for plain HTTP.
+        // Installing fails harmlessly when one is already set.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(2))
             .pool_idle_timeout(Duration::from_secs(60))
-            .tcp_nodelay(true)
-            .build()
-            .expect("http client");
-        Client { http, secret }
+            .tcp_nodelay(true);
+        let scheme = match tls {
+            Some(cfg) => {
+                builder = builder.tls_backend_preconfigured(cfg);
+                "https"
+            }
+            None => "http",
+        };
+        let http = builder.build().expect("http client");
+        Client {
+            http,
+            secret,
+            scheme,
+        }
     }
 
     async fn send(
@@ -99,7 +114,7 @@ impl Client {
         let body = self
             .send(
                 self.http
-                    .post(format!("http://{addr}{path}"))
+                    .post(format!("{}://{addr}{path}", self.scheme))
                     .body(encode(req)),
                 timeout,
             )
@@ -111,7 +126,7 @@ impl Client {
         let body = self
             .send(
                 self.http
-                    .put(format!("http://{addr}/chunk/{id}"))
+                    .put(format!("{}://{addr}/chunk/{id}", self.scheme))
                     .body(data),
                 Duration::from_secs(60),
             )
@@ -120,16 +135,20 @@ impl Client {
     }
 
     pub async fn health(&self, addr: &str, timeout: Duration) -> Result<(), RpcError> {
-        self.send(self.http.get(format!("http://{addr}/health")), timeout)
-            .await
-            .map(drop)
+        self.send(
+            self.http.get(format!("{}://{addr}/health", self.scheme)),
+            timeout,
+        )
+        .await
+        .map(drop)
     }
 
     /// Whether `addr` holds a copy of the chunk.
     pub async fn has_chunk(&self, addr: &str, id: &str) -> Result<bool, RpcError> {
         match self
             .send(
-                self.http.head(format!("http://{addr}/chunk/{id}")),
+                self.http
+                    .head(format!("{}://{addr}/chunk/{id}", self.scheme)),
                 Duration::from_secs(5),
             )
             .await
@@ -142,7 +161,8 @@ impl Client {
 
     pub async fn get_chunk(&self, addr: &str, id: &str, len: u32) -> Result<Bytes, RpcError> {
         self.send(
-            self.http.get(format!("http://{addr}/chunk/{id}?len={len}")),
+            self.http
+                .get(format!("{}://{addr}/chunk/{id}?len={len}", self.scheme)),
             Duration::from_secs(60),
         )
         .await

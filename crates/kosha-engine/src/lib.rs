@@ -24,6 +24,7 @@ mod keys;
 mod lifecycle;
 mod meta;
 mod types;
+mod users;
 mod versions;
 mod writer;
 
