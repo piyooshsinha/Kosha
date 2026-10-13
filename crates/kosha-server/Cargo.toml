@@ -1,0 +1,18 @@
+[package]
+name = "kosha-server"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "kosha"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+kosha-engine = { version = "0.1.0", path = "../kosha-engine" }
+kosha-s3 = { version = "0.1.0", path = "../kosha-s3" }
+tokio = { version = "1.53.2", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+axum = "0.8"
