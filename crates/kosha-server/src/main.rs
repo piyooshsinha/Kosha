@@ -71,6 +71,16 @@ struct Args {
     #[arg(long, env = "KOSHA_ENCRYPTION_KEY_FILE")]
     encryption_key_file: Option<PathBuf>,
 
+    /// Event notification target, `name=url` (repeatable). Buckets refer to
+    /// it as `arn:kosha:sqs::<name>:webhook`. Use the same list on every
+    /// cluster node.
+    #[arg(
+        long = "notify-webhook",
+        env = "KOSHA_NOTIFY_WEBHOOKS",
+        value_delimiter = ','
+    )]
+    notify_webhooks: Vec<String>,
+
     /// PEM certificate (chain) for serving the S3 API and console over HTTPS.
     #[arg(long, env = "KOSHA_TLS_CERT", requires = "tls_key")]
     tls_cert: Option<PathBuf>,
@@ -229,7 +239,25 @@ async fn main() -> anyhow::Result<()> {
         cluster: None,
         metrics_public: args.metrics_public,
         secure_transport: args.tls_cert.is_some(),
+        webhooks: Default::default(),
     };
+    for spec in &args.notify_webhooks {
+        let (name, url) = spec
+            .split_once('=')
+            .with_context(|| format!("--notify-webhook {spec:?}: expected name=url"))?;
+        anyhow::ensure!(
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b)),
+            "--notify-webhook: target names use A-Z a-z 0-9 - _"
+        );
+        anyhow::ensure!(
+            url.starts_with("http://") || url.starts_with("https://"),
+            "--notify-webhook {name}: the URL must start with http:// or https://"
+        );
+        s3.webhooks.insert(name.to_string(), url.to_string());
+    }
 
     let cluster = match args.node_id {
         None => None,
@@ -285,21 +313,30 @@ async fn main() -> anyhow::Result<()> {
     };
 
     engine.spawn_sweeper(Duration::from_secs(600));
+    // Lifecycle passes and event delivery run only on the leader (always
+    // true on a single node), so they do not race each other.
+    let leader_gate: Arc<dyn Fn() -> bool + Send + Sync> = match &cluster {
+        Some(c) => {
+            let c = c.clone();
+            Arc::new(move || {
+                let s = c.status();
+                s.leader == Some(s.node_id)
+            })
+        }
+        None => Arc::new(|| true),
+    };
     if args.lifecycle_interval_secs > 0 {
-        // Lifecycle actions are replicated commands; in a cluster only the
-        // leader proposes them, so passes do not race each other.
-        let gate: Arc<dyn Fn() -> bool + Send + Sync> = match &cluster {
-            Some(c) => {
-                let c = c.clone();
-                Arc::new(move || {
-                    let s = c.status();
-                    s.leader == Some(s.node_id)
-                })
-            }
-            None => Arc::new(|| true),
-        };
-        engine.spawn_lifecycle(Duration::from_secs(args.lifecycle_interval_secs), gate);
+        engine.spawn_lifecycle(
+            Duration::from_secs(args.lifecycle_interval_secs),
+            leader_gate.clone(),
+        );
     }
+    kosha_s3::notify::spawn_dispatcher(
+        engine.clone(),
+        s3.webhooks.clone(),
+        s3.region.clone(),
+        leader_gate,
+    );
 
     let app = ui::router()
         .merge(kosha_s3::router(engine, s3))

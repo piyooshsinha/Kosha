@@ -279,6 +279,30 @@ replication, ordering and Object Lock checks for free; locked versions are
 reported as refused and left in place. A version counts as noncurrent from
 the moment its successor was written.
 
+## Event notifications
+
+Notifications are produced by the state machine, not by request handlers.
+Before a command is applied, `events::Source` records what it is (put, copy,
+complete, delete, tagging, and whether lifecycle issued it). If the command
+succeeds, `Tx::emit` matches the result against the bucket's rules and
+appends one `Event` per match to the `events` table, keyed
+`target \0 seq`, in the same transaction. A global `event_seq` counter gives
+every event a unique, increasing sequencer.
+
+So every replica holds identical queues, events cannot be lost between a
+change and its notification, and their order is the log order.
+
+Delivery is outside the engine. On the leader, one task per webhook target
+reads the oldest pending events, posts them one at a time, and proposes
+`AckEvents { target, upto }` for the prefix that succeeded. On a failure it
+backs off (0.5 s doubling to 60 s) and retries the same event, so order is
+kept. After a leader change the new leader resumes from the replicated queue.
+
+An event delivered but not yet acknowledged when the leader dies is sent
+again, which makes delivery at least once. A queue is capped at 100,000
+events per target: beyond that the oldest are dropped and counted in
+`kosha_events_dropped_total`.
+
 ## Authentication and authorization
 
 Every request is authenticated first (SigV4 header, presigned or streaming;
@@ -371,6 +395,7 @@ thread pool when io_uring is disabled.
 | `objects` | `bucket \0 key` | manifest: size, ETag, attrs, segments |
 | `chunks` | BLAKE3 id | refcount, raw length, stored length |
 | `uploads` / `upload_index` / `parts` | upload id / `bucket \0 key \0 id` / `id \0 part#` | multipart state |
+| `events` | `target \0 seq` | undelivered notifications |
 | `users` | access key | user: secret, name, identity policy, enabled |
 | `versions` | `bucket \0 key \0 (MAX - seq)` | version: manifest or delete marker, lock state |
 | `requests` / `request_seq` | request id / sequence | results of recent writes, for exactly-once retries |
@@ -416,7 +441,7 @@ data, Prometheus metrics, object and bucket tagging, bucket CORS.
 Versioning, Object Lock (retention and legal hold) and lifecycle rules.
 Users, identity and bucket policies (with anonymous access), SigV2 header
 auth, HTTPS, mutual TLS between nodes, and dedup-preserving encryption at
-rest.
+rest. Event notifications to webhooks from the replicated metadata log.
 
 **Next**
 - io_uring with registered buffers and `O_DIRECT` for large chunks.
@@ -430,4 +455,3 @@ rest.
 - Tiering: track access frequency per chunk, demote to a cold tier
   (HDD or another S3) and promote on read.
 - Per-bucket trained zstd dictionaries and similarity-aware placement.
-- Event notifications from the ordered metadata log.

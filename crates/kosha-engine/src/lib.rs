@@ -20,6 +20,7 @@ mod crypt;
 mod durability;
 mod engine;
 mod error;
+mod events;
 pub mod io;
 mod keys;
 mod lifecycle;

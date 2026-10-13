@@ -40,13 +40,16 @@ const REQUESTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("requests")
 const REQUEST_SEQ: TableDefinition<&[u8], &[u8]> = TableDefinition::new("request_seq");
 
 /// Every version of every key in versioned buckets (see `versions.rs`).
+/// `target \0 seq` (big-endian) -> `Event`: undelivered notifications.
+pub(crate) const EVENTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("events");
 /// access key -> `User`.
 pub(crate) const USERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("users");
 pub(crate) const VERSIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("versions");
 
 /// Byte-keyed tables included in snapshots generically. New tables only need
 /// to be listed here.
-const BYTE_TABLES: &[TableDefinition<&[u8], &[u8]>] = &[REQUESTS, REQUEST_SEQ, VERSIONS, USERS];
+const BYTE_TABLES: &[TableDefinition<&[u8], &[u8]>] =
+    &[REQUESTS, REQUEST_SEQ, VERSIONS, USERS, EVENTS];
 
 /// How many request ids are remembered for deduplication.
 const REMEMBERED_REQUESTS: u64 = 100_000;
@@ -79,6 +82,9 @@ pub enum Command {
         targets: Vec<DeleteTarget>,
         bypass_governance: bool,
         now: DateTime<Utc>,
+        /// Issued by lifecycle rules (reported as LifecycleExpiration events).
+        #[serde(default)]
+        lifecycle: bool,
     },
     CopyObject {
         src_bucket: String,
@@ -128,6 +134,8 @@ pub enum Command {
         #[serde(default)]
         version_id: Option<String>,
         tags: BTreeMap<String, String>,
+        #[serde(default)]
+        now: Option<DateTime<Utc>>,
     },
     /// PutObjectRetention / PutObjectLegalHold.
     SetObjectLock {
@@ -147,6 +155,11 @@ pub enum Command {
     },
     DeleteUser {
         access_key: String,
+    },
+    /// Delivered notifications for `target` up to and including `upto`.
+    AckEvents {
+        target: String,
+        upto: u64,
     },
 }
 
@@ -559,6 +572,7 @@ impl Tx<'_> {
                 targets,
                 bypass_governance,
                 now,
+                ..
             } => {
                 let info = self.bucket_info(&bucket)?;
                 let mut outcomes = Vec::with_capacity(targets.len());
@@ -755,6 +769,7 @@ impl Tx<'_> {
                     BucketConfigUpdate::Cors(cors) => info.config.cors = cors,
                     BucketConfigUpdate::Lifecycle(rules) => info.config.lifecycle = rules,
                     BucketConfigUpdate::Policy(policy) => info.config.policy = policy,
+                    BucketConfigUpdate::Notifications(rules) => info.config.notifications = rules,
                     BucketConfigUpdate::Versioning(v) => {
                         if v == Versioning::Unversioned {
                             return reject(Rejection::InvalidRequest(
@@ -790,6 +805,7 @@ impl Tx<'_> {
                 key,
                 version_id,
                 tags,
+                ..
             } => {
                 let info = self.bucket_info(&bucket)?;
                 // Same manifest, so chunk references are unchanged.
@@ -826,6 +842,10 @@ impl Tx<'_> {
             }
             Command::DeleteUser { access_key } => {
                 self.delete_user(&access_key)?;
+                Ok(CommandOutput::Done)
+            }
+            Command::AckEvents { target, upto } => {
+                self.ack_events(&target, upto)?;
                 Ok(CommandOutput::Done)
             }
         }
@@ -898,8 +918,18 @@ impl MetaStore {
                 results.push(prev);
                 continue;
             }
+            let source = crate::events::Source::of(&cmd);
             let result = match tx.apply(cmd) {
-                Ok(out) => Ok(out),
+                Ok(out) => {
+                    match tx.emit(source, &out) {
+                        Ok(()) => {}
+                        Err(Fail::Fatal(e)) => return Err(e),
+                        Err(Fail::Reject(r)) => {
+                            return Err(Error::Internal(format!("event emission rejected: {r:?}")));
+                        }
+                    }
+                    Ok(out)
+                }
                 Err(Fail::Reject(r)) => Err(r),
                 Err(Fail::Fatal(e)) => return Err(e),
             };

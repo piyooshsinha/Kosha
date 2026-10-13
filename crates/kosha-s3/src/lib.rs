@@ -8,6 +8,7 @@ mod error;
 mod handlers;
 pub mod iam;
 mod metrics;
+pub mod notify;
 mod protection;
 mod xml;
 
@@ -34,6 +35,8 @@ pub struct S3Config {
     pub metrics_public: bool,
     /// Requests arrive over TLS (`aws:SecureTransport` in policies).
     pub secure_transport: bool,
+    /// Notification targets that bucket configurations may reference.
+    pub webhooks: notify::Webhooks,
 }
 
 /// What the S3 front end needs from a cluster, for `/_kosha/cluster*`.
@@ -63,6 +66,7 @@ impl Default for S3Config {
             cluster: None,
             metrics_public: false,
             secure_transport: false,
+            webhooks: Default::default(),
         }
     }
 }

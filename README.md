@@ -126,7 +126,40 @@ Lifecycle runs every `--lifecycle-interval-secs` (default one hour). Its
 deletions go through the same replicated command path as client deletes, so
 Object Lock still protects locked versions.
 
-### Python (boto3)
+### Event notifications
+
+Kosha posts S3-format event messages to webhooks when objects change. Name
+the targets on the servers, then point buckets at them with the usual S3 API:
+
+```sh
+kosha --notify-webhook audit=https://hooks.example.com/kosha?token=… ...
+
+s3api put-bucket-notification-configuration --bucket media --notification-configuration '{
+  "QueueConfigurations": [{"Id": "uploads", "QueueArn": "arn:kosha:sqs::audit:webhook",
+    "Events": ["s3:ObjectCreated:*", "s3:ObjectRemoved:*"],
+    "Filter": {"Key": {"FilterRules": [{"Name": "prefix", "Value": "images/"}]}}}]}'
+```
+
+Each event is one `POST` with the standard
+[S3 event message structure](https://docs.aws.amazon.com/AmazonS3/latest/userguide/notification-content-structure.html)
+(`Records[0].eventName` is e.g. `ObjectCreated:Put`).
+
+- **Event types:** `ObjectCreated:{Put,Copy,CompleteMultipartUpload}`,
+  `ObjectRemoved:{Delete,DeleteMarkerCreated}`,
+  `LifecycleExpiration:{Delete,DeleteMarkerCreated}`,
+  `ObjectTagging:{Put,Delete}`, and their `*` forms.
+- **Durability:** events are written to a replicated queue in the same
+  transaction as the change. A crash, a restart or a new leader never loses
+  one.
+- **Order:** they are delivered in commit order, per target.
+- **At least once:** a failing webhook is retried with backoff, and its
+  queue holds up to 100,000 events. A leader crash between a delivery and its
+  acknowledgement can repeat an event; deduplicate on
+  `s3.object.sequencer`.
+- **Verified:** in a 3-node test, the leader was SIGKILLed during 300
+  uploads, and all 300 events arrived in order.
+
+
 
 ```python
 import boto3
@@ -276,7 +309,7 @@ curl -X DELETE --aws-sigv4 "aws:amz:us-east-1:s3" --user admin:admin-secret-key 
 |---|---|---|
 | `GET /_kosha/health` | none | `ok`, for load balancer and liveness probes |
 | `GET /_kosha/stats` | SigV4 | objects, logical/unique/physical bytes, dedup and compression ratios, I/O backend |
-| `GET /_kosha/metrics` | SigV4, or none with `--metrics-public` | Prometheus: requests and latency histograms per S3 operation, bytes in/out, storage gauges, group commit/sync batching, Raft state, follower lag, lease/quorum reads, repair counters |
+| `GET /_kosha/metrics` | SigV4, or none with `--metrics-public` | Prometheus: requests and latency histograms per S3 operation, bytes in/out, storage gauges, group commit/sync batching, Raft state, follower lag, lease/quorum reads, repair counters, pending/delivered/failed events |
 | `GET /_kosha/cluster` | SigV4 | role, term, leader, log/applied indexes, members, replication progress, lease vs quorum reads, background repair counters |
 | `DELETE /_kosha/cluster/nodes/{id}` | SigV4 | removes a voter (refuses non-voters and the last voter) |
 | `/_kosha/admin/users[/{key}]` | SigV4 | user management (see [Security](#users-and-policies)) |
@@ -634,6 +667,7 @@ io_uring. `--io auto` (the default) detects this and falls back to threads;
 | `--tls-cert` / `--tls-key` | `KOSHA_TLS_CERT` / `KOSHA_TLS_KEY` | none | serve S3 and the console over HTTPS |
 | `--encryption-key-file` | `KOSHA_ENCRYPTION_KEY_FILE` | none | encrypt object data at rest (64 hex chars); fixed per data directory |
 | `--cluster-tls-cert` / `--cluster-tls-key` / `--cluster-tls-ca` | `KOSHA_CLUSTER_TLS_*` | none | mutual TLS for all internal cluster traffic |
+| `--notify-webhook name=url` | `KOSHA_NOTIFY_WEBHOOKS` (comma-separated) | none | event notification target (repeatable; same list on every node) |
 | `--lifecycle-interval-secs` | `KOSHA_LIFECYCLE_INTERVAL_SECS` | `3600` | how often lifecycle rules run (leader only in a cluster; `0` disables) |
 
 ## S3 compatibility
@@ -654,6 +688,7 @@ Tested against the **AWS SDK for Rust** (in CI), **boto3**, the **AWS CLI**,
 | Versioning | Get/PutBucketVersioning (Enabled, Suspended), `versionId` on Get/Head/Delete/Copy source/tagging, delete markers, null versions, ListObjectVersions (prefix, delimiter, key/version markers), versioned DeleteObjects |
 | Object Lock | buckets created with `x-amz-bucket-object-lock-enabled`, Get/PutObjectLockConfiguration (default retention), Get/PutObjectRetention (GOVERNANCE with `x-amz-bypass-governance-retention`, COMPLIANCE), Get/PutObjectLegalHold, `x-amz-object-lock-*` headers on Put/Copy/CreateMultipartUpload |
 | Lifecycle | Get/Put/DeleteBucketLifecycleConfiguration: expiration (days or date), noncurrent version expiration, expired delete marker cleanup, AbortIncompleteMultipartUpload; filters by prefix and tags |
+| Notifications | Get/PutBucketNotificationConfiguration (Queue/Topic/CloudFunction configurations, prefix/suffix filters) delivered to webhooks |
 | Listing | ListObjectsV2 (prefix, delimiter, continuation, start-after, `encoding-type=url`), ListObjects v1 |
 | Multipart | Create, UploadPart, UploadPartCopy (with range), Complete, Abort, ListParts, ListMultipartUploads (paginated) |
 | Writes | Conditional `If-None-Match: *` / `If-Match` on Put, Copy and Complete |

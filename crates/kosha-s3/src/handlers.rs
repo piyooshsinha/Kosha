@@ -238,6 +238,41 @@ async fn metrics_response(st: &AppState) -> S3Result<Response> {
         "syncfs calls that made them durable.",
         w.sync_calls,
     );
+    counter(
+        &mut out,
+        "kosha_events_delivered_total",
+        "Event notifications delivered to webhooks by this node.",
+        crate::notify::STATS
+            .delivered
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
+    counter(
+        &mut out,
+        "kosha_events_failed_total",
+        "Webhook delivery attempts that failed (retried).",
+        crate::notify::STATS
+            .failed
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
+    counter(
+        &mut out,
+        "kosha_events_dropped_total",
+        "Events discarded because a target's queue was full.",
+        s.events_dropped,
+    );
+    if let Ok(pending) = st.engine.pending_event_counts() {
+        crate::metrics::header(
+            &mut out,
+            "kosha_events_pending",
+            "gauge",
+            "Undelivered event notifications per target.",
+        );
+        for (target, n) in pending {
+            out.push_str(&format!(
+                "kosha_events_pending{{target=\"{target}\"}} {n}\n"
+            ));
+        }
+    }
     crate::metrics::header(&mut out, "kosha_info", "gauge", "Build and configuration.");
     out.push_str(&format!(
         "kosha_info{{version=\"{}\",io_backend=\"{}\",sync=\"{:?}\"}} 1\n",
@@ -592,6 +627,29 @@ async fn bucket_encryption(ctx: &Ctx, bucket: &str, body: Body) -> S3Result<Resp
     }
 }
 
+/// Get/PutBucketNotificationConfiguration.
+async fn bucket_notification(ctx: &Ctx, bucket: &str, body: Body) -> S3Result<Response> {
+    let engine = ctx.engine();
+    match ctx.method {
+        Method::GET => {
+            let rules = engine.bucket(bucket).await?.config.notifications;
+            Ok(xml_response(crate::notify::render(
+                rules.as_deref().unwrap_or_default(),
+            )))
+        }
+        Method::PUT => {
+            let doc = read_text(ctx, body).await?;
+            engine.bucket(bucket).await?;
+            let rules = crate::notify::parse(&doc, &ctx.st.cfg.webhooks)?;
+            engine
+                .set_bucket_config(bucket, BucketConfigUpdate::Notifications(rules))
+                .await?;
+            Ok(StatusCode::OK.into_response())
+        }
+        _ => Err(S3Error::not_implemented("this notification operation")),
+    }
+}
+
 /// Get/Put/DeleteBucketPolicy and GetBucketPolicyStatus.
 async fn bucket_policy(ctx: &Ctx, bucket: &str, body: Body) -> S3Result<Response> {
     let engine = ctx.engine();
@@ -858,6 +916,9 @@ async fn route(ctx: &Ctx, body: Body) -> S3Result<Response> {
             if ctx.has("encryption") {
                 return bucket_encryption(ctx, bucket, body).await;
             }
+            if ctx.has("notification") {
+                return bucket_notification(ctx, bucket, body).await;
+            }
             if ["tagging", "cors", "versioning", "object-lock", "lifecycle"]
                 .iter()
                 .any(|s| ctx.has(s))
@@ -869,14 +930,7 @@ async fn route(ctx: &Ctx, body: Body) -> S3Result<Response> {
             }
             match *m {
                 Method::PUT => {
-                    for sub in [
-                        "acl",
-                        "object-lock",
-                        "notification",
-                        "website",
-                        "replication",
-                        "logging",
-                    ] {
+                    for sub in ["acl", "object-lock", "website", "replication", "logging"] {
                         if ctx.has(sub) {
                             return Err(S3Error::not_implemented(&format!("PutBucket {sub}")));
                         }

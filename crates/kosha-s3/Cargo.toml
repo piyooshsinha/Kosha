@@ -17,6 +17,8 @@ kosha-engine = { version = "0.1.0", path = "../kosha-engine" }
 md-5 = "0.11.0"
 parking_lot = "0.12.5"
 percent-encoding = "2.3.2"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 quick-xml = { version = "0.42.0", features = ["serialize"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

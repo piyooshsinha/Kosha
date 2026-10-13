@@ -120,6 +120,55 @@ pub struct BucketConfig {
     /// validates and evaluates it.
     #[serde(default)]
     pub policy: Option<String>,
+    #[serde(default)]
+    pub notifications: Option<Vec<NotificationRule>>,
+}
+
+/// Send matching events of a bucket to a named target.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationRule {
+    pub id: String,
+    /// Target name (configured on the servers).
+    pub target: String,
+    /// S3 event types, e.g. `s3:ObjectCreated:*`, `s3:ObjectRemoved:Delete`.
+    pub events: Vec<String>,
+    #[serde(default)]
+    pub prefix: String,
+    #[serde(default)]
+    pub suffix: String,
+}
+
+impl NotificationRule {
+    /// Whether this rule selects event `name` (without the `s3:` prefix)
+    /// on `key`.
+    pub fn matches(&self, name: &str, key: &str) -> bool {
+        key.starts_with(&self.prefix)
+            && key.ends_with(&self.suffix)
+            && self.events.iter().any(|e| {
+                let e = e.strip_prefix("s3:").unwrap_or(e);
+                match e.strip_suffix('*') {
+                    Some(stem) => name.starts_with(stem),
+                    None => e == name,
+                }
+            })
+    }
+}
+
+/// One queued notification, in the order the metadata log produced it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Event {
+    /// Position in the cluster-wide event sequence (unique, increasing).
+    pub seq: u64,
+    pub target: String,
+    pub rule_id: String,
+    pub bucket: String,
+    pub key: String,
+    /// Event type without the `s3:` prefix, e.g. `ObjectCreated:Put`.
+    pub name: String,
+    pub size: Option<u64>,
+    pub etag: Option<String>,
+    pub version_id: Option<String>,
+    pub time: DateTime<Utc>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -247,6 +296,7 @@ pub enum BucketConfigUpdate {
     ObjectLock(ObjectLockConfig),
     Lifecycle(Option<Vec<LifecycleRule>>),
     Policy(Option<String>),
+    Notifications(Option<Vec<NotificationRule>>),
 }
 
 /// An access key that is not a root key. Its permissions come from its
@@ -339,4 +389,7 @@ pub struct Stats {
     /// Bytes actually stored on disk for chunks (after dedup and compression).
     pub physical_bytes: u64,
     pub chunks: u64,
+    /// Notifications discarded because a target's queue was full.
+    #[serde(default)]
+    pub events_dropped: u64,
 }

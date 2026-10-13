@@ -52,7 +52,7 @@ impl Engine {
             return Ok(());
         }
         let outcomes = self
-            .delete_targets(bucket, std::mem::take(targets), false)
+            .delete_targets_as(bucket, std::mem::take(targets), false, true)
             .await?;
         for o in outcomes {
             if o.error.is_some() {

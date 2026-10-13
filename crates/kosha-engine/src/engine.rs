@@ -454,6 +454,7 @@ impl Engine {
                 key: key.into(),
                 version_id,
                 tags,
+                now: Some(Utc::now()),
             })
             .await?,
         )
@@ -655,12 +656,25 @@ impl Engine {
         targets: Vec<DeleteTarget>,
         bypass_governance: bool,
     ) -> Result<Vec<DeleteOutcome>> {
+        self.delete_targets_as(bucket, targets, bypass_governance, false)
+            .await
+    }
+
+    /// `lifecycle`: the deletion comes from a lifecycle rule.
+    pub(crate) async fn delete_targets_as(
+        &self,
+        bucket: &str,
+        targets: Vec<DeleteTarget>,
+        bypass_governance: bool,
+        lifecycle: bool,
+    ) -> Result<Vec<DeleteOutcome>> {
         match self
             .propose(Command::DeleteObjects {
                 bucket: bucket.into(),
                 targets,
                 bypass_governance,
                 now: Utc::now(),
+                lifecycle,
             })
             .await?
         {
