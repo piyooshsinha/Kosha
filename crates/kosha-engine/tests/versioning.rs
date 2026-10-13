@@ -451,6 +451,8 @@ async fn lifecycle_rules() {
         transition_days: None,
         transition_date: None,
         transition_class: None,
+        noncurrent_transition_days: None,
+        noncurrent_transition_class: None,
         ..Default::default()
     };
     e.set_bucket_config("logs", BucketConfigUpdate::Lifecycle(Some(vec![rule])))

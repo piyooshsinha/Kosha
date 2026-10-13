@@ -320,9 +320,9 @@ Tiering works on chunks, so it composes with dedup. Each chunk record keeps
 `cold_refs`, the number of its references held by objects in a cold storage
 class, next to `refs`. The rules:
 
-- **Transition** (lifecycle, or a cold class requested on PUT/COPY/
-  CompleteMultipartUpload) sets the version's `storage_class` and increments
-  `cold_refs` on its chunks, in the same command as the write when requested
+- **Transition** (lifecycle rules for current or noncurrent versions, or a
+  cold class requested on PUT/COPY/CompleteMultipartUpload) sets the
+  version's `storage_class` and increments `cold_refs` on its chunks, in the same command as the write when requested
   on upload. A chunk with `cold_refs == refs` and no remote copy goes into
   the `tier_queue` table. Dropping the last *hot* reference does the same.
 - **Offload** runs on the leader. It reads each queued chunk (locally or from a

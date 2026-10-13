@@ -276,6 +276,8 @@ async fn lifecycle_transition_rules() {
             transition_days: Some(30),
             transition_date: None,
             transition_class: Some("GLACIER_IR".into()),
+            noncurrent_transition_days: None,
+            noncurrent_transition_class: None,
         }])),
     )
     .await
@@ -311,4 +313,84 @@ async fn lifecycle_transition_rules() {
             ("keep/1.log", None)
         ]
     );
+}
+
+#[tokio::test]
+async fn noncurrent_versions_move_to_the_cold_tier() {
+    let dir = tempfile::tempdir().unwrap();
+    let (e, cold) = engine(dir.path(), None);
+    e.create_bucket("docs").await.unwrap();
+    e.set_bucket_config("docs", BucketConfigUpdate::Versioning(Versioning::Enabled))
+        .await
+        .unwrap();
+    let v1 = data(80_000, 7);
+    let v2 = data(80_000, 8);
+    put(&e, "docs", "report", &v1).await;
+    put(&e, "docs", "report", &v2).await;
+    e.set_bucket_config(
+        "docs",
+        BucketConfigUpdate::Lifecycle(Some(vec![LifecycleRule {
+            id: Some("old-versions".into()),
+            enabled: true,
+            prefix: String::new(),
+            tags: Default::default(),
+            expiration_days: None,
+            expiration_date: None,
+            expired_object_delete_marker: false,
+            noncurrent_days: None,
+            abort_incomplete_days: None,
+            transition_days: None,
+            transition_date: None,
+            transition_class: None,
+            noncurrent_transition_days: Some(7),
+            noncurrent_transition_class: Some("STANDARD_IA".into()),
+        }])),
+    )
+    .await
+    .unwrap();
+    let r = e
+        .run_lifecycle(chrono::Utc::now() + chrono::Duration::days(3))
+        .await
+        .unwrap();
+    assert_eq!(r.noncurrent_transitioned, 0, "not noncurrent long enough");
+    let r = e
+        .run_lifecycle(chrono::Utc::now() + chrono::Duration::days(8))
+        .await
+        .unwrap();
+    assert_eq!(r.noncurrent_transitioned, 1);
+    let r = e
+        .run_lifecycle(chrono::Utc::now() + chrono::Duration::days(8))
+        .await
+        .unwrap();
+    assert_eq!(r.noncurrent_transitioned, 0, "idempotent");
+
+    let versions = e
+        .list_versions(
+            "docs",
+            VersionListQuery {
+                max_keys: 10,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .versions;
+    let classes: Vec<_> = versions
+        .iter()
+        .map(|v| (v.is_latest, v.meta.as_ref().unwrap().storage_class.clone()))
+        .collect();
+    assert_eq!(classes, [(true, None), (false, Some("STANDARD_IA".into()))]);
+    // Only the old version's chunks leave; both versions still read.
+    assert!(e.run_offloader().await.unwrap() > 0);
+    assert!(!cold.objects.lock().is_empty());
+    let old = versions[1].version_id.clone();
+    let m = e
+        .head_version("docs", "report", &old)
+        .await
+        .unwrap()
+        .meta
+        .unwrap();
+    let parts: Vec<_> = e.read(&m, 0, m.size).try_collect().await.unwrap();
+    assert_eq!(parts.concat(), v1);
+    assert_eq!(get(&e, "docs", "report").await, v2);
 }

@@ -827,7 +827,10 @@ async fn bucket_config(ctx: &Ctx, bucket: &str, body: Body) -> S3Result<Option<R
         return Ok(Some(match *m {
             Method::PUT => {
                 let rules = crate::protection::parse_lifecycle(&read_text(ctx, body).await?)?;
-                if rules.iter().any(|r| r.transition_class.is_some()) && !engine.has_cold_store() {
+                if rules.iter().any(|r| {
+                    r.transition_class.is_some() || r.noncurrent_transition_class.is_some()
+                }) && !engine.has_cold_store()
+                {
                     return Err(S3Error::invalid_request(
                         "Transition rules need a cold tier, and none is configured on this server",
                     ));
@@ -947,7 +950,11 @@ async fn route(ctx: &Ctx, body: Body) -> S3Result<Response> {
             }
             match *m {
                 Method::PUT => {
-                    for sub in ["acl", "object-lock", "website", "replication", "logging"] {
+                    if ctx.has("acl") {
+                        ctx.engine().bucket(bucket).await?;
+                        return put_acl(ctx, body).await;
+                    }
+                    for sub in ["object-lock", "website", "replication", "logging"] {
                         if ctx.has(sub) {
                             return Err(S3Error::not_implemented(&format!("PutBucket {sub}")));
                         }
@@ -988,8 +995,14 @@ async fn route(ctx: &Ctx, body: Body) -> S3Result<Response> {
                     object_lock_subresource(ctx, bucket, key, body).await
                 }
                 Method::PUT if ctx.has("acl") => {
-                    Err(S3Error::not_implemented("object subresources"))
+                    resolve_object(ctx, bucket, key).await?;
+                    put_acl(ctx, body).await
                 }
+                Method::GET if ctx.has("acl") => {
+                    resolve_object(ctx, bucket, key).await?;
+                    Ok(owner_acl())
+                }
+                Method::POST if ctx.has("restore") => restore_object(ctx, bucket, key).await,
                 Method::PUT if ctx.headers.contains_key("x-amz-copy-source") => {
                     copy_object(ctx, bucket, key).await
                 }
@@ -1080,6 +1093,80 @@ async fn stats(st: &AppState) -> S3Result<Response> {
         .unwrap())
 }
 
+// -------------------------------------------------------------------- ACLs
+
+/// Kosha's only ACL: the owner has full control. Access for anyone else is
+/// granted with bucket and user policies.
+fn owner_acl() -> Response {
+    let mut x = Xml::new("AccessControlPolicy");
+    x.open("Owner")
+        .elem("ID", OWNER_ID)
+        .elem("DisplayName", OWNER_ID)
+        .close("Owner");
+    x.open("AccessControlList")
+        .open("Grant")
+        .raw("<Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"CanonicalUser\">")
+        .elem("ID", OWNER_ID)
+        .elem("DisplayName", OWNER_ID)
+        .close("Grantee")
+        .elem("Permission", "FULL_CONTROL")
+        .close("Grant")
+        .close("AccessControlList");
+    xml_response(x.finish("AccessControlPolicy"))
+}
+
+/// PutBucketAcl / PutObjectAcl: accept what Kosha already enforces (the
+/// `private` canned ACL, or an ACL granting only the owner full control);
+/// refuse anything that would grant more, rather than ignore it.
+async fn put_acl(ctx: &Ctx, body: Body) -> S3Result<Response> {
+    let refuse = || {
+        S3Error::not_implemented(
+            "ACLs other than private (grant access with bucket or user policies instead)",
+        )
+    };
+    if ctx
+        .headers
+        .keys()
+        .any(|k| k.as_str().starts_with("x-amz-grant-"))
+    {
+        return Err(refuse());
+    }
+    if ctx.header("x-amz-acl").is_some_and(|a| a != "private") {
+        return Err(refuse());
+    }
+    let doc = read_text(ctx, body).await?;
+    if !doc.trim().is_empty() {
+        let grants = doc.matches("<Permission>").count();
+        let full_control = doc.matches("<Permission>FULL_CONTROL</Permission>").count();
+        let only_owner = doc
+            .split("<ID>")
+            .skip(1)
+            .all(|rest| rest.starts_with(&format!("{OWNER_ID}</ID>")));
+        if grants != full_control
+            || !only_owner
+            || doc.contains("<URI>")
+            || doc.contains("<EmailAddress>")
+        {
+            return Err(refuse());
+        }
+    }
+    Ok(StatusCode::OK.into_response())
+}
+
+/// RestoreObject. Cold data is read directly, so a cold object is already
+/// available; STANDARD objects are refused like S3 does.
+async fn restore_object(ctx: &Ctx, bucket: &str, key: &str) -> S3Result<Response> {
+    let meta = resolve_object(ctx, bucket, key).await?;
+    if meta.storage_class.is_none() {
+        return Err(S3Error::new(
+            StatusCode::FORBIDDEN,
+            "InvalidObjectState",
+            "Restore is not allowed for the object's current storage class",
+        ));
+    }
+    Ok(StatusCode::OK.into_response())
+}
+
 // ------------------------------------------------------------------- bucket
 
 async fn get_bucket(ctx: &Ctx, bucket: &str) -> S3Result<Response> {
@@ -1100,21 +1187,7 @@ async fn get_bucket(ctx: &Ctx, bucket: &str) -> S3Result<Response> {
     }
     if ctx.has("acl") {
         ctx.engine().bucket(bucket).await?;
-        let mut x = Xml::new("AccessControlPolicy");
-        x.open("Owner")
-            .elem("ID", OWNER_ID)
-            .elem("DisplayName", OWNER_ID)
-            .close("Owner");
-        x.open("AccessControlList")
-            .open("Grant")
-            .raw("<Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"CanonicalUser\">")
-            .elem("ID", OWNER_ID)
-            .elem("DisplayName", OWNER_ID)
-            .close("Grantee")
-            .elem("Permission", "FULL_CONTROL")
-            .close("Grant")
-            .close("AccessControlList");
-        return Ok(xml_response(x.finish("AccessControlPolicy")));
+        return Ok(owner_acl());
     }
     // Configuration that Kosha does not store yet: answer the way S3 does
     // for a bucket where it was never set.

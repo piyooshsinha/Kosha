@@ -30,6 +30,8 @@ pub struct LifecycleReport {
     pub uploads_aborted: u64,
     /// Current objects moved to the cold tier.
     pub transitioned: u64,
+    /// Noncurrent versions moved to the cold tier.
+    pub noncurrent_transitioned: u64,
     /// Actions refused by Object Lock.
     pub refused: u64,
 }
@@ -193,21 +195,30 @@ impl Engine {
         }
 
         // Noncurrent versions and lone delete markers (versioned buckets).
+        let noncurrent_tier = rule
+            .noncurrent_transition_days
+            .zip(rule.noncurrent_transition_class.as_ref())
+            .filter(|_| self.has_cold_store());
         if info.config.versioning != Versioning::Unversioned
-            && (rule.noncurrent_days.is_some() || rule.expired_object_delete_marker)
+            && (rule.noncurrent_days.is_some()
+                || rule.expired_object_delete_marker
+                || noncurrent_tier.is_some())
         {
             let mut noncurrent = Vec::new();
             let mut markers = Vec::new();
+            let mut to_cold = Vec::new();
             // Versions of the key being scanned, newest first, each with
             // whether the rule's tag filter selects it.
             let mut group: Vec<(VersionInfo, bool)> = Vec::new();
             let flush = |group: &mut Vec<(VersionInfo, bool)>,
                          noncurrent: &mut Vec<DeleteTarget>,
-                         markers: &mut Vec<DeleteTarget>| {
+                         markers: &mut Vec<DeleteTarget>,
+                         to_cold: &mut Vec<DeleteTarget>| {
                 if group.is_empty() {
                     return;
                 }
                 let mut removed = 0;
+                let mut expiring = std::collections::HashSet::new();
                 if let Some(days) = rule.noncurrent_days {
                     // A version became noncurrent when its successor was written.
                     for i in 1..group.len() {
@@ -217,7 +228,25 @@ impl Engine {
                                 key: v.key.clone(),
                                 version_id: Some(v.version_id.clone()),
                             });
+                            expiring.insert(i);
                             removed += 1;
+                        }
+                    }
+                }
+                // Noncurrent versions that stay, but move to the cold tier.
+                if let Some((days, _)) = noncurrent_tier {
+                    for i in 1..group.len() {
+                        let (newer, (v, eligible)) = (&group[i - 1].0, &group[i]);
+                        let hot = v.meta.as_ref().is_some_and(|m| m.storage_class.is_none());
+                        if *eligible
+                            && hot
+                            && !expiring.contains(&i)
+                            && older_than(newer.last_modified, days, now)
+                        {
+                            to_cold.push(DeleteTarget {
+                                key: v.key.clone(),
+                                version_id: Some(v.version_id.clone()),
+                            });
                         }
                     }
                 }
@@ -250,7 +279,7 @@ impl Engine {
                     .await?;
                 for v in page.versions {
                     if group.first().is_some_and(|(g, _)| g.key != v.key) {
-                        flush(&mut group, &mut noncurrent, &mut markers);
+                        flush(&mut group, &mut noncurrent, &mut markers, &mut to_cold);
                     }
                     let eligible = rule.tags.is_empty()
                         || v.meta
@@ -264,7 +293,7 @@ impl Engine {
                 km = page.next_key_marker;
                 vm = page.next_version_marker;
             }
-            flush(&mut group, &mut noncurrent, &mut markers);
+            flush(&mut group, &mut noncurrent, &mut markers, &mut to_cold);
             for chunk in noncurrent.chunks(BATCH) {
                 self.delete_batch(bucket, &mut chunk.to_vec(), report, |r| {
                     &mut r.noncurrent_removed
@@ -276,6 +305,13 @@ impl Engine {
                     &mut r.markers_removed
                 })
                 .await?;
+            }
+            if let Some((_, class)) = noncurrent_tier {
+                for chunk in to_cold.chunks(BATCH) {
+                    report.noncurrent_transitioned += self
+                        .transition_objects(bucket, chunk.to_vec(), class)
+                        .await?;
+                }
             }
         }
 

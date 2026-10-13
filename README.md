@@ -137,7 +137,7 @@ another Kosha) and keep serving it transparently:
 kosha --cold-tier-endpoint https://s3.eu-west-1.amazonaws.com --cold-tier-bucket my-archive \
       --cold-tier-region eu-west-1 --cold-tier-access-key AKIA… --cold-tier-secret-key … ...
 
-# move objects after 30 days...
+# move objects after 30 days (and old versions after 7 with NoncurrentVersionTransitions)...
 s3api put-bucket-lifecycle-configuration --bucket logs --lifecycle-configuration '{"Rules": [
   {"ID": "archive", "Status": "Enabled", "Filter": {"Prefix": "2025/"},
    "Transitions": [{"Days": 30, "StorageClass": "GLACIER_IR"}]}]}'
@@ -775,17 +775,17 @@ Tested against the **AWS SDK for Rust** (in CI), **boto3**, the **AWS CLI**,
 | CORS | Get/Put/DeleteBucketCors, unauthenticated `OPTIONS` preflight, CORS headers on matching responses (origin wildcards, credentials, exposed headers, max-age) |
 | Versioning | Get/PutBucketVersioning (Enabled, Suspended), `versionId` on Get/Head/Delete/Copy source/tagging, delete markers, null versions, ListObjectVersions (prefix, delimiter, key/version markers), versioned DeleteObjects |
 | Object Lock | buckets created with `x-amz-bucket-object-lock-enabled`, Get/PutObjectLockConfiguration (default retention), Get/PutObjectRetention (GOVERNANCE with `x-amz-bypass-governance-retention`, COMPLIANCE), Get/PutObjectLegalHold, `x-amz-object-lock-*` headers on Put/Copy/CreateMultipartUpload |
-| Lifecycle | Get/Put/DeleteBucketLifecycleConfiguration: expiration (days or date), transition to a cold class (days or date), noncurrent version expiration, expired delete marker cleanup, AbortIncompleteMultipartUpload; filters by prefix and tags |
-| Storage classes | `x-amz-storage-class` on Put/Copy/CreateMultipartUpload, reported on Get/Head and in listings; cold classes need a [cold tier](#cold-tier) |
+| Lifecycle | Get/Put/DeleteBucketLifecycleConfiguration: expiration (days or date), transition to a cold class (days or date), noncurrent version transition and expiration, expired delete marker cleanup, AbortIncompleteMultipartUpload; filters by prefix and tags |
+| Storage classes | `x-amz-storage-class` on Put/Copy/CreateMultipartUpload, reported on Get/Head and in listings, RestoreObject (succeeds at once: cold data reads directly); cold classes need a [cold tier](#cold-tier) |
+| ACLs | Get/PutBucketAcl and Get/PutObjectAcl with the owner-only (`private`) ACL; anything granting more returns `NotImplemented` (use policies) |
 | Notifications | Get/PutBucketNotificationConfiguration (Queue/Topic/CloudFunction configurations, prefix/suffix filters) delivered to webhooks |
 | Listing | ListObjectsV2 (prefix, delimiter, continuation, start-after, `encoding-type=url`), ListObjects v1 |
 | Multipart | Create, UploadPart, UploadPartCopy (with range), Complete, Abort, ListParts, ListMultipartUploads (paginated) |
 | Writes | Conditional `If-None-Match: *` / `If-Match` on Put, Copy and Complete |
 
-Not implemented: ACL changes (ACLs are reported as owner-only; use
-policies), SSE-KMS and SSE-C, the AWS IAM API itself (users are managed
-through `/_kosha/admin/users` and the console), transitions of noncurrent
-versions, and RestoreObject (cold data reads through directly). Unsupported operations return `501 NotImplemented`.
+Not implemented: ACLs that grant access to others (use policies), SSE-KMS
+and SSE-C, and the AWS IAM API itself (users are managed through
+`/_kosha/admin/users` and the console). Unsupported operations return `501 NotImplemented`.
 
 ## Layout
 

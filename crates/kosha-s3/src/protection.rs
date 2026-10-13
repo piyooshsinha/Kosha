@@ -336,7 +336,15 @@ struct RuleXml {
     #[serde(rename = "Transition", default)]
     transitions: Vec<TransitionXml>,
     #[serde(rename = "NoncurrentVersionTransition", default)]
-    noncurrent_transitions: Vec<serde::de::IgnoredAny>,
+    noncurrent_transitions: Vec<NoncurrentTransitionXml>,
+}
+
+#[derive(Deserialize)]
+struct NoncurrentTransitionXml {
+    #[serde(rename = "NoncurrentDays")]
+    days: u32,
+    #[serde(rename = "StorageClass")]
+    class: String,
 }
 
 #[derive(Deserialize)]
@@ -406,12 +414,24 @@ pub fn parse_lifecycle(xml: &str) -> S3Result<Vec<LifecycleRule>> {
     }
     let mut out = Vec::new();
     for r in c.rules {
-        if !r.noncurrent_transitions.is_empty() || r.transitions.len() > 1 {
+        if r.noncurrent_transitions.len() > 1 || r.transitions.len() > 1 {
             return Err(S3Error::new(
                 StatusCode::NOT_IMPLEMENTED,
                 "NotImplemented",
-                "only one Transition (of current versions) per rule is supported",
+                "only one Transition and one NoncurrentVersionTransition per rule are supported",
             ));
+        }
+        let (mut noncurrent_transition_days, mut noncurrent_transition_class) = (None, None);
+        if let Some(t) = r.noncurrent_transitions.into_iter().next() {
+            if !kosha_engine::is_cold_class(&t.class) {
+                return Err(S3Error::new(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidStorageClass",
+                    format!("cannot transition to {}", t.class),
+                ));
+            }
+            noncurrent_transition_days = Some(t.days);
+            noncurrent_transition_class = Some(t.class);
         }
         let (mut transition_days, mut transition_date, mut transition_class) = (None, None, None);
         if let Some(t) = r.transitions.into_iter().next() {
@@ -474,9 +494,12 @@ pub fn parse_lifecycle(xml: &str) -> S3Result<Vec<LifecycleRule>> {
             transition_days,
             transition_date,
             transition_class,
+            noncurrent_transition_days,
+            noncurrent_transition_class,
         };
         if rule.expiration_days.is_none()
             && rule.transition_class.is_none()
+            && rule.noncurrent_transition_class.is_none()
             && rule.expiration_date.is_none()
             && !rule.expired_object_delete_marker
             && rule.noncurrent_days.is_none()
@@ -525,6 +548,14 @@ pub fn render_lifecycle(rules: &[LifecycleRule]) -> String {
             x.opt("Days", r.transition_days.map(|d| d.to_string()));
             x.opt("Date", r.transition_date.as_ref().map(iso8601));
             x.elem("StorageClass", class).close("Transition");
+        }
+        if let (Some(d), Some(class)) =
+            (r.noncurrent_transition_days, &r.noncurrent_transition_class)
+        {
+            x.open("NoncurrentVersionTransition")
+                .elem("NoncurrentDays", d.to_string())
+                .elem("StorageClass", class)
+                .close("NoncurrentVersionTransition");
         }
         if let Some(d) = r.noncurrent_days {
             x.open("NoncurrentVersionExpiration")
@@ -575,13 +606,16 @@ mod tests {
             parse_lifecycle(&bad).unwrap_err().code,
             "InvalidStorageClass"
         );
-        let noncurrent = transition
-            .replace("<Transition>", "<NoncurrentVersionTransition>")
-            .replace("</Transition>", "</NoncurrentVersionTransition>");
+        let noncurrent = r#"<LifecycleConfiguration><Rule><Status>Enabled</Status><Filter><Prefix></Prefix></Filter><NoncurrentVersionTransition><NoncurrentDays>7</NoncurrentDays><StorageClass>STANDARD_IA</StorageClass></NoncurrentVersionTransition></Rule></LifecycleConfiguration>"#;
+        let rules = parse_lifecycle(noncurrent).unwrap();
         assert_eq!(
-            parse_lifecycle(&noncurrent).unwrap_err().code,
-            "NotImplemented"
+            (
+                rules[0].noncurrent_transition_days,
+                rules[0].noncurrent_transition_class.as_deref()
+            ),
+            (Some(7), Some("STANDARD_IA"))
         );
+        assert_eq!(parse_lifecycle(&render_lifecycle(&rules)).unwrap(), rules);
     }
 
     #[test]

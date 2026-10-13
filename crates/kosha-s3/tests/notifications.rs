@@ -349,6 +349,8 @@ async fn webhook_notifications() {
                 transition_days: None,
                 transition_date: None,
                 transition_class: None,
+                noncurrent_transition_days: None,
+                noncurrent_transition_class: None,
             }])),
         )
         .await

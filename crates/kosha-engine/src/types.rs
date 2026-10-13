@@ -238,6 +238,12 @@ pub struct LifecycleRule {
     /// ...as this storage class (e.g. `GLACIER_IR`).
     #[serde(default)]
     pub transition_class: Option<String>,
+    /// Move versions to the cold tier this many days after they became
+    /// noncurrent, as `noncurrent_transition_class`.
+    #[serde(default)]
+    pub noncurrent_transition_days: Option<u32>,
+    #[serde(default)]
+    pub noncurrent_transition_class: Option<String>,
 }
 
 /// One version of an object, as returned by version listings and lookups.

@@ -675,6 +675,7 @@ pub fn required(
                 "s3:PutObjectAcl"
             }
         }
+        "POST" if has("restore") => "s3:RestoreObject",
         "GET" | "HEAD" if has("uploadId") => "s3:ListMultipartUploadParts",
         "GET" | "HEAD" => pick("s3:GetObject", "s3:GetObjectVersion"),
         "DELETE" if has("uploadId") => "s3:AbortMultipartUpload",
