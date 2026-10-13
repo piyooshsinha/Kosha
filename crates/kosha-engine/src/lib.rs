@@ -15,6 +15,7 @@
 
 mod chunker;
 mod chunkstore;
+mod commit;
 mod engine;
 mod error;
 pub mod io;

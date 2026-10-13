@@ -290,6 +290,22 @@ impl ChunkStore {
         Ok(removed)
     }
 
+    /// Delete this node's copy of a chunk unless an upload has it pinned.
+    /// Used by cluster rebalancing once enough other replicas are confirmed.
+    pub fn remove_unpinned(&self, id: &ChunkId) -> Result<bool> {
+        let pins = self.pins.lock();
+        if pins.contains_key(id) {
+            return Ok(false);
+        }
+        let r = match fs::remove_file(self.path_of(id)) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+        };
+        drop(pins);
+        r
+    }
+
     /// Walk every chunk file and collect the unreferenced ones (orphans from
     /// aborted uploads, or chunks whose collection was deferred by the grace
     /// period). Returns the number of files removed.

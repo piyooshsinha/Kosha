@@ -293,3 +293,129 @@ async fn conflicting_conditional_writes_on_different_nodes() {
     }
     assert_eq!(wins, 1);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reads_use_the_leader_lease_and_stay_linearizable() {
+    let nodes = three_nodes().await;
+    let leader_id = nodes[0].cluster.status().leader.unwrap();
+    let leader = nodes
+        .iter()
+        .find(|n| n.cluster.node_id() == leader_id)
+        .unwrap();
+    let followers: Vec<&Node> = nodes
+        .iter()
+        .filter(|n| n.cluster.node_id() != leader_id)
+        .collect();
+    leader.engine.create_bucket("leased").await.unwrap();
+
+    for i in 0..30 {
+        // Write on one follower, read immediately on the other.
+        let key = format!("k{i}");
+        put(&followers[0].engine, "leased", &key, key.as_bytes()).await;
+        assert_eq!(
+            get(&followers[1].engine, "leased", &key).await,
+            key.as_bytes()
+        );
+        assert_eq!(get(&leader.engine, "leased", &key).await, key.as_bytes());
+    }
+    let s = leader.cluster.status();
+    assert!(
+        s.lease_reads > s.quorum_reads,
+        "lease {} vs quorum {}",
+        s.lease_reads,
+        s.quorum_reads
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repair_restores_replicas_after_a_node_dies() {
+    let nodes = three_nodes().await;
+    nodes[0].engine.create_bucket("durable").await.unwrap();
+    let body = data(400_000, 21);
+    let meta = put(&nodes[0].engine, "durable", "obj", &body).await;
+    let ids = chunk_ids(&meta);
+    assert!(ids.len() > 10);
+
+    // Node 3 dies for good. Chunks it held now have a single live copy.
+    nodes[2].cluster.shutdown().await;
+    let alive = [&nodes[0], &nodes[1]];
+    let live_copies = |id: &ChunkId| {
+        alive
+            .iter()
+            .filter(|n| n.engine.chunk_store().has(id))
+            .count()
+    };
+    let under: usize = ids.iter().filter(|id| live_copies(id) < 2).count();
+    assert!(under > 0, "some chunks should have lost a replica");
+
+    let mut repaired = 0;
+    for n in alive {
+        let r = n.cluster.repair_now().await;
+        assert_eq!(r.live_voters, 2);
+        assert_eq!(r.failed, 0);
+        repaired += r.repaired;
+    }
+    assert_eq!(repaired as usize, under);
+    for id in &ids {
+        assert_eq!(live_copies(id), 2, "chunk {id:?} back to 2 live copies");
+    }
+    assert_eq!(get(&nodes[1].engine, "durable", "obj").await, body);
+    // A second pass finds nothing to do.
+    for n in alive {
+        let r = n.cluster.repair_now().await;
+        assert_eq!((r.repaired, r.surplus_removed, r.failed), (0, 0, 0));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repair_removes_surplus_replicas() {
+    let nodes = three_nodes().await;
+    nodes[0].engine.create_bucket("balance").await.unwrap();
+    let body = data(200_000, 33);
+    let meta = put(&nodes[0].engine, "balance", "obj", &body).await;
+
+    // Plant a copy of every chunk on every node (as fallback writes would).
+    let mut planted = 0;
+    for seg in &meta.segments {
+        let Segment::Chunk { id, .. } = seg else {
+            continue;
+        };
+        let holder = nodes
+            .iter()
+            .find(|n| n.engine.chunk_store().has(id))
+            .unwrap();
+        let raw = holder
+            .engine
+            .chunk_store()
+            .get(id, seg.len() as u32)
+            .await
+            .unwrap();
+        for n in &nodes {
+            if !n.engine.chunk_store().has(id) {
+                n.engine
+                    .chunk_store()
+                    .put_replica(*id, raw.clone())
+                    .await
+                    .unwrap();
+                planted += 1;
+            }
+        }
+    }
+    assert!(planted > 0);
+
+    let mut removed = 0;
+    for n in &nodes {
+        removed += n.cluster.repair_now().await.surplus_removed;
+    }
+    assert_eq!(removed as usize, planted);
+    for id in chunk_ids(&meta) {
+        let copies = nodes
+            .iter()
+            .filter(|n| n.engine.chunk_store().has(&id))
+            .count();
+        assert_eq!(copies, 2);
+    }
+    for n in &nodes {
+        assert_eq!(get(&n.engine, "balance", "obj").await, body);
+    }
+}

@@ -22,13 +22,18 @@ impl fmt::Display for KoshaNode {
     }
 }
 
-/// Result of applying one log entry. Only `Normal` entries carry a result.
+/// One Raft entry: a group of commands committed together (group commit).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct Response(pub Option<CommandResult>);
+pub struct CommandBatch(pub Vec<Command>);
+
+/// Result of applying one log entry: one result per command in its batch
+/// (empty for blank and membership entries).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Response(pub Vec<CommandResult>);
 
 openraft::declare_raft_types!(
     pub TypeConfig:
-        D = Command,
+        D = CommandBatch,
         R = Response,
         NodeId = NodeId,
         Node = KoshaNode,

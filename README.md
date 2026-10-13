@@ -22,6 +22,8 @@ with io_uring.
 | Metadata | files / ad-hoc database | **Raft-replicated ACID state machine** (openraft + redb) |
 | Consistency | eventually consistent or proprietary | **linearizable** reads and writes on any node (ReadIndex) |
 | Concurrency control | last writer wins | adds **conditional writes** (`If-None-Match: *`, `If-Match`) evaluated in the Raft log |
+| Write path | one commit per request | **group commit**: concurrent writes share one durable transaction / one Raft entry |
+| Durability after node loss | manual rebuild | **self-healing**: background re-replication restores every chunk's replica count |
 | Admin UI | separate product | **built-in web console**, compiled into the binary |
 
 **Contents:**
@@ -153,8 +155,9 @@ sessions. It works over plain HTTP too.
 - **Buckets and object browser**: create and delete buckets, browse folders,
   drag-and-drop uploads with progress, object details, downloads, expiring
   share links (1 hour / 1 day / 7 days), and bulk delete.
-- **Cluster**: leader, Raft term, log and applied indexes, and per-node
-  replication progress, refreshed every 2 seconds.
+- **Cluster**: leader, Raft term, log and applied indexes, per-node
+  replication progress, lease-read hit rate and background-repair counters,
+  refreshed every 2 seconds. Nodes can be removed from here.
 
 | Object browser | Cluster (dark mode) |
 |---|---|
@@ -198,10 +201,22 @@ Things to know:
   only after it has applied the write itself, so you always read your own
   writes.
 - **Reads** are linearizable on every node: a read never returns data older
-  than a write that already completed anywhere in the cluster.
+  than a write that already completed anywhere in the cluster. The leader
+  serves them from a **leader lease** instead of a quorum round-trip per read
+  (in benchmarks, over 99% of read barriers). `--no-lease-reads` turns this
+  off if your clocks are unreliable.
 - **Failure**: if the leader dies, the others elect a new one within about
   1–2 seconds and keep serving. When the dead node comes back, it catches up
   from the log, or from a snapshot if the log was compacted.
+- **Self-healing**: every node runs a background repairer
+  (`--repair-interval-secs`, default 60). When a node stops answering, the
+  next-ranked live nodes copy the chunks it held, so every chunk gets back to
+  `--replication` copies without waiting for reads. Surplus copies, for
+  example fallback replicas written while a node was down, are removed once
+  the designated nodes confirm they have theirs.
+- **Removing a node**: click **Remove** in the console's Cluster page, or
+  call `DELETE /_kosha/cluster/nodes/<id>` (SigV4-signed) on any node. Then
+  stop that node's process. Its data is re-replicated in the background.
 - Internal traffic (port 9100) is plain HTTP authenticated by the shared
   secret. **Keep it on a private network.**
 
@@ -212,6 +227,10 @@ scripts/dev-cluster.sh start      # 3 nodes: S3 on :9001-9003, console on http:/
 scripts/dev-cluster.sh kill 1     # SIGKILL node 1 and watch a new leader take over
 scripts/dev-cluster.sh restart 1  # it rejoins and catches up
 scripts/dev-cluster.sh stop
+
+# remove a node for good (any node accepts the request)
+curl -X DELETE --aws-sigv4 "aws:amz:us-east-1:s3" --user admin:admin-secret-key \
+     http://127.0.0.1:9001/_kosha/cluster/nodes/3
 ```
 
 ## 6. Monitoring
@@ -220,7 +239,8 @@ scripts/dev-cluster.sh stop
 |---|---|---|
 | `GET /_kosha/health` | none | `ok`, for load balancer and liveness probes |
 | `GET /_kosha/stats` | SigV4 | objects, logical/unique/physical bytes, dedup and compression ratios, I/O backend |
-| `GET /_kosha/cluster` | SigV4 | role, term, leader, log and applied indexes, members and replication progress |
+| `GET /_kosha/cluster` | SigV4 | role, term, leader, log/applied indexes, members, replication progress, lease vs quorum reads, background repair counters |
+| `DELETE /_kosha/cluster/nodes/{id}` | SigV4 | removes a voter (refuses non-voters and the last voter) |
 
 ```sh
 curl -s --aws-sigv4 "aws:amz:us-east-1:s3" --user admin:change-me-please http://localhost:9000/_kosha/stats
@@ -249,21 +269,48 @@ Unless noted otherwise:
 - every GET is checked byte-for-byte against what was written, and every run
   finished with **0 errors**.
 
+### Group commit and lease reads: before and after
+
+Measured back-to-back on the same VM, same client, same workload
+(4 KiB objects, 32 concurrent requests unless noted):
+
+| | Before | After | |
+|---|---|---|---|
+| Single node, PUT | 987 req/s · p50 31 ms | **3,193 req/s** · p50 6.4 ms | **3.2×** |
+| Single node, PUT at 128 concurrent | 895 req/s · p50 140 ms | **3,209 req/s** · p50 21 ms | **3.6×** |
+| 3-node cluster, PUT via leader | 529–626 req/s · p50 ~50 ms | **1,432 req/s** · p50 19 ms | **2.3–2.7×** |
+| 3-node cluster, PUT via follower | 638 req/s | **1,220 req/s** | **1.9×** |
+| Leader read barriers needing a quorum round-trip | 100% | **0.2%** (31 of 17,200) | lease |
+| Leader GET, one request at a time | p50 1.15 ms | **p50 0.87 ms** | −24% |
+
+- **Before group commit**, throughput stayed flat from 32 to 128 concurrent
+  requests while latency grew, the signature of a serialized commit path. On
+  the cluster leader, a probe showed every Raft append carried exactly one
+  entry.
+- **Now**, single-node writes form batches in one durable redb transaction,
+  and cluster writes put a batch of commands into one Raft entry. Batches
+  form from load alone, so a lone request still commits immediately.
+- **Lease reads** save one quorum round-trip per read on the leader, and a
+  follower read now costs a single round-trip to the leader. On loopback a
+  round-trip is ~0.3 ms, so the gain here is small. Across racks or
+  availability zones it is a full network RTT per read.
+
 ### Single node: throughput under load
 
 | Object size | Concurrency | PUT | GET |
 |---|---|---|---|
-| 4 KiB | 32 | **1,160 req/s** · p50 27 ms · p99 61 ms | **4,120 req/s** · p50 3.8 ms · p99 10.7 ms |
-| 64 KiB | 32 | **880 req/s** (55 MiB/s) · p50 35 ms · p99 81 ms | **3,670 req/s** (229 MiB/s) · p50 6.1 ms · p99 12.6 ms |
-| 1 MiB | 16 | **143 MiB/s** · p50 87 ms · p99 168 ms | **851 MiB/s** · p50 17 ms · p99 38 ms |
-| 32 MiB | 4 | **141 MiB/s** · p50 744 ms | **586 MiB/s** · p50 200 ms |
+| 4 KiB | 32 | **2,760 req/s** · p50 6.9 ms | **3,900 req/s** · p50 4.3 ms · p99 9.9 ms |
+| 4 KiB | 128 | **2,830 req/s** · p50 24 ms | 2,650 req/s · p50 22 ms |
+| 64 KiB | 32 | **840 req/s** (53 MiB/s) · p50 28 ms | **3,000 req/s** (188 MiB/s) · p50 7.5 ms |
+| 1 MiB | 16 | **121 MiB/s** · p50 84 ms | **693 MiB/s** · p50 20 ms · p99 44 ms |
+| 32 MiB | 4 | **117 MiB/s** · p50 962 ms | **562 MiB/s** · p50 217 ms |
 
 ### Single node: one request at a time (latency)
 
 | Object size | PUT p50 / p99 | GET p50 / p99 |
 |---|---|---|
-| 4 KiB | **1.7 ms** / 4.0 ms | **0.58 ms** / 1.5 ms |
-| 1 MiB | 26.6 ms / 35.9 ms | **2.9 ms** / 4.6 ms |
+| 4 KiB | **3.0 ms** / 8.6 ms | **0.77 ms** / 2.1 ms |
+| 1 MiB | 19 ms / 29 ms | **4.2 ms** / 9.9 ms |
 
 ### Single node: one large stream (curl, `UNSIGNED-PAYLOAD`)
 
@@ -276,43 +323,42 @@ Unless noted otherwise:
 
 ### 3-node cluster (replication factor 2)
 
-Writes go through Raft: the leader fsyncs the log entry and waits for a
-majority to do the same. Each chunk is also written to 2 nodes. Reads use
-ReadIndex, so a follower read includes one round-trip to the leader.
+Writes go through Raft: a batch of commands becomes one log entry, which the
+leader fsyncs and replicates to a majority. Each chunk is also written to 2
+nodes. Follower reads make one round-trip to the leader; the leader answers
+from its lease.
 
 | Object size | Concurrency | PUT via leader | GET via follower |
 |---|---|---|---|
-| 4 KiB | 32 | **687 req/s** · p50 43 ms · p99 65 ms | **3,800 req/s** · p50 6.4 ms · p99 26 ms |
-| 64 KiB | 32 | **513 req/s** (32 MiB/s) · p50 53 ms | **2,240 req/s** (140 MiB/s) · p50 11 ms |
-| 1 MiB | 16 | **102 MiB/s** · p50 119 ms | **562 MiB/s** · p50 26 ms |
-| 32 MiB | 4 | **125 MiB/s** | **543 MiB/s** |
+| 4 KiB | 32 | **1,180 req/s** · p50 23 ms · p99 41 ms | **3,700 req/s** · p50 5.5 ms · p99 25 ms |
+| 64 KiB | 32 | **416 req/s** (26 MiB/s) · p50 67 ms | **2,440 req/s** (153 MiB/s) · p50 9.6 ms |
+| 1 MiB | 16 | **93 MiB/s** · p50 133 ms | **678 MiB/s** · p50 21 ms |
+| 32 MiB | 4 | **99 MiB/s** | **299 MiB/s** |
 
-Writing through a follower costs little extra: 638 req/s for 4 KiB and
-125 MiB/s for 1 MiB. With one request at a time, a 4 KiB PUT takes **6.0 ms**
-p50 through the leader and 7.0 ms through a follower. A linearizable 4 KiB GET
-on a follower takes **1.2 ms** p50.
+Through a follower, 4 KiB PUTs run at 1,100 req/s. With one request at a
+time:
 
-### What limits these numbers
+- 4 KiB PUT: **7.7 ms** p50.
+- Linearizable 4 KiB GET on a follower: **1.1 ms** p50.
+- 4 KiB GET on the leader, served from its lease: **0.72 ms** p50.
 
-- **Small writes are limited by metadata commits.** Each PUT is one
-  serialized, durable redb transaction (a Raft log append plus apply in a
-  cluster). Objects of 8 KiB or less are stored inline and never touch a chunk
-  file, and 4 KiB PUTs still top out around 1,100/s. `--no-fsync` (which only
-  affects chunk files) did not change that. Up to 32 concurrent requests,
-  latency grows with load while throughput stays flat, the signature of a
-  serialized commit path. The fix is **group commit**: batch concurrent
-  commands into one transaction. The state machine already applies batches,
-  so this is the next optimization on the roadmap.
+Run-to-run variance on this shared VM is about ±15% for most rows, more for
+large objects in the cluster.
+
+### What limits these numbers now
+
 - **Large writes are CPU-bound on this VM.** The SDK hashes every payload
   with SHA-256, and the server re-verifies it and also computes MD5 (for the
-  ETag) and BLAKE3 (for the chunk address), on the same 4 cores as the client.
-  That is why identical-content 1 MiB PUTs run only modestly faster
-  (164 vs 143 MiB/s) even though dedup skips the disk write. The
-  single-stream curl upload with `UNSIGNED-PAYLOAD` skips the SHA-256 and
-  reaches 245–340 MB/s.
-- **Reads scale well.** Range reads touch only the chunks they need,
-  `read_ahead` chunks are fetched concurrently, and io_uring serves warm
-  chunks at over 1 GB/s on a single stream.
+  ETag) and BLAKE3 (for the chunk address), on the same 4 cores as the client
+  (and, in the cluster, two other nodes). Identical-content 1 MiB PUTs, where
+  dedup skips the disk write entirely, are only modestly faster
+  (164 vs 143 MiB/s in an earlier run). The single-stream curl upload with
+  `UNSIGNED-PAYLOAD` skips the SHA-256 and reaches 245–340 MB/s.
+- **Medium objects (64 KiB) pay one fsync per chunk file.** Each one is
+  durably written before the PUT is acknowledged. Batching those fsyncs the
+  way metadata commits are batched is the next write-path optimization.
+- **Small writes** now run at about the same rate as small reads, so the
+  client, the HTTP stack and SigV4 verification share the remaining cost.
 
 ### Reproduce
 
@@ -378,6 +424,8 @@ io_uring. `--io auto` (the default) detects this and falls back to threads;
 | `--init` / `--join <addr>` | `KOSHA_INIT` / `KOSHA_JOIN` | | bootstrap, or join through any member |
 | `--replication` | `KOSHA_REPLICATION` | `2` | copies of each chunk |
 | `--gc-grace-secs` | `KOSHA_GC_GRACE_SECS` | `900` | cluster: keep unreferenced chunks this long |
+| `--repair-interval-secs` | `KOSHA_REPAIR_INTERVAL_SECS` | `60` | cluster: background re-replication/rebalancing pass (`0` disables) |
+| `--no-lease-reads` | `KOSHA_NO_LEASE_READS` | off | cluster: prove leadership with a quorum round-trip on every read |
 
 ## S3 compatibility
 
@@ -391,7 +439,7 @@ Tested against the **AWS SDK for Rust** (in CI), **boto3**, the **AWS CLI**,
 | Buckets | Create, Delete, Head, List, GetBucketLocation, GetBucketVersioning (unversioned), GetBucketAcl; "not configured" responses for policy/CORS/lifecycle/tagging/encryption/... |
 | Objects | Put, Get (single range, conditional, `response-*` overrides), Head, Delete, DeleteObjects, CopyObject (COPY/REPLACE metadata, copy-source conditions), user metadata and standard headers |
 | Listing | ListObjectsV2 (prefix, delimiter, continuation, start-after, `encoding-type=url`), ListObjects v1 |
-| Multipart | Create, UploadPart, UploadPartCopy (with range), Complete, Abort, ListParts, ListMultipartUploads |
+| Multipart | Create, UploadPart, UploadPartCopy (with range), Complete, Abort, ListParts, ListMultipartUploads (paginated) |
 | Writes | Conditional `If-None-Match: *` / `If-Match` on Put, Copy and Complete |
 
 Not implemented yet: versioning, object lock, bucket policies/IAM, lifecycle,

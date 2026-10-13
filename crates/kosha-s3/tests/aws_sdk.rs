@@ -313,6 +313,57 @@ async fn multipart_upload() {
     assert_eq!(got.content_type(), Some("application/x-big"));
     assert_eq!(body(got).await, [p1, p2].concat());
 
+    // Paginated ListMultipartUploads across several keys and uploads per key.
+    let mut created = Vec::new();
+    for k in ["p/a", "p/b", "p/b", "p/c", "p/c", "p/c"] {
+        let up = c
+            .create_multipart_upload()
+            .bucket("uploads")
+            .key(k)
+            .send()
+            .await
+            .unwrap();
+        created.push((k.to_string(), up.upload_id().unwrap().to_string()));
+    }
+    let mut seen = Vec::new();
+    let (mut km, mut um): (Option<String>, Option<String>) = (None, None);
+    loop {
+        let page = c
+            .list_multipart_uploads()
+            .bucket("uploads")
+            .prefix("p/")
+            .max_uploads(2)
+            .set_key_marker(km.clone())
+            .set_upload_id_marker(um.clone())
+            .send()
+            .await
+            .unwrap();
+        assert!(page.uploads().len() <= 2);
+        seen.extend(page.uploads().iter().map(|u| {
+            (
+                u.key().unwrap().to_string(),
+                u.upload_id().unwrap().to_string(),
+            )
+        }));
+        if !page.is_truncated().unwrap_or(false) {
+            break;
+        }
+        km = page.next_key_marker().map(str::to_string);
+        um = page.next_upload_id_marker().map(str::to_string);
+    }
+    created.sort();
+    seen.sort();
+    assert_eq!(seen, created, "every upload listed exactly once");
+    for (k, id) in &created {
+        c.abort_multipart_upload()
+            .bucket("uploads")
+            .key(k)
+            .upload_id(id)
+            .send()
+            .await
+            .unwrap();
+    }
+
     // Abort path.
     let up = c
         .create_multipart_upload()

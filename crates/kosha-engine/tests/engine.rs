@@ -376,3 +376,65 @@ async fn concurrent_put_delete_keeps_shared_chunks() {
     // All objects share the same chunks.
     assert!(s.unique_bytes <= shared.len() as u64);
 }
+
+/// Group commit puts many concurrent commands in one transaction. Conflicting
+/// conditional creates inside the same batch must still have exactly one
+/// winner, and every independent write must persist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn group_commit_preserves_per_command_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = Engine::open(config(dir.path())).unwrap();
+    e.create_bucket("batch").await.unwrap();
+
+    let mut racers = Vec::new();
+    for i in 0..64 {
+        let e = e.clone();
+        racers.push(tokio::spawn(async move {
+            let mut w = e.writer();
+            w.write(format!("racer {i}").as_bytes()).await.unwrap();
+            let cond = WriteCondition {
+                if_none_match_any: true,
+                ..Default::default()
+            };
+            e.put_object(
+                "batch",
+                "lock",
+                w.finish().await.unwrap(),
+                ObjectAttrs::default(),
+                cond,
+            )
+            .await
+            .is_ok()
+        }));
+    }
+    let mut writers = Vec::new();
+    for i in 0..200 {
+        let e = e.clone();
+        writers.push(tokio::spawn(async move {
+            put(&e, "batch", &format!("k{i:03}"), format!("v{i}").as_bytes()).await;
+        }));
+    }
+    let wins: usize = futures::future::join_all(racers)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap() as usize)
+        .sum();
+    for w in writers {
+        w.await.unwrap();
+    }
+    assert_eq!(wins, 1);
+
+    let page = e
+        .list_objects(
+            "batch",
+            ListQuery {
+                max_keys: 1000,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.objects.len(), 201);
+    assert_eq!(e.stats().await.unwrap().objects, 201);
+    assert_eq!(get(&e, "batch", "k123", 0, None).await, b"v123");
+}

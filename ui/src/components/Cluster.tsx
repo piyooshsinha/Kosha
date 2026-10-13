@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
 import type { ClusterStatus, S3 } from "../api/s3.ts";
+import type { PushToast } from "./Toasts.tsx";
 
-export function ClusterView({ s3 }: { s3: S3 }) {
+export function ClusterView({ s3, toast }: { s3: S3; toast: PushToast }) {
   const [status, setStatus] = useState<ClusterStatus | null>(null);
+  const [removing, setRemoving] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [updated, setUpdated] = useState<Date | null>(null);
 
@@ -54,6 +56,26 @@ kosha --node-id 3 --cluster-listen 10.0.0.3:9100 --join 10.0.0.1:9100`}</pre>
   const quorum = Math.floor(voters / 2) + 1;
   const lastIndex = status.last_log_index ?? 0;
   const isLeader = status.leader === status.node_id;
+  const barrier = (status.lease_reads ?? 0) + (status.quorum_reads ?? 0);
+  const leasePct = barrier ? Math.round(((status.lease_reads ?? 0) / barrier) * 100) : null;
+  const repair = status.repair;
+
+  async function remove(id: number) {
+    const warn =
+      id === status!.node_id
+        ? `Remove node ${id} — the node serving this console — from the cluster?`
+        : `Remove node ${id} from the cluster?`;
+    if (!confirm(`${warn}\n\nIts chunks will be re-replicated to the remaining nodes. Stop the process after removal.`)) return;
+    setRemoving(id);
+    try {
+      await s3.removeNode(id);
+      toast("ok", `Node ${id} removed; re-replication runs in the background`);
+    } catch (e) {
+      toast("error", (e as Error).message);
+    } finally {
+      setRemoving(null);
+    }
+  }
   const leaderNode = nodes.find((n) => n.id === status.leader);
 
   return (
@@ -86,6 +108,23 @@ kosha --node-id 3 --cluster-listen 10.0.0.3:9100 --join 10.0.0.1:9100`}</pre>
           <div className="tile-value">{status.snapshot_index ?? "none"}</div>
           <div className="tile-sub">last compacted index</div>
         </div>
+        <div className="tile">
+          <div className="tile-label">Lease reads</div>
+          <div className="tile-value">{isLeader && leasePct != null ? `${leasePct}%` : "—"}</div>
+          <div className="tile-sub">
+            {isLeader ? `${(status.lease_reads ?? 0).toLocaleString()} without a quorum round-trip` : "tracked on the leader"}
+          </div>
+        </div>
+        {repair && (
+          <div className="tile">
+            <div className="tile-label">Background repair</div>
+            <div className="tile-value">{repair.repaired.toLocaleString()}</div>
+            <div className="tile-sub">
+              replicas restored · {repair.surplus_removed.toLocaleString()} surplus removed · {repair.rounds} passes
+              {repair.failed ? ` · ${repair.failed} failed` : ""}
+            </div>
+          </div>
+        )}
       </section>
 
       <div className="card flush">
@@ -97,6 +136,7 @@ kosha --node-id 3 --cluster-listen 10.0.0.3:9100 --join 10.0.0.1:9100`}</pre>
               <th>S3 endpoint</th>
               <th>Cluster address</th>
               {isLeader && <th className="right">Replicated to</th>}
+              <th className="right" />
             </tr>
           </thead>
           <tbody>
@@ -126,6 +166,13 @@ kosha --node-id 3 --cluster-listen 10.0.0.3:9100 --join 10.0.0.1:9100`}</pre>
                       )}
                     </td>
                   )}
+                  <td className="right">
+                    {n.voter && voters > 1 && (
+                      <button className="ghost small danger" disabled={removing !== null} onClick={() => remove(n.id)}>
+                        {removing === n.id ? "Removing…" : "Remove"}
+                      </button>
+                    )}
+                  </td>
                 </tr>
               );
             })}

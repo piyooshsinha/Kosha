@@ -53,6 +53,28 @@ Conditional writes (`If-None-Match: *`) are therefore checked *in log order*.
 If three nodes race to create the same key, exactly one wins. The cluster test
 `conflicting_conditional_writes_on_different_nodes` checks this.
 
+## Group commit
+
+Every metadata mutation must be durable before it is acknowledged, and
+durable commits are serialized. If each request commits on its own,
+throughput is capped by the fsync rate no matter how many clients there are.
+Kosha batches instead:
+
+- **Single node.** A dedicated committer thread owns the write path. While
+  one transaction is being made durable, new commands queue up, and the next
+  transaction applies all of them (up to 512).
+- **Cluster.** Each node has a proposer. Queued commands become one Raft
+  entry, a `CommandBatch` of up to 256 commands. A follower forwards the whole
+  batch to the leader in one RPC.
+
+Batches form from load alone: a lone request commits immediately, with no
+timer. This is safe because a command rejected by a precondition leaves no
+trace and does not affect its batch-mates (rule 2 above). For example, 64
+racing `If-None-Match: *` creates of one key in a single batch still produce
+exactly one winner (`group_commit_preserves_per_command_semantics`). Callers
+keep their chunk pins until their own reply arrives, which happens after the
+batch commits.
+
 ## Write path
 
 1. The body is streamed, never buffered whole. `aws-chunked` framing is
@@ -80,10 +102,11 @@ the chunk store.
 
 ## Read path
 
-1. **Linearizable barrier.** On the leader, `ensure_linearizable` confirms
-   leadership with a quorum. On a follower, the leader returns its commit
-   index (ReadIndex) and the follower waits until it has applied that index.
-   A read issued after a write completed, on any node, sees that write.
+1. **Linearizable barrier.** The leader determines a read index: its commit
+   index, after proving it is still leader (see *Leader leases*). A follower
+   asks the leader for it (ReadIndex) and waits until it has applied that
+   index. A read issued after a write completed, on any node, sees that
+   write.
 2. The manifest is read from the local redb (MVCC, never blocks writers). A
    range request maps only to the chunks it overlaps, and `read_ahead` chunks
    are fetched concurrently.
@@ -91,6 +114,28 @@ the chunk store.
    replicas in rendezvous order. Every chunk is BLAKE3-verified wherever it
    came from. A node that *should* hold a chunk but does not (for example, it
    was down during the write) stores the copy it fetched: **read-repair**.
+
+## Leader leases
+
+`ensure_linearizable` proves leadership by heartbeating every voter and
+waiting for a quorum, on *every* call. Kosha keeps a lease instead
+(`kosha-cluster/src/lease.rs`):
+
+- Record `t0` just before a successful `ensure_linearizable`. A quorum then
+  accepted a heartbeat sent after `t0`, and openraft voters refuse to vote for
+  `election_timeout_max` after hearing from a leader. So no other leader can
+  exist before `t0 + election_timeout_max`.
+- Reads are served from the lease until `t0 + 0.8 × election_timeout_min`,
+  a margin for clock-rate drift between nodes. Each lease read requires that
+  this node is still the committed leader *in the lease's term*, and that the
+  commit index belongs to that term (the leader has committed its own no-op).
+- An expired lease is renewed single-flight: one caller does the quorum check
+  while concurrent readers wait and reuse the result.
+
+Over 99% of leader read barriers in benchmarks are lease hits. The leader
+counts lease and quorum reads separately, and `/_kosha/cluster` reports them.
+`--no-lease-reads` disables leases for environments where bounded clock
+drift cannot be assumed.
 
 ## Chunk placement
 
@@ -103,6 +148,38 @@ in their top set are affected.
 Chunks are immutable and content-addressed, so replication needs no
 consensus of its own: any copy of a chunk is the same bytes, and repairs are
 idempotent.
+
+## Background repair and rebalancing
+
+Every node runs a repairer (`kosha-cluster/src/repair.rs`, every
+`--repair-interval-secs`). It looks only at its own disk and needs no
+coordination. Each pass probes which voters are live, then walks every chunk
+referenced by committed metadata, in pages:
+
+- **Repair.** If this node is among the top `replication` *live* voters for
+  a chunk and lacks a copy, it fetches one from a live peer, verifies the
+  BLAKE3 address, and stores it. When a node dies, the next-ranked live
+  node takes over its share and the replica count is restored without
+  waiting for reads.
+- **Rebalance.** If this node holds a copy but is in the top `replication`
+  of neither all voters nor live voters, the copy is surplus. It is deleted
+  only after every designated node is live and confirms its copy (HEAD), and
+  only if no local upload has it pinned. The replica count never drops below
+  target.
+
+Chunks not yet referenced by metadata are never touched, so in-flight
+uploads are safe. Tests cover both directions with exact counts:
+`repair_restores_replicas_after_a_node_dies` and
+`repair_removes_surplus_replicas`.
+
+## Removing nodes
+
+`DELETE /_kosha/cluster/nodes/{id}` (SigV4) and the console's **Remove**
+button work from any node: a follower forwards the request to the leader.
+The leader refuses non-voters and refuses to remove the last voter. After
+the membership change commits, rendezvous rankings no longer include the
+node, and background repair moves its share of chunks to the remaining
+nodes.
 
 ## Garbage collection
 
@@ -165,27 +242,36 @@ O(entries returned) rather than O(keys under the prefix).
 
 ## Known limitations
 
-- **No background rebalancing or re-replication.** After membership changes
-  or a permanent node loss, chunks stay where they were placed. Reads still
-  find them, because nodes are tried in rank order and then all voters, and
-  read-repair restores copies on designated nodes when they are read. But an
-  unread chunk on a dead node stays under-replicated.
+- **Retried forwarded writes are not deduplicated.** If a follower's
+  forwarding RPC fails *after* the leader committed the batch, the follower
+  retries and the commands apply twice. Most commands are idempotent on
+  replay (a re-applied `PutObject` with the same manifest is a no-op for
+  refcounts), but a replayed `CreateBucket` or conditional create would
+  report a spurious conflict to the client. Request ids for exactly-once
+  application are planned.
+- **Repair scans all chunk metadata every pass.** This is O(chunks) per
+  node per interval. That is fine up to millions of chunks; beyond that it
+  needs an incremental, membership-change-driven scan.
+- **Lease reads assume bounded clock-rate drift** between nodes (the 20%
+  margin). Turn them off with `--no-lease-reads` where that does not hold.
 - **Snapshots are built in memory** and sent whole. This is fine for
   millions of objects. Very large namespaces need streaming snapshots.
-- **Every linearizable read costs a quorum round-trip** (plus a leader
-  round-trip on followers). Leader leases would remove this.
 - **Internal traffic is not encrypted.** Use a private network until mTLS
   lands.
-- Removing a node is available in the library (`Cluster::remove_node`) but
-  not yet from the CLI or console.
+- **Chunk files are fsynced one by one.** For 64 KiB–1 MiB objects that is
+  now the dominant write cost; batching chunk fsyncs is next.
 - A read racing with deletion of the same object can fail mid-stream.
-- `ListMultipartUploads` does not paginate.
 
 ## Roadmap
 
+**Done since v0.1:** group commit (single node and Raft), leader-lease
+reads, background re-replication and rebalancing, node removal from the
+console and API, ListMultipartUploads pagination.
+
 **Next**
-- Background re-replication and rebalancing driven by the rendezvous ranking.
-- Leader-lease reads, mTLS between nodes, node removal from the console.
+- Request ids for exactly-once application of retried writes.
+- Batched chunk fsyncs (group commit for data, not just metadata).
+- mTLS between nodes.
 - Object versioning (manifests are immutable, so versions are cheap) and
   object lock (WORM).
 - Users, access keys and bucket policies stored in the replicated state machine.

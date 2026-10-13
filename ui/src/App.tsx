@@ -130,7 +130,7 @@ export function App() {
         {route.page === "overview" && <Overview s3={s3} />}
         {route.page === "buckets" && <Buckets s3={s3} toast={toasts.push} />}
         {route.page === "browse" && <Browser s3={s3} bucket={route.bucket} prefix={route.prefix} toast={toasts.push} />}
-        {route.page === "cluster" && <ClusterView s3={s3} />}
+        {route.page === "cluster" && <ClusterView s3={s3} toast={toasts.push} />}
       </main>
       <Toasts items={toasts.items} dismiss={toasts.dismiss} />
     </div>

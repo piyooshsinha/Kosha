@@ -112,19 +112,20 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
     {
         let mut state = self.state.lock().clone();
         let mut cmds: Vec<Command> = Vec::new();
-        // For each entry: Some(i) = index into cmds, None = no result.
-        let mut slots: Vec<Option<usize>> = Vec::new();
+        // For each entry, the range of `cmds` it contributed.
+        let mut slots: Vec<std::ops::Range<usize>> = Vec::new();
         for entry in entries {
             state.last_applied = Some(entry.log_id);
             match entry.payload {
-                EntryPayload::Blank => slots.push(None),
-                EntryPayload::Normal(cmd) => {
-                    slots.push(Some(cmds.len()));
-                    cmds.push(cmd);
+                EntryPayload::Blank => slots.push(cmds.len()..cmds.len()),
+                EntryPayload::Normal(CommandBatch(batch)) => {
+                    let start = cmds.len();
+                    cmds.extend(batch);
+                    slots.push(start..cmds.len());
                 }
                 EntryPayload::Membership(m) => {
                     state.membership = StoredMembership::new(Some(entry.log_id), m);
-                    slots.push(None);
+                    slots.push(cmds.len()..cmds.len());
                 }
             }
         }
@@ -139,10 +140,10 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
                 .map_err(storage_err)?
                 .map_err(storage_err)?;
         *self.state.lock() = state;
-        let mut results = results.into_iter().map(Some).collect::<Vec<_>>();
+        let mut results = results.into_iter();
         Ok(slots
             .into_iter()
-            .map(|s| Response(s.and_then(|i| results[i].take())))
+            .map(|r| Response(results.by_ref().take(r.len()).collect()))
             .collect())
     }
 

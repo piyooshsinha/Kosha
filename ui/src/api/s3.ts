@@ -59,6 +59,16 @@ export interface ClusterStatus {
   snapshot_index?: number | null;
   replication_factor?: number;
   nodes?: ClusterNode[];
+  lease_reads?: number;
+  quorum_reads?: number;
+  repair?: {
+    rounds: number;
+    scanned: number;
+    repaired: number;
+    surplus_removed: number;
+    failed: number;
+    last_round_ms: number;
+  };
 }
 
 export class S3Error extends Error {
@@ -214,6 +224,10 @@ export class S3 {
 
   async stats(): Promise<Stats> {
     return (await this.request("GET", "/_kosha/stats")).json();
+  }
+
+  async removeNode(id: number) {
+    await this.request("DELETE", `/_kosha/cluster/nodes/${id}`);
   }
 
   async cluster(): Promise<ClusterStatus> {

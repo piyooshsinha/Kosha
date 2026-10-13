@@ -133,7 +133,22 @@ async fn main() {
     let a = Arc::new(args());
     let writer = client(&a.endpoint);
     let reader = client(a.read_endpoint.as_deref().unwrap_or(&a.endpoint));
-    let _ = writer.create_bucket().bucket(&a.bucket).send().await;
+    if let Err(e) = writer.create_bucket().bucket(&a.bucket).send().await {
+        let code = e
+            .as_service_error()
+            .and_then(|s| s.meta().code())
+            .unwrap_or("");
+        if code != "BucketAlreadyOwnedByYou" && code != "BucketAlreadyExists" {
+            eprintln!(
+                "cannot create bucket {:?}: {}",
+                a.bucket,
+                e.as_service_error()
+                    .and_then(|s| s.meta().message())
+                    .unwrap_or(code)
+            );
+            std::process::exit(1);
+        }
+    }
     let run = format!(
         "{:x}",
         Instant::now().elapsed().as_nanos() ^ std::process::id() as u128

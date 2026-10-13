@@ -1863,6 +1863,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "futures",
  "kosha-cluster",
  "kosha-engine",
  "kosha-s3",

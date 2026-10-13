@@ -10,7 +10,7 @@ use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use kosha_engine::{ChunkId, Command};
+use kosha_engine::ChunkId;
 use openraft::ChangeMembers;
 use openraft::error::{CheckIsLeaderError, ClientWriteError, RaftError};
 use openraft::raft::{AppendEntriesRequest, InstallSnapshotRequest, VoteRequest};
@@ -31,7 +31,12 @@ pub fn router(inner: Arc<Inner>) -> Router {
         .route("/raft/read-index", post(read_index))
         .route("/cluster/join", post(join))
         .route("/cluster/status", get(cluster_status))
-        .route("/chunk/{id}", get(get_chunk).put(put_chunk))
+        .route("/cluster/remove", post(remove))
+        .route("/health", get(|| async { "ok" }))
+        .route(
+            "/chunk/{id}",
+            get(get_chunk).put(put_chunk).head(head_chunk),
+        )
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(inner.clone(), authenticate))
         .with_state(inner)
@@ -85,18 +90,15 @@ async fn snapshot(State(inner): St, body: Bytes) -> Response {
 }
 
 async fn propose(State(inner): St, body: Bytes) -> Response {
-    let cmd: Command = match decode(&body) {
+    let batch: CommandBatch = match decode(&body) {
         Ok(c) => c,
         Err(e) => return bad_request(e),
     };
-    match inner.raft.client_write(cmd).await {
-        Ok(resp) => match resp.data.0 {
-            Some(result) => msgpack(&LeaderReply::Ok(Proposed {
-                result,
-                index: resp.log_id.index,
-            })),
-            None => (StatusCode::INTERNAL_SERVER_ERROR, "missing result").into_response(),
-        },
+    match inner.raft.client_write(batch).await {
+        Ok(resp) => msgpack(&LeaderReply::Ok(Proposed {
+            results: resp.data.0,
+            index: resp.log_id.index,
+        })),
         Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) => {
             msgpack(&LeaderReply::<Proposed>::NotLeader(
                 f.leader_id.zip(f.leader_node),
@@ -107,8 +109,8 @@ async fn propose(State(inner): St, body: Bytes) -> Response {
 }
 
 async fn read_index(State(inner): St) -> Response {
-    match inner.raft.ensure_linearizable().await {
-        Ok(log_id) => msgpack(&LeaderReply::Ok(log_id.map(|l| l.index))),
+    match inner.leader_read_index().await {
+        Ok(index) => msgpack(&LeaderReply::Ok(index)),
         Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(f))) => msgpack(
             &LeaderReply::<Option<u64>>::NotLeader(f.leader_id.zip(f.leader_node)),
         ),
@@ -147,6 +149,17 @@ async fn join(State(inner): St, body: Bytes) -> Response {
     }
 }
 
+async fn remove(State(inner): St, body: Bytes) -> Response {
+    let id: NodeId = match decode(&body) {
+        Ok(id) => id,
+        Err(e) => return bad_request(e),
+    };
+    match inner.remove_voter(id).await {
+        Ok(reply) => msgpack(&reply),
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+    }
+}
+
 async fn cluster_status(State(inner): St) -> Response {
     axum::Json(crate::status(&inner)).into_response()
 }
@@ -163,6 +176,14 @@ async fn put_chunk(State(inner): St, Path(id): Path<String>, body: Bytes) -> Res
     match inner.engine.chunk_store().put_replica(id, body).await {
         Ok(c) => msgpack(&c.stored_len),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn head_chunk(State(inner): St, Path(id): Path<String>) -> Response {
+    match parse_id(&id) {
+        Some(id) if inner.engine.chunk_store().has(&id) => StatusCode::OK.into_response(),
+        Some(_) => StatusCode::NOT_FOUND.into_response(),
+        None => bad_request("invalid chunk id"),
     }
 }
 

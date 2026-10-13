@@ -135,11 +135,33 @@ async fn handle(st: Arc<AppState>, req: Request) -> S3Result<Response> {
         return stats(&st).await;
     }
     if raw_path == "/_kosha/cluster" {
-        let body = match &st.cfg.cluster_status {
-            Some(p) => (p.0)(),
+        let body = match &st.cfg.cluster {
+            Some(c) => c.status(),
             None => serde_json::json!({ "mode": "single-node" }),
         };
         return Ok(axum::Json(body).into_response());
+    }
+    if let Some(id) = raw_path.strip_prefix("/_kosha/cluster/nodes/") {
+        if parts.method != Method::DELETE {
+            return Err(S3Error::new(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "MethodNotAllowed",
+                "use DELETE to remove a node",
+            ));
+        }
+        let Some(cluster) = &st.cfg.cluster else {
+            return Err(S3Error::invalid_request(
+                "this server is not part of a cluster",
+            ));
+        };
+        let id: u64 = id
+            .parse()
+            .map_err(|_| S3Error::invalid_argument("node id must be a number"))?;
+        cluster
+            .remove_node(id)
+            .await
+            .map_err(|e| S3Error::new(StatusCode::CONFLICT, "InvalidRequest", e))?;
+        return Ok(StatusCode::NO_CONTENT.into_response());
     }
 
     let (bucket, key) = resolve_target(&st, &parts.headers, &raw_path);
@@ -616,17 +638,56 @@ async fn delete_objects(ctx: &Ctx, bucket: &str, body: Body) -> S3Result<Respons
     Ok(xml_response(x.finish("DeleteResult")))
 }
 
+/// The page of uploads after (`key_marker`, `id_marker`), in (key, upload id)
+/// order, plus whether more remain.
+fn page_uploads<'a>(
+    uploads: &'a [kosha_engine::UploadInfo],
+    key_marker: &str,
+    id_marker: &str,
+    max: usize,
+) -> (Vec<&'a kosha_engine::UploadInfo>, bool) {
+    let after = |u: &&kosha_engine::UploadInfo| {
+        if key_marker.is_empty() {
+            true
+        } else if id_marker.is_empty() {
+            u.key.as_str() > key_marker
+        } else {
+            u.key.as_str() > key_marker || (u.key == key_marker && u.upload_id.as_str() > id_marker)
+        }
+    };
+    let mut rest: Vec<_> = uploads.iter().filter(after).collect();
+    rest.sort_by(|a, b| (&a.key, &a.upload_id).cmp(&(&b.key, &b.upload_id)));
+    let truncated = rest.len() > max;
+    rest.truncate(max);
+    (rest, truncated)
+}
+
 async fn list_uploads(ctx: &Ctx, bucket: &str) -> S3Result<Response> {
     let prefix = ctx.q("prefix").unwrap_or_default();
+    let key_marker = ctx.q("key-marker").unwrap_or_default();
+    let id_marker = ctx.q("upload-id-marker").unwrap_or_default();
+    let max = match ctx.q("max-uploads") {
+        Some(v) => v
+            .parse::<usize>()
+            .map_err(|_| S3Error::invalid_argument("max-uploads must be a non-negative integer"))?
+            .min(1000),
+        None => 1000,
+    };
     let uploads = ctx.engine().list_uploads(bucket, prefix).await?;
+    let (page, truncated) = page_uploads(&uploads, key_marker, id_marker, max);
+
     let mut x = Xml::new("ListMultipartUploadsResult");
     x.elem("Bucket", bucket)
-        .elem("KeyMarker", "")
-        .elem("UploadIdMarker", "")
+        .elem("KeyMarker", key_marker)
+        .elem("UploadIdMarker", id_marker)
         .elem("Prefix", prefix)
-        .elem("MaxUploads", "1000")
-        .elem("IsTruncated", "false");
-    for u in &uploads {
+        .elem("MaxUploads", max.to_string())
+        .elem("IsTruncated", truncated.to_string());
+    if truncated && let Some(last) = page.last() {
+        x.elem("NextKeyMarker", &last.key)
+            .elem("NextUploadIdMarker", &last.upload_id);
+    }
+    for u in &page {
         x.open("Upload")
             .elem("Key", &u.key)
             .elem("UploadId", &u.upload_id)

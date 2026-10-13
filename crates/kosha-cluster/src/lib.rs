@@ -17,8 +17,10 @@
 // openraft's trait signatures fix the (large) `StorageError` type.
 #![allow(clippy::result_large_err)]
 
+mod lease;
 mod log_store;
 mod network;
+mod repair;
 mod rpc;
 mod server;
 mod state_machine;
@@ -37,6 +39,7 @@ use openraft::error::{CheckIsLeaderError, ClientWriteError, RaftError};
 use openraft::{ChangeMembers, ServerState};
 use serde::Serialize;
 
+pub use crate::repair::RepairReport;
 use crate::rpc::{Client, JoinRequest, LeaderReply, Proposed};
 use crate::types::*;
 pub use crate::types::{KoshaNode, NodeId};
@@ -63,6 +66,11 @@ pub struct ClusterConfig {
     /// Log entries kept behind the latest snapshot (lets slow followers catch
     /// up from the log instead of a full snapshot).
     pub logs_to_keep: u64,
+    /// Serve linearizable reads from a leader lease instead of a quorum
+    /// round-trip per read (see `lease.rs`).
+    pub lease_reads: bool,
+    /// Run background re-replication/rebalancing this often (`None` disables).
+    pub repair_interval: Option<Duration>,
 }
 
 impl ClusterConfig {
@@ -84,6 +92,8 @@ impl ClusterConfig {
             election_timeout_ms: (1000, 2000),
             snapshot_every: 10_000,
             logs_to_keep: 1_000,
+            lease_reads: true,
+            repair_interval: Some(Duration::from_secs(60)),
         }
     }
 }
@@ -107,6 +117,8 @@ pub(crate) struct Inner {
     pub engine: Engine,
     pub cfg: ClusterConfig,
     pub client: Client,
+    pub lease: lease::ReadLease,
+    pub repair_stats: repair::RepairStats,
 }
 
 /// A running cluster member.
@@ -114,6 +126,7 @@ pub(crate) struct Inner {
 pub struct Cluster {
     inner: Arc<Inner>,
     server: Arc<tokio::task::JoinHandle<()>>,
+    repairer: Option<Arc<tokio::task::JoinHandle<()>>>,
 }
 
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -166,10 +179,16 @@ impl Cluster {
             engine: engine.clone(),
             cfg: cfg.clone(),
             client,
+            lease: lease::ReadLease::new(cfg.lease_reads, cfg.election_timeout_ms.0),
+            repair_stats: Default::default(),
         });
+        let repairer = cfg
+            .repair_interval
+            .map(|every| Arc::new(repair::spawn(Arc::downgrade(&inner), every)));
         engine.attach_cluster(
             Arc::new(RaftConsensus {
                 inner: inner.clone(),
+                proposer: Arc::new(Proposer::start(Arc::downgrade(&inner))),
             }),
             Arc::new(RendezvousPlacement {
                 inner: inner.clone(),
@@ -187,6 +206,7 @@ impl Cluster {
         Ok(Cluster {
             inner,
             server: Arc::new(server),
+            repairer,
         })
     }
 
@@ -255,13 +275,43 @@ impl Cluster {
     }
 
     /// Remove a node from the voter set (run on any member).
+    /// Remove a voter from the cluster. Works from any member (forwarded to
+    /// the leader). Its chunks are re-replicated by background repair.
     pub async fn remove_node(&self, id: NodeId) -> Result<(), ClusterError> {
-        self.inner
-            .raft
-            .change_membership(ChangeMembers::RemoveVoters(BTreeSet::from([id])), false)
-            .await
-            .map(drop)
-            .map_err(|e| ClusterError::Raft(e.to_string()))
+        let mut last = String::from("no leader");
+        for attempt in 0..RETRIES {
+            match self.inner.remove_voter(id).await {
+                Ok(LeaderReply::Ok(Ok(()))) => return Ok(()),
+                Ok(LeaderReply::Ok(Err(msg))) => return Err(ClusterError::Join(msg)),
+                Ok(LeaderReply::NotLeader(Some((_, leader)))) => {
+                    match self
+                        .inner
+                        .client
+                        .call::<_, LeaderReply<Result<(), String>>>(
+                            &leader.addr,
+                            "/cluster/remove",
+                            &id,
+                            FORWARD_TIMEOUT,
+                        )
+                        .await
+                    {
+                        Ok(LeaderReply::Ok(Ok(()))) => return Ok(()),
+                        Ok(LeaderReply::Ok(Err(msg))) => return Err(ClusterError::Join(msg)),
+                        Ok(LeaderReply::NotLeader(_)) => last = "leader changed".into(),
+                        Err(e) => last = e.to_string(),
+                    }
+                }
+                Ok(LeaderReply::NotLeader(None)) => last = "no leader elected".into(),
+                Err(e) => last = e,
+            }
+            tokio::time::sleep(backoff(attempt)).await;
+        }
+        Err(ClusterError::Raft(last))
+    }
+
+    /// Run one re-replication/rebalancing pass now.
+    pub async fn repair_now(&self) -> RepairReport {
+        self.inner.repair_round().await
     }
 
     pub fn status(&self) -> ClusterStatus {
@@ -283,6 +333,9 @@ impl Cluster {
     /// Stop Raft and the internal endpoint (simulates a node failure in tests).
     pub async fn shutdown(&self) {
         self.server.abort();
+        if let Some(r) = &self.repairer {
+            r.abort();
+        }
         let _ = self.inner.raft.shutdown().await;
     }
 }
@@ -310,6 +363,22 @@ pub struct ClusterStatus {
     pub snapshot_index: Option<u64>,
     pub replication_factor: usize,
     pub nodes: Vec<NodeStatus>,
+    /// Read barriers served from the leader lease / by a quorum round-trip
+    /// (counted on the leader).
+    pub lease_reads: u64,
+    pub quorum_reads: u64,
+    pub repair: RepairStatus,
+}
+
+/// Cumulative background repair counters on this node.
+#[derive(Clone, Debug, Serialize)]
+pub struct RepairStatus {
+    pub rounds: u64,
+    pub scanned: u64,
+    pub repaired: u64,
+    pub surplus_removed: u64,
+    pub failed: u64,
+    pub last_round_ms: u64,
 }
 
 fn status(inner: &Inner) -> ClusterStatus {
@@ -347,6 +416,26 @@ fn status(inner: &Inner) -> ClusterStatus {
         snapshot_index: m.snapshot.map(|l| l.index),
         replication_factor: inner.cfg.replication,
         nodes,
+        lease_reads: inner
+            .lease
+            .lease_reads
+            .load(std::sync::atomic::Ordering::Relaxed),
+        quorum_reads: inner
+            .lease
+            .quorum_reads
+            .load(std::sync::atomic::Ordering::Relaxed),
+        repair: {
+            use std::sync::atomic::Ordering::Relaxed;
+            let r = &inner.repair_stats;
+            RepairStatus {
+                rounds: r.rounds.load(Relaxed),
+                scanned: r.scanned.load(Relaxed),
+                repaired: r.repaired.load(Relaxed),
+                surplus_removed: r.surplus_removed.load(Relaxed),
+                failed: r.failed.load(Relaxed),
+                last_round_ms: r.last_round_ms.load(Relaxed),
+            }
+        },
     }
 }
 
@@ -354,6 +443,7 @@ fn status(inner: &Inner) -> ClusterStatus {
 
 struct RaftConsensus {
     inner: Arc<Inner>,
+    proposer: Arc<Proposer>,
 }
 
 fn raft_err(e: impl std::fmt::Display) -> kosha_engine::Error {
@@ -361,6 +451,42 @@ fn raft_err(e: impl std::fmt::Display) -> kosha_engine::Error {
 }
 
 impl Inner {
+    /// Leader-side voter removal with guardrails. `Ok(Ok)` on success,
+    /// `Ok(Err(msg))` for a refused request, `NotLeader` to redirect.
+    pub(crate) async fn remove_voter(
+        &self,
+        id: NodeId,
+    ) -> Result<LeaderReply<Result<(), String>>, String> {
+        let voters: BTreeSet<NodeId> = self
+            .raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .voter_ids()
+            .collect();
+        if !voters.contains(&id) {
+            return Ok(LeaderReply::Ok(Err(format!("node {id} is not a voter"))));
+        }
+        if voters.len() == 1 {
+            return Ok(LeaderReply::Ok(Err("cannot remove the last voter".into())));
+        }
+        match self
+            .raft
+            .change_membership(ChangeMembers::RemoveVoters(BTreeSet::from([id])), false)
+            .await
+        {
+            Ok(_) => {
+                tracing::info!(node = id, "removed node from the cluster");
+                Ok(LeaderReply::Ok(Ok(())))
+            }
+            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) => {
+                Ok(LeaderReply::NotLeader(f.leader_id.zip(f.leader_node)))
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
     async fn wait_applied(&self, index: u64) -> kosha_engine::Result<()> {
         self.raft
             .wait(Some(APPLY_WAIT))
@@ -370,15 +496,15 @@ impl Inner {
             .map_err(raft_err)
     }
 
-    async fn propose(&self, cmd: Command) -> kosha_engine::Result<CommandResult> {
+    /// Replicate a batch of commands as one Raft entry. On a follower the
+    /// batch is forwarded to the leader in one RPC, then the follower waits
+    /// until it has applied the entry itself (read-your-writes).
+    async fn propose_batch(&self, cmds: Vec<Command>) -> kosha_engine::Result<Vec<CommandResult>> {
+        let batch = CommandBatch(cmds);
         let mut last = String::from("no leader");
         for attempt in 0..RETRIES {
-            match self.raft.client_write(cmd.clone()).await {
-                Ok(resp) => {
-                    return resp.data.0.ok_or_else(|| {
-                        kosha_engine::Error::Internal("missing command result".into())
-                    });
-                }
+            match self.raft.client_write(batch.clone()).await {
+                Ok(resp) => return Ok(resp.data.0),
                 Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) => {
                     if let Some(leader) = f.leader_node {
                         match self
@@ -386,15 +512,14 @@ impl Inner {
                             .call::<_, LeaderReply<Proposed>>(
                                 &leader.addr,
                                 "/raft/propose",
-                                &cmd,
+                                &batch,
                                 FORWARD_TIMEOUT,
                             )
                             .await
                         {
                             Ok(LeaderReply::Ok(p)) => {
-                                // Read-your-writes on this node.
                                 self.wait_applied(p.index).await?;
-                                return Ok(p.result);
+                                return Ok(p.results);
                             }
                             Ok(LeaderReply::NotLeader(_)) => last = "leader changed".into(),
                             Err(e) => last = e.to_string(),
@@ -413,8 +538,13 @@ impl Inner {
     async fn read_barrier(&self) -> kosha_engine::Result<()> {
         let mut last = String::from("no leader");
         for attempt in 0..RETRIES {
-            match self.raft.ensure_linearizable().await {
-                Ok(_) => return Ok(()),
+            match self.leader_read_index().await {
+                Ok(index) => {
+                    if let Some(i) = index {
+                        self.wait_applied(i).await?;
+                    }
+                    return Ok(());
+                }
                 Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(f))) => {
                     if let Some(leader) = f.leader_node {
                         match self
@@ -448,10 +578,76 @@ impl Inner {
     }
 }
 
+/// Group commit for the Raft write path: commands queue up while the
+/// previous batch is being replicated, and the next Raft entry carries all of
+/// them (up to `MAX_BATCH`). A lone command is proposed immediately.
+struct Proposer {
+    tx: tokio::sync::mpsc::UnboundedSender<Queued>,
+}
+
+type Queued = (
+    Command,
+    tokio::sync::oneshot::Sender<kosha_engine::Result<CommandResult>>,
+);
+
+const MAX_BATCH: usize = 256;
+
+impl Proposer {
+    fn start(inner: std::sync::Weak<Inner>) -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Queued>();
+        tokio::spawn(async move {
+            while let Some(first) = rx.recv().await {
+                let mut queued = vec![first];
+                while queued.len() < MAX_BATCH {
+                    match rx.try_recv() {
+                        Ok(q) => queued.push(q),
+                        Err(_) => break,
+                    }
+                }
+                let (cmds, replies): (Vec<_>, Vec<_>) = queued.into_iter().unzip();
+                let n = cmds.len();
+                let result = match inner.upgrade() {
+                    Some(inner) => inner.propose_batch(cmds).await,
+                    None => Err(kosha_engine::Error::Internal("cluster stopped".into())),
+                };
+                match result {
+                    Ok(results) if results.len() == n => {
+                        for (reply, r) in replies.into_iter().zip(results) {
+                            let _ = reply.send(Ok(r));
+                        }
+                    }
+                    Ok(results) => {
+                        let msg = format!("expected {n} results, got {}", results.len());
+                        for reply in replies {
+                            let _ = reply.send(Err(kosha_engine::Error::Internal(msg.clone())));
+                        }
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        for reply in replies {
+                            let _ = reply.send(Err(kosha_engine::Error::Internal(msg.clone())));
+                        }
+                    }
+                }
+            }
+        });
+        Proposer { tx }
+    }
+
+    async fn propose(&self, cmd: Command) -> kosha_engine::Result<CommandResult> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send((cmd, reply))
+            .map_err(|_| kosha_engine::Error::Internal("proposer stopped".into()))?;
+        rx.await
+            .map_err(|_| kosha_engine::Error::Internal("proposer dropped the request".into()))?
+    }
+}
+
 impl Consensus for RaftConsensus {
     fn propose(&self, cmd: Command) -> BoxFuture<'static, kosha_engine::Result<CommandResult>> {
-        let inner = self.inner.clone();
-        Box::pin(async move { inner.propose(cmd).await })
+        let proposer = self.proposer.clone();
+        Box::pin(async move { proposer.propose(cmd).await })
     }
 
     fn read_barrier(&self) -> BoxFuture<'static, kosha_engine::Result<()>> {
@@ -469,7 +665,7 @@ struct RendezvousPlacement {
 /// Voters ordered by rendezvous (highest-random-weight) score for `id`.
 /// Every node computes the same order without coordination, and adding or
 /// removing a node only moves the chunks that rank it first.
-fn rank(inner: &Inner, id: &ChunkId) -> Vec<(NodeId, KoshaNode)> {
+pub(crate) fn rank_voters(inner: &Inner, id: &ChunkId) -> Vec<(NodeId, KoshaNode)> {
     let m = inner.raft.metrics().borrow().clone();
     let membership = m.membership_config.membership();
     let voters: BTreeSet<NodeId> = membership.voter_ids().collect();
@@ -512,7 +708,7 @@ impl Inner {
     }
 
     async fn place(self: Arc<Self>, id: ChunkId, data: Bytes) -> kosha_engine::Result<u64> {
-        let ranked = rank(&self, &id);
+        let ranked = rank_voters(&self, &id);
         let want = self.cfg.replication.clamp(1, ranked.len().max(1));
         let mut stored = 0u64;
         let mut ok = 0usize;
@@ -563,7 +759,7 @@ impl Inner {
                 Err(e) => tracing::warn!(error = %e, "local replica unusable, fetching remotely"),
             }
         }
-        let ranked = rank(&self, &id);
+        let ranked = rank_voters(&self, &id);
         let want = self.cfg.replication.clamp(1, ranked.len().max(1));
         let should_hold = ranked
             .iter()

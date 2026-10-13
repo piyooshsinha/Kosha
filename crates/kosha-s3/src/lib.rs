@@ -23,17 +23,21 @@ pub struct S3Config {
     pub credentials: Credentials,
     /// Enables virtual-hosted-style requests (`bucket.<domain>`).
     pub domain: Option<String>,
-    /// Source of `/_kosha/cluster` (absent on a single node).
-    pub cluster_status: Option<StatusProvider>,
+    /// Cluster status and administration (absent on a single node).
+    pub cluster: Option<Arc<dyn ClusterHooks>>,
 }
 
-/// Produces the JSON served at `/_kosha/cluster`.
-#[derive(Clone)]
-pub struct StatusProvider(pub Arc<dyn Fn() -> serde_json::Value + Send + Sync>);
+/// What the S3 front end needs from a cluster, for `/_kosha/cluster*`.
+pub trait ClusterHooks: Send + Sync + 'static {
+    /// JSON served at `GET /_kosha/cluster`.
+    fn status(&self) -> serde_json::Value;
+    /// `DELETE /_kosha/cluster/nodes/{id}`. `Err` carries a user-facing reason.
+    fn remove_node(&self, id: u64) -> futures::future::BoxFuture<'static, Result<(), String>>;
+}
 
-impl std::fmt::Debug for StatusProvider {
+impl std::fmt::Debug for dyn ClusterHooks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("StatusProvider")
+        f.write_str("ClusterHooks")
     }
 }
 
@@ -43,7 +47,7 @@ impl Default for S3Config {
             region: "us-east-1".into(),
             credentials: Credentials::new(),
             domain: None,
-            cluster_status: None,
+            cluster: None,
         }
     }
 }

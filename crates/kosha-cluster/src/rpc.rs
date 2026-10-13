@@ -29,7 +29,7 @@ pub enum LeaderReply<T> {
 
 #[derive(Debug, Serialize, serde::Deserialize)]
 pub struct Proposed {
-    pub result: kosha_engine::CommandResult,
+    pub results: Vec<kosha_engine::CommandResult>,
     pub index: u64,
 }
 
@@ -117,6 +117,27 @@ impl Client {
             )
             .await?;
         decode(&body)
+    }
+
+    pub async fn health(&self, addr: &str, timeout: Duration) -> Result<(), RpcError> {
+        self.send(self.http.get(format!("http://{addr}/health")), timeout)
+            .await
+            .map(drop)
+    }
+
+    /// Whether `addr` holds a copy of the chunk.
+    pub async fn has_chunk(&self, addr: &str, id: &str) -> Result<bool, RpcError> {
+        match self
+            .send(
+                self.http.head(format!("http://{addr}/chunk/{id}")),
+                Duration::from_secs(5),
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(RpcError::Status(404, _)) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn get_chunk(&self, addr: &str, id: &str, len: u32) -> Result<Bytes, RpcError> {

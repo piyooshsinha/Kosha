@@ -7,7 +7,7 @@ use anyhow::Context;
 use clap::Parser;
 use kosha_cluster::{Cluster, ClusterConfig};
 use kosha_engine::{Engine, EngineConfig, IoMode};
-use kosha_s3::{Credentials, S3Config, StatusProvider};
+use kosha_s3::{ClusterHooks, Credentials, S3Config};
 use tracing_subscriber::EnvFilter;
 
 mod ui;
@@ -90,10 +90,33 @@ struct Args {
     #[arg(long, env = "KOSHA_REPLICATION", default_value_t = 2)]
     replication: usize,
 
+    /// Prove leadership with a quorum round-trip on every read instead of using
+    /// a leader lease (slower; for environments with unreliable clocks).
+    #[arg(long, env = "KOSHA_NO_LEASE_READS")]
+    no_lease_reads: bool,
+
+    /// Seconds between background re-replication/rebalancing passes (0 disables).
+    #[arg(long, env = "KOSHA_REPAIR_INTERVAL_SECS", default_value_t = 60)]
+    repair_interval_secs: u64,
+
     /// Seconds an unreferenced chunk file is kept before it may be collected
     /// (gives uploads on other nodes time to commit).
     #[arg(long, env = "KOSHA_GC_GRACE_SECS", default_value_t = 900)]
     gc_grace_secs: u64,
+}
+
+/// Connects the S3 front end's admin endpoints to the cluster.
+struct Hooks(Cluster);
+
+impl ClusterHooks for Hooks {
+    fn status(&self) -> serde_json::Value {
+        serde_json::to_value(self.0.status()).unwrap_or_default()
+    }
+
+    fn remove_node(&self, id: u64) -> futures::future::BoxFuture<'static, Result<(), String>> {
+        let c = self.0.clone();
+        Box::pin(async move { c.remove_node(id).await.map_err(|e| e.to_string()) })
+    }
 }
 
 #[tokio::main]
@@ -139,7 +162,7 @@ async fn main() -> anyhow::Result<()> {
         region: args.region.clone(),
         credentials,
         domain: args.domain.clone(),
-        cluster_status: None,
+        cluster: None,
     };
 
     let cluster = match args.node_id {
@@ -165,6 +188,9 @@ async fn main() -> anyhow::Result<()> {
                 .clone()
                 .unwrap_or_else(|| args.listen.to_string());
             ccfg.replication = args.replication.max(1);
+            ccfg.lease_reads = !args.no_lease_reads;
+            ccfg.repair_interval = (args.repair_interval_secs > 0)
+                .then(|| Duration::from_secs(args.repair_interval_secs));
             let cluster = Cluster::start(engine.clone(), ccfg).await?;
             if args.init {
                 cluster.initialize().await?;
@@ -177,10 +203,7 @@ async fn main() -> anyhow::Result<()> {
                     "this node is not part of a cluster yet: start one with --init or join one with --join"
                 );
             }
-            let c = cluster.clone();
-            s3.cluster_status = Some(StatusProvider(Arc::new(move || {
-                serde_json::to_value(c.status()).unwrap_or_default()
-            })));
+            s3.cluster = Some(Arc::new(Hooks(cluster.clone())));
             Some(cluster)
         }
     };

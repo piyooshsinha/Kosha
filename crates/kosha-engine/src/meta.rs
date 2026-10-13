@@ -624,6 +624,29 @@ impl MetaStore {
         self.apply(Vec::new(), Some(sm_state)).map(drop)
     }
 
+    /// Referenced chunks in id order, starting after `after`, with their
+    /// lengths. Used by cluster repair to walk every chunk in pages.
+    pub fn chunk_page(&self, after: Option<ChunkId>, limit: usize) -> Result<Vec<(ChunkId, u32)>> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(CHUNKS)?;
+        let start = after.map(|a| a.0);
+        let range = match &start {
+            Some(a) => t.range::<&[u8]>((Bound::Excluded(a.as_slice()), Bound::Unbounded))?,
+            None => t.range::<&[u8]>(..)?,
+        };
+        let mut out = Vec::with_capacity(limit.min(4096));
+        for item in range.take(limit) {
+            let (k, v) = item?;
+            let id: [u8; 32] = k
+                .value()
+                .try_into()
+                .map_err(|_| Error::Internal("malformed chunk id".into()))?;
+            let info: ChunkInfo = dec(v.value())?;
+            out.push((ChunkId(id), info.len));
+        }
+        Ok(out)
+    }
+
     pub fn is_referenced(&self, id: &ChunkId) -> Result<bool> {
         let r = self.db.begin_read()?;
         Ok(r.open_table(CHUNKS)?.get(id.0.as_slice())?.is_some())

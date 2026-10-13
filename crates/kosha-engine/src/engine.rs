@@ -9,6 +9,7 @@ use futures::stream::{self, BoxStream, StreamExt};
 
 use crate::chunker::ChunkerConfig;
 use crate::chunkstore::{ChunkStore, StoreOptions};
+use crate::commit::{GroupCommitter, apply_and_collect};
 use crate::error::{Error, Result};
 use crate::io::{IoBackend, IoMode};
 use crate::meta::{Command, CommandOutput, CommandResult, MetaStore};
@@ -84,7 +85,8 @@ pub trait ChunkPlacement: Send + Sync + 'static {
 }
 
 struct Inner {
-    meta: MetaStore,
+    meta: Arc<MetaStore>,
+    committer: GroupCommitter,
     store: Arc<ChunkStore>,
     cfg: EngineConfig,
     consensus: OnceLock<Arc<dyn Consensus>>,
@@ -151,11 +153,14 @@ impl Engine {
                 gc_grace: cfg.gc_grace,
             },
         )?;
-        let meta = MetaStore::open(&cfg.data_dir.join("meta.redb"))?;
+        let meta = Arc::new(MetaStore::open(&cfg.data_dir.join("meta.redb"))?);
+        let store = Arc::new(store);
+        let committer = GroupCommitter::start(meta.clone(), store.clone())?;
         Ok(Engine {
             inner: Arc::new(Inner {
                 meta,
-                store: Arc::new(store),
+                committer,
+                store,
                 cfg,
                 consensus: OnceLock::new(),
                 placement: OnceLock::new(),
@@ -204,20 +209,7 @@ impl Engine {
         cmds: Vec<Command>,
         sm_state: Option<Vec<u8>>,
     ) -> Result<Vec<CommandResult>> {
-        let applied = self.inner.meta.apply(cmds, sm_state)?;
-        if !applied.freed.is_empty() {
-            let meta = &self.inner.meta;
-            let removed = self
-                .inner
-                .store
-                .collect(&applied.freed, |id| Ok(!meta.is_referenced(id)?))?;
-            tracing::debug!(
-                candidates = applied.freed.len(),
-                removed,
-                "collected chunks"
-            );
-        }
-        Ok(applied.results)
+        apply_and_collect(&self.inner.meta, &self.inner.store, cmds, sm_state)
     }
 
     pub fn sm_state(&self) -> Result<Option<Vec<u8>>> {
@@ -235,6 +227,16 @@ impl Engine {
 
     pub fn import_snapshot(&self, bytes: &[u8]) -> Result<()> {
         self.inner.meta.import_snapshot(bytes)
+    }
+
+    /// A page of referenced chunks (id, length) after `after`, from local
+    /// state (no read barrier: callers use it for background maintenance).
+    pub fn referenced_chunks(
+        &self,
+        after: Option<ChunkId>,
+        limit: usize,
+    ) -> Result<Vec<(ChunkId, u32)>> {
+        self.inner.meta.chunk_page(after, limit)
     }
 
     pub fn is_chunk_referenced(&self, id: &ChunkId) -> Result<bool> {
@@ -279,13 +281,7 @@ impl Engine {
     async fn propose(&self, cmd: Command) -> Result<CommandOutput> {
         let result = match self.inner.consensus.get() {
             Some(c) => c.propose(cmd).await?,
-            None => {
-                let this = self.clone();
-                tokio::task::spawn_blocking(move || this.apply_committed(vec![cmd], None))
-                    .await??
-                    .pop()
-                    .ok_or_else(|| Error::Internal("no result for command".into()))?
-            }
+            None => self.inner.committer.submit(cmd).await?,
         };
         result.map_err(Error::from)
     }
