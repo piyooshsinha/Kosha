@@ -52,9 +52,9 @@ impl Inner {
     /// The erasure layout for a new chunk of `len` bytes, if it should be
     /// erasure coded: large enough, and enough voters to spread it.
     pub(crate) fn ec_layout(&self, len: usize, voters: usize) -> Option<Layout> {
-        self.cfg
-            .erasure
-            .filter(|l| len >= self.cfg.erasure_min_len && voters >= l.total())
+        self.cfg.erasure.filter(|l| {
+            !self.cfg.erasure_cold_only && len >= self.cfg.erasure_min_len && voters >= l.total()
+        })
     }
 
     async fn store_shard(

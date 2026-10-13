@@ -206,6 +206,22 @@ impl Tx<'_> {
         Ok(())
     }
 
+    pub(crate) fn chunk_erasure_coded(&mut self, id: ChunkId) -> Step<()> {
+        self.txn.open_table(TIER_QUEUE)?.remove(id.0.as_slice())?;
+        let mut chunks = self.txn.open_table(CHUNKS)?;
+        let Some(raw) = chunks.get(id.0.as_slice())?.map(|v| v.value().to_vec()) else {
+            // Freed meanwhile: garbage collection removes the shards.
+            return Ok(());
+        };
+        let mut c: ChunkInfo = dec(&raw)?;
+        if !c.erasure {
+            c.erasure = true;
+            chunks.insert(id.0.as_slice(), enc(&c)?.as_slice())?;
+            self.coded.push(id);
+        }
+        Ok(())
+    }
+
     pub(crate) fn chunk_offloaded(&mut self, id: ChunkId, key: String) -> Step<()> {
         self.txn.open_table(TIER_QUEUE)?.remove(id.0.as_slice())?;
         let mut chunks = self.txn.open_table(CHUNKS)?;
@@ -237,6 +253,10 @@ impl MetaStore {
         let r = self.db.begin_read()?;
         let t = r.open_table(CHUNKS)?;
         t.get(id.0.as_slice())?.map(|v| dec(v.value())).transpose()
+    }
+
+    pub fn is_erasure_coded(&self, id: &ChunkId) -> Result<bool> {
+        Ok(self.chunk_info(id)?.is_some_and(|c| c.erasure))
     }
 
     /// Whether every node may drop its local copy of `id`.
@@ -296,6 +316,21 @@ impl Engine {
         self.cold_cell().get().is_some()
     }
 
+    /// Whether the chunk was converted to erasure-coded shards.
+    pub fn chunk_is_erasure_coded(&self, id: &ChunkId) -> bool {
+        self.meta().is_erasure_coded(id).unwrap_or(false)
+    }
+
+    /// Whether cold data has somewhere cheaper to go: an external cold
+    /// store, or erasure-coded shards across the cluster.
+    pub fn can_tier(&self) -> bool {
+        self.has_cold_store()
+            || self
+                .placement_cell()
+                .get()
+                .is_some_and(|p| p.supports_erasure())
+    }
+
     /// Move objects (or specific versions) to a cold storage class.
     pub async fn transition_objects(
         &self,
@@ -314,7 +349,7 @@ impl Engine {
         class: &str,
         auto: bool,
     ) -> Result<u64> {
-        if !self.has_cold_store() {
+        if !self.can_tier() {
             return Err(Error::InvalidRequest(
                 "no cold tier is configured on this server".into(),
             ));
@@ -459,7 +494,7 @@ impl Engine {
     /// how many chunks were offloaded.
     pub async fn run_offloader(&self) -> Result<usize> {
         let Some(cold) = self.cold_cell().get().cloned() else {
-            return Ok(0);
+            return self.run_erasure_coder().await;
         };
         let mut done = 0;
         loop {
@@ -485,6 +520,36 @@ impl Engine {
                 self.propose_cmd(Command::ChunkOffloaded { id, key })
                     .await?;
                 done += 1;
+            }
+        }
+    }
+
+    /// Without an external cold store, cold chunks become erasure-coded
+    /// shards across the cluster instead (when the placement supports it).
+    async fn run_erasure_coder(&self) -> Result<usize> {
+        let Some(placement) = self
+            .placement_cell()
+            .get()
+            .filter(|p| p.supports_erasure())
+            .cloned()
+        else {
+            return Ok(0);
+        };
+        let mut done = 0;
+        loop {
+            let batch = {
+                let meta = self.meta_arc();
+                tokio::task::spawn_blocking(move || meta.tier_queue(32)).await??
+            };
+            if batch.is_empty() {
+                return Ok(done);
+            }
+            for (id, len) in batch {
+                if !self.meta().is_erasure_coded(&id)? {
+                    placement.erasure_code(id, len).await?;
+                    done += 1;
+                }
+                self.propose_cmd(Command::ChunkErasureCoded { id }).await?;
             }
         }
     }

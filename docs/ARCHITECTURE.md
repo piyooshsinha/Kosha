@@ -310,6 +310,18 @@ the failed node's shards.
 Holders of shards they are no longer responsible for drop them once the
 responsible node is live and confirms its copy.
 
+**Cold-only mode** (`erasure_cold_only`):
+
+- **Writes** stay replicated. Chunks that become cold-only enter the same
+  `tier_queue` the cold tier uses.
+- **Conversion:** without an external cold store, the leader's offloader
+  calls `ChunkPlacement::erasure_code`. That reads the chunk, writes its
+  K+M shards, then commits `ChunkErasureCoded`.
+- **Applying it** sets `erasure` on the chunk record, and every node drops
+  its full copy (shards stay).
+- **Afterwards**, repair maintains such chunks as shards, and reads consult
+  the flag to go straight to shards. Hot chunks never pay for a shard probe.
+
 **Mixed layouts:** chunks written while fewer than K+M voters existed are
 replicated. Repair recognises them because no voter holds shards of them,
 and reads always try both layouts.
@@ -533,17 +545,14 @@ Users, identity and bucket policies (with anonymous access), SigV2 header
 auth, HTTPS, mutual TLS between nodes, and dedup-preserving encryption at
 rest. Event notifications to webhooks from the replicated metadata log.
 A chunk-level cold tier on any S3-compatible service, with access-based
-tiering (demote unread objects, promote on read). Reed–Solomon erasure
+tiering (demote unread objects, promote on read), and erasure coding of
+cold chunks in the background. Reed–Solomon erasure
 coding across nodes.
 
 **Next**
 - io_uring with registered buffers and `O_DIRECT` for large chunks.
 - Key rotation for encryption at rest (re-encrypting chunks in the
   background under a new key).
-
-**Later**
-- Erasure-coding chunks in the background once they turn cold, instead of
-  choosing the layout at write time.
 
 **Deliberately not built (yet)**
 

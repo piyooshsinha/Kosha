@@ -665,7 +665,7 @@ async fn bucket_tiering(ctx: &Ctx, bucket: &str, body: Body) -> S3Result<Respons
             .ok_or_else(no_config),
         (&Method::PUT, Some(id)) => {
             let rule = crate::tiering::parse(&read_text(ctx, body).await?, &id)?;
-            if !engine.has_cold_store() {
+            if !engine.can_tier() {
                 return Err(S3Error::invalid_request(
                     "Intelligent-Tiering needs a cold tier, and none is configured on this server",
                 ));
@@ -884,7 +884,7 @@ async fn bucket_config(ctx: &Ctx, bucket: &str, body: Body) -> S3Result<Option<R
                 let rules = crate::protection::parse_lifecycle(&read_text(ctx, body).await?)?;
                 if rules.iter().any(|r| {
                     r.transition_class.is_some() || r.noncurrent_transition_class.is_some()
-                }) && !engine.has_cold_store()
+                }) && !engine.can_tier()
                 {
                     return Err(S3Error::invalid_request(
                         "Transition rules need a cold tier, and none is configured on this server",
@@ -1630,7 +1630,7 @@ fn storage_class(ctx: &Ctx) -> S3Result<Option<String>> {
     match ctx.header("x-amz-storage-class") {
         None | Some("STANDARD") | Some("REDUCED_REDUNDANCY") => Ok(None),
         Some(c) if kosha_engine::is_cold_class(c) => {
-            if ctx.engine().has_cold_store() {
+            if ctx.engine().can_tier() {
                 Ok(Some(c.to_string()))
             } else {
                 Err(S3Error::new(

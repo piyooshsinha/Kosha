@@ -175,12 +175,26 @@ impl Inner {
         })
     }
 
-    async fn maintain_chunk(&self, id: ChunkId, len: u32, live: &BTreeSet<NodeId>) -> Action {
+    async fn maintain_chunk(
+        &self,
+        id: ChunkId,
+        len: u32,
+        coded: bool,
+        live: &BTreeSet<NodeId>,
+    ) -> Action {
         let ranked = rank_voters(self, &id);
+        if coded && let Some(layout) = self.cfg.erasure {
+            // Converted from replicas: shards only; full copies are gone.
+            return self
+                .maintain_shards(id, len, layout, &ranked, live)
+                .await
+                .unwrap_or(Action::Keep);
+        }
+        // Written as shards: no full copy anywhere (see `ec_layout`).
         if let Some(layout) = self
             .cfg
             .erasure
-            .filter(|_| len as usize >= self.cfg.erasure_min_len)
+            .filter(|_| !self.cfg.erasure_cold_only && len as usize >= self.cfg.erasure_min_len)
             && !self.engine.chunk_store().has(&id)
             && let Some(action) = self.maintain_shards(id, len, layout, &ranked, live).await
         {
@@ -271,11 +285,13 @@ impl Inner {
                     break;
                 }
             };
-            let Some(&(last, _)) = page.last() else { break };
+            let Some(&(last, _, _)) = page.last() else {
+                break;
+            };
             after = Some(last);
             let live = &live;
             let actions: Vec<Action> = futures::stream::iter(page)
-                .map(|(id, len)| self.maintain_chunk(id, len, live))
+                .map(|(id, len, coded)| self.maintain_chunk(id, len, coded, live))
                 .buffer_unordered(CONCURRENCY)
                 .collect()
                 .await;

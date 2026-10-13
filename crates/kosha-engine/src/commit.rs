@@ -48,6 +48,12 @@ pub(crate) fn apply_and_collect(
         let removed = store.evict(&applied.evicted, |id| meta.is_evicted(id))?;
         tracing::debug!(removed, "evicted chunks now in the cold tier");
     }
+    for id in &applied.coded {
+        // Shards hold the data now; drop this node's full copy, if any.
+        if let Err(e) = store.remove_unpinned(id) {
+            tracing::warn!(chunk = %id.to_hex(), error = %e, "dropping a full copy failed");
+        }
+    }
     if !applied.remote_garbage.is_empty() {
         store.defer_remote_delete(applied.remote_garbage);
     }

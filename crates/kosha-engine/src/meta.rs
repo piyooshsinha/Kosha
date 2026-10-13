@@ -190,6 +190,10 @@ pub enum Command {
         bucket: String,
         targets: Vec<DeleteTarget>,
     },
+    /// A cold chunk was stored as erasure-coded shards.
+    ChunkErasureCoded {
+        id: ChunkId,
+    },
     /// A chunk was copied to the cold tier under `key`.
     ChunkOffloaded {
         id: ChunkId,
@@ -314,6 +318,9 @@ pub(crate) struct ChunkInfo {
     /// Key of this chunk's copy in the cold tier, once offloaded.
     #[serde(default)]
     pub(crate) remote: Option<String>,
+    /// Stored as erasure-coded shards rather than full copies.
+    #[serde(default)]
+    pub(crate) erasure: bool,
 }
 
 impl ChunkInfo {
@@ -355,6 +362,8 @@ pub(crate) struct Tx<'a> {
     pub(crate) freed: Vec<ChunkId>,
     /// Chunks now served from the cold tier: local copies can go.
     pub(crate) evicted: Vec<ChunkId>,
+    /// Chunks now erasure coded: full copies can go (shards stay).
+    pub(crate) coded: Vec<ChunkId>,
     /// Cold-tier keys no longer referenced.
     pub(crate) remote_garbage: Vec<String>,
 }
@@ -450,6 +459,7 @@ impl Tx<'_> {
                         stored,
                         cold_refs: 0,
                         remote: None,
+                        erasure: false,
                     }
                 }
             };
@@ -991,6 +1001,10 @@ impl Tx<'_> {
             Command::PromoteObjects { bucket, targets } => {
                 Ok(CommandOutput::Transitioned(self.promote(&bucket, targets)?))
             }
+            Command::ChunkErasureCoded { id } => {
+                self.chunk_erasure_coded(id)?;
+                Ok(CommandOutput::Done)
+            }
             Command::ChunkOffloaded { id, key } => {
                 self.chunk_offloaded(id, key)?;
                 Ok(CommandOutput::Done)
@@ -1031,6 +1045,7 @@ pub struct Applied {
     /// Chunks whose last reference was dropped.
     pub freed: Vec<ChunkId>,
     pub evicted: Vec<ChunkId>,
+    pub coded: Vec<ChunkId>,
     pub remote_garbage: Vec<String>,
 }
 
@@ -1063,6 +1078,7 @@ impl MetaStore {
             stats,
             freed: Vec::new(),
             evicted: Vec::new(),
+            coded: Vec::new(),
             remote_garbage: Vec::new(),
         };
         let mut results = Vec::with_capacity(reqs.len());
@@ -1097,6 +1113,7 @@ impl MetaStore {
             stats,
             freed,
             evicted,
+            coded,
             remote_garbage,
             ..
         } = tx;
@@ -1112,6 +1129,7 @@ impl MetaStore {
             results,
             freed,
             evicted,
+            coded,
             remote_garbage,
         })
     }
@@ -1132,7 +1150,11 @@ impl MetaStore {
     /// Referenced chunks that need local replicas, in id order, starting
     /// after `after`, with their lengths. Used by cluster repair to walk
     /// every chunk in pages.
-    pub fn chunk_page(&self, after: Option<ChunkId>, limit: usize) -> Result<Vec<(ChunkId, u32)>> {
+    pub fn chunk_page(
+        &self,
+        after: Option<ChunkId>,
+        limit: usize,
+    ) -> Result<Vec<(ChunkId, u32, bool)>> {
         let r = self.db.begin_read()?;
         let t = r.open_table(CHUNKS)?;
         let start = after.map(|a| a.0);
@@ -1153,7 +1175,7 @@ impl MetaStore {
             let info: ChunkInfo = dec(v.value())?;
             // Chunks served from the cold tier need no local replicas.
             if !info.evicted() {
-                out.push((ChunkId(id), info.len));
+                out.push((ChunkId(id), info.len, info.erasure));
             }
         }
         Ok(out)

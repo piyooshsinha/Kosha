@@ -82,6 +82,9 @@ pub struct ClusterConfig {
     /// shards instead of replicating them (needs K+M voters).
     pub erasure: Option<erasure::Layout>,
     pub erasure_min_len: usize,
+    /// Write chunks replicated and erasure code them only once they are
+    /// cold (all their objects in a cold storage class).
+    pub erasure_cold_only: bool,
 }
 
 impl ClusterConfig {
@@ -108,6 +111,7 @@ impl ClusterConfig {
             tls: None,
             erasure: None,
             erasure_min_len: 128 * 1024,
+            erasure_cold_only: false,
         }
     }
 }
@@ -927,10 +931,13 @@ impl Inner {
         }
         // Large chunks are probably erasure coded; try shards first. Either
         // way both layouts are tried, so changing the setting is safe.
-        let ec_first = self
-            .cfg
-            .erasure
-            .is_some_and(|_| len as usize >= self.cfg.erasure_min_len);
+        let ec_first = self.cfg.erasure.is_some()
+            && if self.cfg.erasure_cold_only {
+                // Hot chunks are replicated; metadata says which were coded.
+                self.engine.chunk_is_erasure_coded(&id)
+            } else {
+                len as usize >= self.cfg.erasure_min_len || self.engine.chunk_is_erasure_coded(&id)
+            };
         if ec_first && let Ok(b) = self.fetch_shards(id, len).await {
             return Ok(b);
         }
@@ -979,6 +986,28 @@ impl Inner {
 impl ChunkPlacement for RendezvousPlacement {
     fn put(&self, id: ChunkId, data: Bytes) -> BoxFuture<'static, kosha_engine::Result<u64>> {
         Box::pin(self.inner.clone().place(id, data))
+    }
+
+    fn supports_erasure(&self) -> bool {
+        self.inner.cfg.erasure.is_some()
+    }
+
+    fn erasure_code(&self, id: ChunkId, len: u32) -> BoxFuture<'static, kosha_engine::Result<()>> {
+        let inner = self.inner.clone();
+        Box::pin(async move {
+            let layout = inner.cfg.erasure.ok_or_else(|| {
+                kosha_engine::Error::Internal("erasure coding is not configured".into())
+            })?;
+            let voters = rank_voters(&inner, &id).len();
+            if voters < layout.total() {
+                return Err(kosha_engine::Error::Internal(format!(
+                    "erasure coding {layout} needs {} voters, the cluster has {voters}",
+                    layout.total()
+                )));
+            }
+            let data = inner.clone().fetch(id, len).await?;
+            inner.place_shards(id, data, layout).await.map(drop)
+        })
     }
 
     fn get(&self, id: ChunkId, len: u32) -> BoxFuture<'static, kosha_engine::Result<Bytes>> {

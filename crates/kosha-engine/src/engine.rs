@@ -107,6 +107,20 @@ pub trait ChunkPlacement: Send + Sync + 'static {
     fn put(&self, id: ChunkId, data: Bytes) -> BoxFuture<'static, Result<u64>>;
     /// Fetch a chunk from wherever a replica lives.
     fn get(&self, id: ChunkId, len: u32) -> BoxFuture<'static, Result<Bytes>>;
+    /// Whether cold chunks can be converted to erasure-coded shards.
+    fn supports_erasure(&self) -> bool {
+        false
+    }
+    /// Store a replicated chunk as erasure-coded shards as well. Once this
+    /// returns, the full copies may be dropped.
+    fn erasure_code(&self, id: ChunkId, _len: u32) -> BoxFuture<'static, Result<()>> {
+        Box::pin(async move {
+            Err(Error::Internal(format!(
+                "chunk {}: erasure coding is not available",
+                id.to_hex()
+            )))
+        })
+    }
 }
 
 struct Inner {
@@ -296,13 +310,14 @@ impl Engine {
         self.inner.meta.import_snapshot(bytes)
     }
 
-    /// A page of referenced chunks (id, length) after `after`, from local
-    /// state (no read barrier: callers use it for background maintenance).
+    /// A page of referenced chunks (id, length, erasure coded) after
+    /// `after`, from local state (no read barrier: callers use it for
+    /// background maintenance).
     pub fn referenced_chunks(
         &self,
         after: Option<ChunkId>,
         limit: usize,
-    ) -> Result<Vec<(ChunkId, u32)>> {
+    ) -> Result<Vec<(ChunkId, u32, bool)>> {
         self.inner.meta.chunk_page(after, limit)
     }
 
@@ -790,7 +805,7 @@ impl Engine {
             Some(c) if !crate::tier::is_cold_class(c) => Err(Error::InvalidRequest(format!(
                 "{c} is not a supported storage class"
             ))),
-            Some(_) if !self.has_cold_store() => Err(Error::InvalidRequest(
+            Some(_) if !self.can_tier() => Err(Error::InvalidRequest(
                 "no cold tier is configured on this server".into(),
             )),
             Some(_) => Ok(()),

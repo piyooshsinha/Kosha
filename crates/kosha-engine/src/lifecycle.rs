@@ -82,7 +82,7 @@ impl Engine {
                 }
             }
             if let Some(rules) = info.config.tiering.clone()
-                && self.has_cold_store()
+                && self.can_tier()
             {
                 for rule in rules.iter().filter(|r| r.enabled) {
                     self.apply_tiering(&info, rule, now, &mut report).await?;
@@ -227,7 +227,7 @@ impl Engine {
                 || rule.transition_date.is_some_and(|d| now >= d)
         };
         if let Some(class) = &rule.transition_class
-            && self.has_cold_store()
+            && self.can_tier()
         {
             let mut targets = Vec::new();
             let mut after = None;
@@ -280,7 +280,7 @@ impl Engine {
         let noncurrent_tier = rule
             .noncurrent_transition_days
             .zip(rule.noncurrent_transition_class.as_ref())
-            .filter(|_| self.has_cold_store());
+            .filter(|_| self.can_tier());
         if info.config.versioning != Versioning::Unversioned
             && (rule.noncurrent_days.is_some()
                 || rule.expired_object_delete_marker

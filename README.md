@@ -384,6 +384,22 @@ and M parity shards on K+M different nodes. Any K shards rebuild the chunk.
   have somewhere to go.
 - A node with a different `--erasure` setting is refused when it joins.
 
+**Hot replicated, cold erasure coded.** With `--erasure K+M
+--erasure-cold-only`:
+
+- **Writes** stay replicated, so hot reads come from a full copy.
+- **When a chunk goes cold** (every object using it is in a cold class, via
+  lifecycle, a cold upload, or access-based tiering), the leader converts it
+  to shards in the background, and every node drops its full copy.
+- **No external tier needed:** this is the cold tier when no
+  `--cold-tier-endpoint` is configured, so cold storage classes and
+  Intelligent-Tiering work without one.
+- **Reads** use the layout recorded in metadata, so hot reads never probe
+  for shards.
+- **Tested:** in a 6-node test, an object went from 2 replicas (2×) to 3+2
+  shards (1.67×). It read correctly on every node, and repair rebuilt a dead
+  node's shards.
+
 Measured on 4 nodes (24 × 16 MiB objects, same VM, alternating runs):
 
 | | Disk used | PUT | GET |
@@ -772,6 +788,7 @@ io_uring. `--io auto` (the default) detects this and falls back to threads;
 | `--gc-grace-secs` | `KOSHA_GC_GRACE_SECS` | `900` | cluster: keep unreferenced chunks this long |
 | `--repair-interval-secs` | `KOSHA_REPAIR_INTERVAL_SECS` | `60` | cluster: background re-replication/rebalancing pass (`0` disables) |
 | `--erasure K+M` | `KOSHA_ERASURE` | none | cluster: Reed–Solomon erasure coding instead of replication for large chunks |
+| `--erasure-cold-only` | `KOSHA_ERASURE_COLD_ONLY` | off | cluster: replicate new chunks, erasure code them once cold |
 | `--erasure-min-chunk` | `KOSHA_ERASURE_MIN_CHUNK` | `131072` | cluster: smaller chunks stay replicated |
 | `--no-lease-reads` | `KOSHA_NO_LEASE_READS` | off | cluster: prove leadership with a quorum round-trip on every read |
 | `--tls-cert` / `--tls-key` | `KOSHA_TLS_CERT` / `KOSHA_TLS_KEY` | none | serve S3 and the console over HTTPS |

@@ -174,6 +174,12 @@ struct Args {
     #[arg(long, env = "KOSHA_ERASURE")]
     erasure: Option<String>,
 
+    /// With --erasure: write chunks replicated and erasure code them only
+    /// once they are cold (lifecycle transition, cold upload class, or
+    /// access-based tiering) and no --cold-tier-endpoint is configured.
+    #[arg(long, env = "KOSHA_ERASURE_COLD_ONLY", requires = "erasure")]
+    erasure_cold_only: bool,
+
     /// Chunks smaller than this many bytes stay replicated.
     #[arg(long, env = "KOSHA_ERASURE_MIN_CHUNK", default_value_t = 128 * 1024)]
     erasure_min_chunk: usize,
@@ -346,6 +352,7 @@ async fn main() -> anyhow::Result<()> {
                 .transpose()
                 .map_err(anyhow::Error::msg)?;
             ccfg.erasure_min_len = args.erasure_min_chunk;
+            ccfg.erasure_cold_only = args.erasure_cold_only;
             ccfg.tls = args.cluster_tls_cert.clone().map(|cert| TlsFiles {
                 cert,
                 key: args.cluster_tls_key.clone().expect("required by clap"),
@@ -392,7 +399,7 @@ async fn main() -> anyhow::Result<()> {
             leader_gate.clone(),
         );
     }
-    if engine.has_cold_store() {
+    if engine.can_tier() {
         // Reads are recorded in batches for access-based tiering.
         engine.spawn_access_flusher(Duration::from_secs(30));
         engine.spawn_offloader(
