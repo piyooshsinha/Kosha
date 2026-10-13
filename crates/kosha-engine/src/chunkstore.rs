@@ -30,7 +30,7 @@ use std::time::{Duration, SystemTime};
 use bytes::Bytes;
 use parking_lot::Mutex;
 
-use crate::crypt::{ChunkKeys, check_marker};
+use crate::crypt::{ChunkKeys, ENCRYPTED, check_unencrypted};
 use crate::durability::{GroupSync, SyncMode, sync_dir};
 use crate::error::{Error, Result};
 use crate::io::IoBackend;
@@ -38,8 +38,6 @@ use crate::types::ChunkId;
 
 const CODEC_RAW: u8 = 0;
 const CODEC_ZSTD: u8 = 1;
-/// Set on the codec byte when the payload is encrypted.
-const ENCRYPTED: u8 = 0x80;
 
 /// Probe size used to decide whether a chunk is worth compressing.
 const PROBE: usize = 64 * 1024;
@@ -87,7 +85,17 @@ impl ChunkStore {
     pub fn open(root: &Path, opts: StoreOptions) -> Result<Self> {
         let tmp = root.join("tmp");
         fs::create_dir_all(&tmp)?;
-        check_marker(root, opts.keys.as_deref())?;
+        // Bind the keyring to this directory (its id key and marker).
+        let opts = match &opts.keys {
+            Some(k) => StoreOptions {
+                keys: Some(Arc::new(k.resolve(root)?)),
+                ..opts
+            },
+            None => {
+                check_unencrypted(root)?;
+                opts
+            }
+        };
         // Leftover temp files are from writes that never completed.
         for entry in fs::read_dir(&tmp)? {
             let _ = fs::remove_file(entry?.path());
@@ -370,12 +378,7 @@ impl ChunkStore {
         let Some(keys) = &self.opts.keys else {
             return Ok(plain);
         };
-        let codec = plain[0] | ENCRYPTED;
-        let sealed = keys.seal(id, codec, &plain[1..]);
-        let mut v = Vec::with_capacity(sealed.len() + 1);
-        v.push(codec);
-        v.extend_from_slice(&sealed);
-        Ok(v)
+        Ok(keys.seal_chunk(id, plain[0], &plain[1..]))
     }
 
     fn compress(&self, data: &[u8]) -> Result<Vec<u8>> {
@@ -402,6 +405,138 @@ impl ChunkStore {
         v.push(CODEC_ZSTD);
         v.extend_from_slice(&full);
         Ok(v)
+    }
+
+    /// The keyring, once bound to this store (`None` when unencrypted).
+    pub fn keys(&self) -> Option<&Arc<ChunkKeys>> {
+        self.opts.keys.as_ref()
+    }
+
+    /// The plain stored form (codec byte + payload, compressed but not
+    /// encrypted), for erasure coding with per-shard encryption.
+    pub fn compress_external(&self, data: &[u8]) -> Result<Vec<u8>> {
+        self.compress(data)
+    }
+
+    /// Re-encrypt up to `limit` local chunk files that are not under the
+    /// primary key. Returns (rewritten, still pending afterwards).
+    pub fn rotate_local(&self, limit: usize) -> Result<(usize, usize)> {
+        let Some(keys) = self.opts.keys.clone() else {
+            return Ok((0, 0));
+        };
+        if keys.id_key_needs_rotation(&self.root) {
+            keys.rotate_id_key(&self.root)?;
+        }
+        let (mut done, mut pending) = (0, 0);
+        for (id, path) in self.chunk_files()? {
+            let raw = match fs::read(&path) {
+                Ok(r) => r,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            if !keys.needs_rotation(&raw) {
+                continue;
+            }
+            if done >= limit {
+                pending += 1;
+                continue;
+            }
+            let fresh = keys.reseal_chunk(&id, &raw)?;
+            let tmp = self.tmp.join(format!(
+                "{}.rot.{}",
+                id.to_hex(),
+                uuid::Uuid::new_v4().simple()
+            ));
+            fs::write(&tmp, &fresh)?;
+            fs::File::open(&tmp)?.sync_all()?;
+            // Garbage collection may have removed the chunk meanwhile;
+            // don't bring it back.
+            let pins = self.pins.lock();
+            if path.exists() {
+                fs::rename(&tmp, &path)?;
+            } else {
+                let _ = fs::remove_file(&tmp);
+            }
+            drop(pins);
+            done += 1;
+        }
+        if done > 0 {
+            sync_dir(self.root.clone())?;
+        }
+        Ok((done, pending))
+    }
+
+    /// Every full chunk file (not shards) with its id.
+    fn chunk_files(&self) -> Result<Vec<(ChunkId, PathBuf)>> {
+        let mut out = Vec::new();
+        for l1 in fs::read_dir(&self.root)? {
+            let l1 = l1?;
+            if l1.file_name() == "tmp" || !l1.file_type()?.is_dir() {
+                continue;
+            }
+            for l2 in fs::read_dir(l1.path())? {
+                let l2 = l2?;
+                if !l2.file_type()?.is_dir() {
+                    continue;
+                }
+                for f in fs::read_dir(l2.path())? {
+                    let f = f?;
+                    let name = f.file_name();
+                    let Some(hex) = name.to_str() else { continue };
+                    if let Ok(bytes) = hex::decode(hex)
+                        && let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice())
+                    {
+                        out.push((ChunkId(arr), f.path()));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every shard file with its chunk id and index.
+    pub fn shard_files(&self) -> Result<Vec<(ChunkId, u8)>> {
+        let mut out = Vec::new();
+        for l1 in fs::read_dir(&self.root)? {
+            let l1 = l1?;
+            if l1.file_name() == "tmp" || !l1.file_type()?.is_dir() {
+                continue;
+            }
+            for l2 in fs::read_dir(l1.path())? {
+                let l2 = l2?;
+                if !l2.file_type()?.is_dir() {
+                    continue;
+                }
+                for f in fs::read_dir(l2.path())? {
+                    let name = f?.file_name();
+                    let Some((hex, idx)) = name.to_str().and_then(|n| n.split_once(".s")) else {
+                        continue;
+                    };
+                    if let (Ok(bytes), Ok(idx)) = (hex::decode(hex), idx.parse::<u8>())
+                        && let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice())
+                    {
+                        out.push((ChunkId(arr), idx));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Replace an existing shard file atomically (rotation, conversion).
+    pub async fn replace_shard(&self, id: ChunkId, index: u8, data: Bytes) -> Result<()> {
+        let path = self.shard_path(&id, index);
+        let tmp = self.tmp.join(format!(
+            "{}.s{index}.rep.{}",
+            id.to_hex(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(path.parent().expect("chunk path has parent"))?;
+        fs::write(&tmp, &data)?;
+        fs::File::open(&tmp)?.sync_all()?;
+        fs::rename(&tmp, &path)?;
+        sync_dir(path.parent().expect("chunk path has parent").to_path_buf())?;
+        Ok(())
     }
 
     /// The stored form of a chunk (compressed, and encrypted if enabled), for
@@ -561,11 +696,11 @@ fn touch(path: &Path) {
         .and_then(|f| f.set_modified(SystemTime::now()));
 }
 
-/// Authentication tag added by encryption.
-const TAG_LEN: usize = 16;
+/// Bytes encryption adds: a key tag and the authentication tag.
+const TAG_LEN: usize = 4 + 16;
 
 fn decode(id: ChunkId, len: u32, raw: Vec<u8>, keys: Option<&ChunkKeys>) -> Result<Bytes> {
-    let (&codec, payload) = raw
+    let (&codec, _) = raw
         .split_first()
         .ok_or_else(|| Error::Corrupt(format!("chunk {} is empty", id.to_hex())))?;
     let (codec, raw) = if codec & ENCRYPTED != 0 {
@@ -575,9 +710,9 @@ fn decode(id: ChunkId, len: u32, raw: Vec<u8>, keys: Option<&ChunkKeys>) -> Resu
                 id.to_hex()
             ))
         })?;
-        let mut plain = keys.open(&id, codec, payload)?;
-        plain.insert(0, codec & !ENCRYPTED);
-        (codec & !ENCRYPTED, plain)
+        let (codec, mut plain) = keys.open_chunk(&id, &raw)?;
+        plain.insert(0, codec);
+        (codec, plain)
     } else {
         (codec, raw)
     };

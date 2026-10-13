@@ -48,6 +48,9 @@ pub const COLD_CLASSES: &[&str] = &[
     "DEEP_ARCHIVE",
 ];
 
+/// A chunk's id, length and cold-tier key.
+pub type RemoteCopy = (ChunkId, u32, String);
+
 pub fn is_cold_class(class: &str) -> bool {
     COLD_CLASSES.contains(&class)
 }
@@ -222,7 +225,37 @@ impl Tx<'_> {
         Ok(())
     }
 
-    pub(crate) fn chunk_offloaded(&mut self, id: ChunkId, key: String) -> Step<()> {
+    pub(crate) fn chunk_remote_rekeyed(
+        &mut self,
+        id: ChunkId,
+        old: String,
+        new: String,
+        tag: Option<[u8; 4]>,
+    ) -> Step<()> {
+        let mut chunks = self.txn.open_table(CHUNKS)?;
+        let current = chunks
+            .get(id.0.as_slice())?
+            .map(|v| dec::<ChunkInfo>(v.value()))
+            .transpose()?;
+        match current {
+            Some(mut c) if c.remote.as_deref() == Some(old.as_str()) => {
+                c.remote = Some(new);
+                c.remote_tag = tag;
+                chunks.insert(id.0.as_slice(), enc(&c)?.as_slice())?;
+                self.remote_garbage.push(old);
+            }
+            // Freed or changed meanwhile: the new upload is not needed.
+            _ => self.remote_garbage.push(new),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn chunk_offloaded(
+        &mut self,
+        id: ChunkId,
+        key: String,
+        tag: Option<[u8; 4]>,
+    ) -> Step<()> {
         self.txn.open_table(TIER_QUEUE)?.remove(id.0.as_slice())?;
         let mut chunks = self.txn.open_table(CHUNKS)?;
         let Some(raw) = chunks.get(id.0.as_slice())?.map(|v| v.value().to_vec()) else {
@@ -237,6 +270,7 @@ impl Tx<'_> {
             return Ok(());
         }
         c.remote = Some(key);
+        c.remote_tag = tag;
         self.stats.cold_chunks += 1;
         self.stats.cold_bytes += c.stored;
         if c.evicted() {
@@ -280,6 +314,34 @@ impl MetaStore {
         t.get(crate::keys::object_key(bucket, key).as_slice())?
             .map(|v| dec(v.value()))
             .transpose()
+    }
+
+    /// Offloaded chunks whose remote copy is not under `primary`.
+    pub fn remote_needing_rotation(
+        &self,
+        primary: [u8; 4],
+        limit: usize,
+    ) -> Result<(Vec<RemoteCopy>, usize)> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(CHUNKS)?;
+        let (mut out, mut total) = (Vec::new(), 0);
+        for item in t.iter()? {
+            let (k, v) = item?;
+            let c: ChunkInfo = dec(v.value())?;
+            let Some(key) = c.remote else { continue };
+            if c.remote_tag == Some(primary) {
+                continue;
+            }
+            total += 1;
+            if out.len() < limit {
+                let id: [u8; 32] = k
+                    .value()
+                    .try_into()
+                    .map_err(|_| Error::Internal("malformed chunk id".into()))?;
+                out.push((ChunkId(id), c.len, key));
+            }
+        }
+        Ok((out, total))
     }
 
     /// Chunks waiting to be offloaded.
@@ -517,7 +579,8 @@ impl Engine {
                     &uuid::Uuid::new_v4().simple().to_string()[..8]
                 );
                 cold.put(key.clone(), Bytes::from(encoded)).await?;
-                self.propose_cmd(Command::ChunkOffloaded { id, key })
+                let tag = self.chunk_store().keys().map(|k| k.primary_tag());
+                self.propose_cmd(Command::ChunkOffloaded { id, key, tag })
                     .await?;
                 done += 1;
             }

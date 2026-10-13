@@ -572,11 +572,13 @@ Object data is encrypted on disk **without giving up dedup**:
 Other things to know:
 
 - **Choose encryption when you create a data directory.** Kosha records the
-  key's fingerprint in it and refuses to start with a different key, without
-  one, or with a key on a directory that already holds unencrypted data.
+  data directory's encryption identity. It refuses to start without a key
+  that can open it, without any key, or with a key on a directory that
+  already holds unencrypted data.
 - **Every cluster node needs the same key.** A node with another key, or none,
   is refused when it joins.
-- **Back up the key.** Without it the data cannot be read.
+- **Back up the key.** Without it the data cannot be read (see rotation
+  below).
 - `x-amz-server-side-encryption: AES256` is returned on object responses, and
   GetBucketEncryption reports SSE-S3.
 - **Refused, not ignored:** on a server without a key, a request for SSE is
@@ -586,6 +588,35 @@ Other things to know:
   metadata, users' secret keys) stays readable in `meta.redb` and the Raft
   log. Treat the data directory as sensitive.
 - **Cost:** see [Performance](#cost-of-encryption-at-rest).
+
+**Rotating keys.** Give every node the new key as primary and the current one
+as an old key, then restart them one at a time:
+
+```sh
+openssl rand -hex 32 > /etc/kosha/kosha-2027.key
+kosha --encryption-key-file /etc/kosha/kosha-2027.key \
+      --encryption-old-key-file /etc/kosha/kosha.key ...
+curl -s --aws-sigv4 ... http://localhost:9000/_kosha/stats   # "rotation": {"chunks_pending": 0, ...}
+```
+
+- **New data** uses the new key immediately.
+- **Existing data** is re-encrypted in the background: every node rewrites
+  its chunk files and shards, and the leader re-uploads cold-tier copies.
+  Every encrypted chunk records which key sealed it.
+- **Progress** is in `/_kosha/stats` (`rotation`) and Prometheus
+  (`kosha_rotation_pending`).
+- **When every node reports 0 pending**, drop `--encryption-old-key-file`.
+  The old key is then no longer needed for anything.
+- **Chunk ids stay valid.** The key that hashes chunk ids never changes:
+  it's created with the data directory and kept in `chunks/ID_KEY`, sealed
+  under the current primary key.
+- **New nodes joining a rotated cluster** need the cluster's original key
+  once: `--encryption-identity-key-file`.
+- **Legacy shards:** erasure-coded shards written by versions before this
+  one in an encrypted cluster use the old shard format. They are counted as
+  `legacy_shards`, can only be read with their original key, and are not
+  re-encrypted. Rewrite those objects (for example with a server-side copy)
+  to move them to the new format.
 
 ---
 
@@ -792,7 +823,9 @@ io_uring. `--io auto` (the default) detects this and falls back to threads;
 | `--erasure-min-chunk` | `KOSHA_ERASURE_MIN_CHUNK` | `131072` | cluster: smaller chunks stay replicated |
 | `--no-lease-reads` | `KOSHA_NO_LEASE_READS` | off | cluster: prove leadership with a quorum round-trip on every read |
 | `--tls-cert` / `--tls-key` | `KOSHA_TLS_CERT` / `KOSHA_TLS_KEY` | none | serve S3 and the console over HTTPS |
-| `--encryption-key-file` | `KOSHA_ENCRYPTION_KEY_FILE` | none | encrypt object data at rest (64 hex chars); fixed per data directory |
+| `--encryption-key-file` | `KOSHA_ENCRYPTION_KEY_FILE` | none | encrypt object data at rest (64 hex chars); the primary key for new data |
+| `--encryption-old-key-file` | `KOSHA_ENCRYPTION_OLD_KEY_FILES` | none | previous key(s) during [key rotation](#encryption-at-rest) (repeatable) |
+| `--encryption-identity-key-file` | `KOSHA_ENCRYPTION_IDENTITY_KEY_FILE` | none | a cluster's original key, for a new node joining after rotation |
 | `--cluster-tls-cert` / `--cluster-tls-key` / `--cluster-tls-ca` | `KOSHA_CLUSTER_TLS_*` | none | mutual TLS for all internal cluster traffic |
 | `--cold-tier-endpoint` / `--cold-tier-bucket` / `--cold-tier-access-key` / `--cold-tier-secret-key` | `KOSHA_COLD_TIER_*` | none | S3-compatible cold tier (see [Cold tier](#cold-tier)) |
 | `--cold-tier-prefix` / `--cold-tier-region` | | `kosha-cold/` / `us-east-1` | key prefix and signing region in the cold bucket |

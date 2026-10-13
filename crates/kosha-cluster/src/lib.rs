@@ -992,6 +992,14 @@ impl ChunkPlacement for RendezvousPlacement {
         self.inner.cfg.erasure.is_some()
     }
 
+    fn rotate_shards(
+        &self,
+        limit: usize,
+    ) -> BoxFuture<'static, kosha_engine::Result<(usize, usize, usize)>> {
+        let store = self.inner.engine.chunk_store();
+        Box::pin(async move { crate::ec::rotate_shards(&store, limit).await })
+    }
+
     fn erasure_code(&self, id: ChunkId, len: u32) -> BoxFuture<'static, kosha_engine::Result<()>> {
         let inner = self.inner.clone();
         Box::pin(async move {

@@ -198,6 +198,17 @@ pub enum Command {
     ChunkOffloaded {
         id: ChunkId,
         key: String,
+        /// Key tag of the uploaded copy (encrypted stores).
+        #[serde(default)]
+        tag: Option<[u8; 4]>,
+    },
+    /// The remote copy of a chunk was re-encrypted under `new` (key
+    /// rotation); `old` becomes garbage.
+    ChunkRemoteRekeyed {
+        id: ChunkId,
+        old: String,
+        new: String,
+        tag: Option<[u8; 4]>,
     },
     /// Delivered notifications for `target` up to and including `upto`.
     AckEvents {
@@ -321,6 +332,10 @@ pub(crate) struct ChunkInfo {
     /// Stored as erasure-coded shards rather than full copies.
     #[serde(default)]
     pub(crate) erasure: bool,
+    /// Key tag of the remote copy (`None`: unencrypted, or written before
+    /// key tags existed).
+    #[serde(default)]
+    pub(crate) remote_tag: Option<[u8; 4]>,
 }
 
 impl ChunkInfo {
@@ -460,6 +475,7 @@ impl Tx<'_> {
                         cold_refs: 0,
                         remote: None,
                         erasure: false,
+                        remote_tag: None,
                     }
                 }
             };
@@ -1005,8 +1021,12 @@ impl Tx<'_> {
                 self.chunk_erasure_coded(id)?;
                 Ok(CommandOutput::Done)
             }
-            Command::ChunkOffloaded { id, key } => {
-                self.chunk_offloaded(id, key)?;
+            Command::ChunkRemoteRekeyed { id, old, new, tag } => {
+                self.chunk_remote_rekeyed(id, old, new, tag)?;
+                Ok(CommandOutput::Done)
+            }
+            Command::ChunkOffloaded { id, key, tag } => {
+                self.chunk_offloaded(id, key, tag)?;
                 Ok(CommandOutput::Done)
             }
             Command::AckEvents { target, upto } => {

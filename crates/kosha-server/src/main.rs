@@ -8,7 +8,7 @@ use axum::serve::ListenerExt;
 use clap::Parser;
 use kosha_cluster::tls::{TlsFiles, TlsListener};
 use kosha_cluster::{Cluster, ClusterConfig};
-use kosha_engine::{ChunkKeys, Engine, EngineConfig, IoMode, SyncMode};
+use kosha_engine::{ChunkKeys, Engine, EngineConfig, IoMode, SyncMode, read_key_file};
 use kosha_s3::{ClusterHooks, Credentials, S3Config};
 use tracing_subscriber::EnvFilter;
 
@@ -70,6 +70,28 @@ struct Args {
     /// cannot be read without it.
     #[arg(long, env = "KOSHA_ENCRYPTION_KEY_FILE")]
     encryption_key_file: Option<PathBuf>,
+
+    /// Previous encryption key(s), for key rotation (repeatable). Data
+    /// under them stays readable and is re-encrypted with
+    /// --encryption-key-file in the background; remove them once
+    /// /_kosha/stats shows the rotation is done on every node.
+    #[arg(
+        long = "encryption-old-key-file",
+        env = "KOSHA_ENCRYPTION_OLD_KEY_FILES",
+        value_delimiter = ',',
+        requires = "encryption_key_file"
+    )]
+    encryption_old_key_files: Vec<PathBuf>,
+
+    /// The key a cluster was first created with. Only needed to create the
+    /// data directory of a node joining a cluster whose keys have been
+    /// rotated since (it derives the cluster's chunk-id key).
+    #[arg(
+        long,
+        env = "KOSHA_ENCRYPTION_IDENTITY_KEY_FILE",
+        requires = "encryption_key_file"
+    )]
+    encryption_identity_key_file: Option<PathBuf>,
 
     /// Event notification target, `name=url` (repeatable). Buckets refer to
     /// it as `arn:kosha:sqs::<name>:webhook`. Use the same list on every
@@ -255,10 +277,20 @@ async fn main() -> anyhow::Result<()> {
     };
     cfg.io_mode = args.io;
     if let Some(path) = &args.encryption_key_file {
-        cfg.encryption =
-            Some(Arc::new(ChunkKeys::load(path).with_context(|| {
-                format!("loading encryption key {}", path.display())
-            })?));
+        let read = |p: &PathBuf| {
+            read_key_file(p).with_context(|| format!("loading encryption key {}", p.display()))
+        };
+        let old = args
+            .encryption_old_key_files
+            .iter()
+            .map(read)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let identity = args
+            .encryption_identity_key_file
+            .as_ref()
+            .map(read)
+            .transpose()?;
+        cfg.encryption = Some(Arc::new(ChunkKeys::ring(read(path)?, old, identity)));
     }
     // A single node protects in-flight uploads with pins alone; a cluster also
     // needs the grace period for uploads coordinated by other nodes.
@@ -398,6 +430,10 @@ async fn main() -> anyhow::Result<()> {
             Duration::from_secs(args.lifecycle_interval_secs),
             leader_gate.clone(),
         );
+    }
+    if engine.encryption_fingerprint().is_some() {
+        // Re-encrypts anything under an old key (a no-op otherwise).
+        engine.spawn_rotation(Duration::from_secs(60), leader_gate.clone());
     }
     if engine.can_tier() {
         // Reads are recorded in batches for access-based tiering.

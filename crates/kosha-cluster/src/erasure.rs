@@ -1,16 +1,28 @@
 //! Reed–Solomon erasure coding of chunks.
 //!
-//! A chunk's stored form (compressed, and encrypted if enabled) is split
-//! into `k` data shards plus `m` parity shards; any `k` of them rebuild it.
-//! Each shard is framed with a header that carries its index, the layout,
-//! the length of the stored form, and a BLAKE3 checksum of the shard, so a
-//! damaged shard is detected and treated as missing.
+//! A chunk's compressed form is split into `k` data shards plus `m` parity
+//! shards; any `k` of them rebuild it. Each shard is framed with a header
+//! that carries its index, the layout, the length of the encoded form, and
+//! a BLAKE3 checksum of the shard as stored, so a damaged shard is detected
+//! and treated as missing.
+//!
+//! Two frame versions exist:
+//!
+//! * `KSH1`: the payload is a slice of the chunk's stored form (which may
+//!   be encrypted as a whole). Written before per-shard encryption.
+//! * `KSH2`: with encryption at rest, each shard payload is encrypted on its
+//!   own (nonce from chunk id and index) and the frame records the key tag.
+//!   A node can therefore re-encrypt its shards during key rotation
+//!   without coordinating with other nodes, and shards under different keys
+//!   still decode together.
 
 use bytes::{BufMut, Bytes, BytesMut};
 use reed_solomon_erasure::galois_8::ReedSolomon;
 
 const MAGIC: &[u8; 4] = b"KSH1";
+const MAGIC_V2: &[u8; 4] = b"KSH2";
 pub const HEADER: usize = 48;
+pub const HEADER_V2: usize = 52;
 
 /// `k` data + `m` parity shards.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -51,19 +63,72 @@ pub struct Shard {
     pub layout: Layout,
     pub encoded_len: u32,
     pub payload: Bytes,
+    /// Frame version (1 or 2).
+    pub version: u8,
+    /// Key of an encrypted `KSH2` payload.
+    pub tag: Option<[u8; 4]>,
 }
 
-/// Split `encoded` into framed shards, index order.
-pub fn encode(layout: Layout, encoded: &[u8]) -> Vec<Bytes> {
+/// Erasure code the (unencrypted) compressed form of a chunk and seal each
+/// shard with `seal(index, payload) -> (key tag, ciphertext)`.
+pub fn encode_sealed(
+    layout: Layout,
+    plain: &[u8],
+    seal: impl Fn(u8, &[u8]) -> ([u8; 4], Vec<u8>),
+) -> Vec<Bytes> {
+    let payloads = split(layout, plain);
+    payloads
+        .into_iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let (tag, sealed) = seal(i as u8, &p);
+            frame_v2(i as u8, layout, plain.len() as u32, Some(tag), &sealed)
+        })
+        .collect()
+}
+
+/// Unencrypted `KSH2` shards of `data`.
+pub fn split_v2(layout: Layout, data: &[u8]) -> Vec<Bytes> {
+    split(layout, data)
+        .into_iter()
+        .enumerate()
+        .map(|(i, p)| frame_v2(i as u8, layout, data.len() as u32, None, &p))
+        .collect()
+}
+
+/// Encode a `KSH2` frame (also used to re-frame a re-encrypted payload).
+pub fn frame_v2(
+    index: u8,
+    layout: Layout,
+    encoded_len: u32,
+    tag: Option<[u8; 4]>,
+    payload: &[u8],
+) -> Bytes {
+    let mut b = BytesMut::with_capacity(HEADER_V2 + payload.len());
+    b.put_slice(MAGIC_V2);
+    b.put_u8(index);
+    b.put_u8(layout.k);
+    b.put_u8(layout.m);
+    b.put_u8(u8::from(tag.is_some()));
+    b.put_u32_le(encoded_len);
+    b.put_u32_le(payload.len() as u32);
+    b.put_slice(&tag.unwrap_or_default());
+    b.put_slice(blake3::hash(payload).as_bytes());
+    b.put_slice(payload);
+    b.freeze()
+}
+
+/// Data and parity payloads for `data`, each `ceil(len / k)` bytes.
+fn split(layout: Layout, data: &[u8]) -> Vec<Vec<u8>> {
     let k = layout.k as usize;
-    let shard_len = encoded.len().div_ceil(k).max(1);
+    let shard_len = data.len().div_ceil(k).max(1);
     let mut shards: Vec<Vec<u8>> = (0..layout.total())
         .map(|i| {
             let mut s = vec![0u8; shard_len];
             if i < k {
-                let from = (i * shard_len).min(encoded.len());
-                let to = ((i + 1) * shard_len).min(encoded.len());
-                s[..to - from].copy_from_slice(&encoded[from..to]);
+                let from = (i * shard_len).min(data.len());
+                let to = ((i + 1) * shard_len).min(data.len());
+                s[..to - from].copy_from_slice(&data[from..to]);
             }
             s
         })
@@ -73,6 +138,11 @@ pub fn encode(layout: Layout, encoded: &[u8]) -> Vec<Bytes> {
         .encode(&mut shards)
         .expect("shards have equal length");
     shards
+}
+
+/// Split `encoded` into framed `KSH1` shards, index order.
+pub fn encode(layout: Layout, encoded: &[u8]) -> Vec<Bytes> {
+    split(layout, encoded)
         .into_iter()
         .enumerate()
         .map(|(i, payload)| frame(i as u8, layout, encoded.len() as u32, &payload))
@@ -95,6 +165,31 @@ fn frame(index: u8, layout: Layout, encoded_len: u32, payload: &[u8]) -> Bytes {
 
 /// Validate a framed shard. `None` if it is malformed or damaged.
 pub fn parse(raw: &Bytes) -> Option<Shard> {
+    if raw.len() >= HEADER_V2 && &raw[..4] == MAGIC_V2 {
+        let layout = Layout {
+            k: raw[5],
+            m: raw[6],
+        };
+        let encrypted = raw[7] == 1;
+        let encoded_len = u32::from_le_bytes(raw[8..12].try_into().ok()?);
+        let shard_len = u32::from_le_bytes(raw[12..16].try_into().ok()?) as usize;
+        let tag: [u8; 4] = raw[16..20].try_into().ok()?;
+        let payload = raw.slice(HEADER_V2..);
+        if payload.len() != shard_len
+            || blake3::hash(&payload).as_bytes() != &raw[20..52]
+            || raw[4] as usize >= layout.total()
+        {
+            return None;
+        }
+        return Some(Shard {
+            index: raw[4],
+            layout,
+            encoded_len,
+            payload,
+            version: 2,
+            tag: encrypted.then_some(tag),
+        });
+    }
     if raw.len() < HEADER || &raw[..4] != MAGIC {
         return None;
     }
@@ -116,13 +211,29 @@ pub fn parse(raw: &Bytes) -> Option<Shard> {
         layout,
         encoded_len,
         payload,
+        version: 1,
+        tag: None,
     })
 }
 
 /// Rebuild the stored form from at least `k` valid shards of one layout.
 pub fn decode(shards: Vec<Shard>) -> Result<Vec<u8>, String> {
-    let first = shards.first().ok_or("no shards")?;
-    let (layout, encoded_len) = (first.layout, first.encoded_len);
+    // Shards of one encoding agree on version, layout and length; use the
+    // largest such group (frames of two versions can coexist briefly).
+    let mut groups: Vec<((u8, Layout, u32), usize)> = Vec::new();
+    for s in &shards {
+        let key = (s.version, s.layout, s.encoded_len);
+        match groups.iter_mut().find(|(g, _)| *g == key) {
+            Some((_, n)) => *n += 1,
+            None => groups.push((key, 1)),
+        }
+    }
+    let ((version, layout, encoded_len), _) =
+        *groups.iter().max_by_key(|(_, n)| *n).ok_or("no shards")?;
+    let shards: Vec<Shard> = shards
+        .into_iter()
+        .filter(|s| s.version == version)
+        .collect();
     let k = layout.k as usize;
     let mut slots: Vec<Option<Vec<u8>>> = vec![None; layout.total()];
     let mut have = 0;

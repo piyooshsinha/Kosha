@@ -219,6 +219,19 @@ async fn metrics_response(st: &AppState) -> S3Result<Response> {
         "Bytes of chunks stored in the cold tier.",
         s.cold_bytes,
     );
+    let rot = st.engine.rotation_status();
+    gauge(
+        &mut out,
+        "kosha_rotation_pending",
+        "Chunks, shards and cold copies still under an old encryption key.",
+        rot.chunks_pending + rot.shards_pending + rot.remote_pending,
+    );
+    gauge(
+        &mut out,
+        "kosha_rotation_legacy_shards",
+        "Shards in the pre-rotation format (readable only with their original key).",
+        rot.legacy_shards,
+    );
     gauge(
         &mut out,
         "kosha_cold_chunks",
@@ -1130,8 +1143,9 @@ async fn stats(st: &AppState) -> S3Result<Response> {
     let ratio = |a: u64, b: u64| if b == 0 { 1.0 } else { a as f64 / b as f64 };
     // Stored bytes live locally or in the cold tier.
     let stored = s.physical_bytes + s.cold_bytes;
+    let rot = st.engine.rotation_status();
     let body = format!(
-        "{{\"io_backend\":\"{}\",\"buckets\":{},\"objects\":{},\"logical_bytes\":{},\"unique_bytes\":{},\"physical_bytes\":{},\"cold_bytes\":{},\"chunks\":{},\"cold_chunks\":{},\"dedup_ratio\":{:.3},\"compression_ratio\":{:.3},\"overall_ratio\":{:.3}}}\n",
+        "{{\"io_backend\":\"{}\",\"buckets\":{},\"objects\":{},\"logical_bytes\":{},\"unique_bytes\":{},\"physical_bytes\":{},\"cold_bytes\":{},\"chunks\":{},\"cold_chunks\":{},\"dedup_ratio\":{:.3},\"compression_ratio\":{:.3},\"overall_ratio\":{:.3},\"rotation\":{}}}\n",
         st.engine.io_backend(),
         s.buckets,
         s.objects,
@@ -1144,6 +1158,7 @@ async fn stats(st: &AppState) -> S3Result<Response> {
         ratio(s.logical_bytes, s.unique_bytes),
         ratio(s.unique_bytes, stored),
         ratio(s.logical_bytes, stored),
+        serde_json::to_string(&rot).unwrap_or_default(),
     );
     Ok(Response::builder()
         .header(header::CONTENT_TYPE, "application/json")

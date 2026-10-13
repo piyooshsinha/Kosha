@@ -48,6 +48,90 @@ pub(crate) fn holder(
         .cloned()
 }
 
+/// Frame `plain` (the compressed form) as `KSH2` shards, each encrypted
+/// under the primary key when encryption at rest is on.
+fn encode_shards(
+    store: &kosha_engine::ChunkStore,
+    id: &ChunkId,
+    layout: Layout,
+    plain: &[u8],
+) -> Vec<Bytes> {
+    match store.keys() {
+        Some(keys) => erasure::encode_sealed(layout, plain, |i, p| keys.seal_shard(id, i, p)),
+        None => erasure::split_v2(layout, plain),
+    }
+}
+
+/// Decrypt the payloads of encrypted `KSH2` shards; shards that fail are
+/// dropped (treated as missing).
+fn open_shards(store: &kosha_engine::ChunkStore, id: &ChunkId, shards: Vec<Shard>) -> Vec<Shard> {
+    shards
+        .into_iter()
+        .filter_map(|mut s| {
+            let Some(tag) = s.tag else { return Some(s) };
+            match store.keys().map(|k| k.open_shard(id, s.index, &tag, &s.payload)) {
+                Some(Ok(plain)) => {
+                    s.payload = Bytes::from(plain);
+                    s.tag = None;
+                    Some(s)
+                }
+                Some(Err(e)) => {
+                    tracing::warn!(chunk = %id.to_hex(), shard = s.index, error = %e, "shard could not be decrypted");
+                    None
+                }
+                None => None,
+            }
+        })
+        .collect()
+}
+
+/// Re-encrypt this node's `KSH2` shards that are not under the primary key.
+/// Returns (rewritten, pending afterwards, legacy `KSH1` shards that can
+/// only be read with their original key).
+pub(crate) async fn rotate_shards(
+    store: &kosha_engine::ChunkStore,
+    limit: usize,
+) -> kosha_engine::Result<(usize, usize, usize)> {
+    let Some(keys) = store.keys().cloned() else {
+        return Ok((0, 0, 0));
+    };
+    let primary = keys.primary_tag();
+    let (mut done, mut pending, mut legacy) = (0, 0, 0);
+    for (id, index) in store.shard_files()? {
+        let Some(raw) = store.get_shard(&id, index).await? else {
+            continue;
+        };
+        let Some(shard) = erasure::parse(&raw) else {
+            continue;
+        };
+        match (shard.version, shard.tag) {
+            (1, _) => {
+                legacy += 1;
+                continue;
+            }
+            (_, Some(tag)) if tag != primary => {}
+            _ => continue,
+        }
+        if done >= limit {
+            pending += 1;
+            continue;
+        }
+        let tag = shard.tag.expect("checked");
+        let plain = keys.open_shard(&id, index, &tag, &shard.payload)?;
+        let (new_tag, sealed) = keys.seal_shard(&id, index, &plain);
+        let framed = erasure::frame_v2(
+            index,
+            shard.layout,
+            shard.encoded_len,
+            Some(new_tag),
+            &sealed,
+        );
+        store.replace_shard(id, index, framed).await?;
+        done += 1;
+    }
+    Ok((done, pending, legacy))
+}
+
 impl Inner {
     /// The erasure layout for a new chunk of `len` bytes, if it should be
     /// erasure coded: large enough, and enough voters to spread it.
@@ -84,13 +168,15 @@ impl Inner {
         layout: Layout,
     ) -> kosha_engine::Result<u64> {
         let store = self.engine.chunk_store();
-        let shards = tokio::task::spawn_blocking(move || {
-            store
-                .encode_external(&id, &data)
-                .map(|encoded| (encoded.len() as u64, erasure::encode(layout, &encoded)))
+        let (stored, shards) = tokio::task::spawn_blocking(move || {
+            store.compress_external(&data).map(|plain| {
+                (
+                    plain.len() as u64,
+                    encode_shards(&store, &id, layout, &plain),
+                )
+            })
         })
         .await??;
-        let (stored, shards) = shards;
         let ranked = rank_voters(self, &id);
         let first = futures::future::join_all(
             shards
@@ -208,6 +294,7 @@ impl Inner {
         }
         let store = self.engine.chunk_store();
         tokio::task::spawn_blocking(move || {
+            let shards = open_shards(&store, &id, shards);
             let encoded = erasure::decode(shards)
                 .map_err(|e| kosha_engine::Error::Corrupt(format!("chunk {}: {e}", id.to_hex())))?;
             store.decode_external(id, len, encoded)
@@ -224,12 +311,21 @@ impl Inner {
         let store = self.engine.chunk_store();
         let id = *id;
         tokio::task::spawn_blocking(move || {
+            // Rebuild in the format of the surviving shards.
+            let v2 = shards.iter().filter(|s| s.version == 2).count()
+                >= shards.iter().filter(|s| s.version == 1).count();
+            let shards = open_shards(&store, &id, shards);
             let encoded = erasure::decode(shards).ok()?;
             if let Err(e) = store.decode_external(id, len, encoded.clone()) {
                 tracing::warn!(chunk = %id.to_hex(), error = %e, "rebuilt chunk failed verification");
                 return None;
             }
-            erasure::encode(layout, &encoded).into_iter().nth(index as usize)
+            let all = if v2 {
+                encode_shards(&store, &id, layout, &encoded)
+            } else {
+                erasure::encode(layout, &encoded)
+            };
+            all.into_iter().nth(index as usize)
         })
         .await
         .ok()
@@ -253,6 +349,61 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn shards_rotate_independently_and_mixed_keys_decode() {
+        use kosha_engine::{ChunkKeys, Engine, EngineConfig, SyncMode};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = ([0xAAu8; 32], [0xBBu8; 32]);
+        let open = |keys: ChunkKeys| {
+            let mut cfg = EngineConfig::new(dir.path());
+            cfg.sync = SyncMode::None;
+            cfg.encryption = Some(Arc::new(keys));
+            Engine::open(cfg).unwrap()
+        };
+        let layout = Layout { k: 3, m: 2 };
+        let data: Vec<u8> = (0..50_000u32).map(|i| (i * 7 % 256) as u8).collect();
+        let (id, len) = {
+            let e = open(ChunkKeys::new(&a));
+            let store = e.chunk_store();
+            let id = e.chunk_id(&data);
+            let plain = store.compress_external(&data).unwrap();
+            for (i, s) in encode_shards(&store, &id, layout, &plain)
+                .into_iter()
+                .enumerate()
+            {
+                store.put_shard(id, i as u8, s).await.unwrap();
+            }
+            (id, data.len() as u32)
+        };
+        let e = open(ChunkKeys::ring(b, vec![a], None));
+        let store = e.chunk_store();
+        let tag_b = ChunkKeys::new(&b).primary_tag();
+        // Rotate only two shards first: a mix of keys still decodes.
+        assert_eq!(rotate_shards(&store, 2).await.unwrap(), (2, 3, 0));
+        let read = |store: Arc<kosha_engine::ChunkStore>| async move {
+            let mut shards = Vec::new();
+            for i in 0..5u8 {
+                shards.push(
+                    erasure::parse(&store.get_shard(&id, i).await.unwrap().unwrap()).unwrap(),
+                );
+            }
+            let tags: Vec<_> = shards.iter().map(|s| s.tag.unwrap()).collect();
+            let encoded = erasure::decode(open_shards(&store, &id, shards)).unwrap();
+            (tags, store.decode_external(id, len, encoded).unwrap())
+        };
+        let (tags, got) = read(store.clone()).await;
+        assert_eq!(got.as_ref(), data.as_slice());
+        assert_eq!(tags.iter().filter(|t| **t == tag_b).count(), 2);
+        assert_eq!(rotate_shards(&store, 100).await.unwrap(), (3, 0, 0));
+        drop(e);
+        // B alone decodes all of them.
+        let e = open(ChunkKeys::new(&b));
+        let (tags, got) = read(e.chunk_store()).await;
+        assert!(tags.iter().all(|t| *t == tag_b));
+        assert_eq!(got.as_ref(), data.as_slice());
     }
 
     #[test]

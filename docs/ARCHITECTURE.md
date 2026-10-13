@@ -435,11 +435,30 @@ roles by making encryption *deterministic per content*:
   zstd(plaintext))`. GCM-SIV is misuse-resistant: repeating a nonce with the
   same plaintext only repeats the ciphertext, which the id already reveals.
   Replicas are therefore byte-identical.
-- `K_id` and `K_enc` are derived from one master key with BLAKE3's KDF, and a
-  short fingerprint (a third derivation) is written to `chunks/ENCRYPTION`.
-  Opening a store with a different key, without a key, or adding a key to an
-  unencrypted store fails at startup. Joining a cluster compares
-  fingerprints.
+- `K_enc` is derived from a master key with BLAKE3's KDF. The keyring holds
+  a primary key, which encrypts new data, and any old keys, which only
+  decrypt. Every encrypted chunk is stored as `codec | key tag (4 bytes) |
+  ciphertext`, and the codec byte and tag are authenticated as associated
+  data.
+- `K_id` is derived once, when a data directory is created (from the
+  primary key, or from `--encryption-identity-key-file` on a node joining a
+  rotated cluster). It is kept in `chunks/ID_KEY`, sealed under the primary
+  key, and is never rotated: ids are in every manifest.
+- `chunks/ENCRYPTION` records the fingerprint of `K_id`. Opening a store
+  whose `ID_KEY` no key in the ring can open, without a key, or adding a key
+  to an unencrypted store fails at startup. Joining a cluster compares
+  identity fingerprints.
+- **Rotation** (`rotation.rs`): a background pass on every node rewrites
+  chunk files whose tag is not the primary (open, re-seal, atomic rename).
+  It also re-seals `ID_KEY` and, through the placement, re-encrypts this
+  node's shards. On the leader it re-uploads cold-tier copies under fresh
+  keys (`ChunkRemoteRekeyed`; the old copy becomes garbage).
+- **Erasure-coded shards** (`KSH2` frames) are encrypted individually, with
+  a nonce derived from the chunk id and shard index, so each node rotates
+  its own. Shards under different keys decode together, because each is
+  opened before Reed–Solomon. Older `KSH1` frames are slices of a
+  whole-encrypted stored form; they cannot be rotated shard by shard, so
+  they are reported as legacy.
 - Reads decrypt (authenticating the bytes), decompress, and re-derive the
   keyed id, so corruption and tampering are both caught.
 - Inline objects would put plaintext into the metadata, so encrypted engines
@@ -543,7 +562,7 @@ data, Prometheus metrics, object and bucket tagging, bucket CORS.
 Versioning, Object Lock (retention and legal hold) and lifecycle rules.
 Users, identity and bucket policies (with anonymous access), SigV2 header
 auth, HTTPS, mutual TLS between nodes, and dedup-preserving encryption at
-rest. Event notifications to webhooks from the replicated metadata log.
+rest with online key rotation. Event notifications to webhooks from the replicated metadata log.
 A chunk-level cold tier on any S3-compatible service, with access-based
 tiering (demote unread objects, promote on read), and erasure coding of
 cold chunks in the background. Reed–Solomon erasure
@@ -551,8 +570,6 @@ coding across nodes.
 
 **Next**
 - io_uring with registered buffers and `O_DIRECT` for large chunks.
-- Key rotation for encryption at rest (re-encrypting chunks in the
-  background under a new key).
 
 **Deliberately not built (yet)**
 

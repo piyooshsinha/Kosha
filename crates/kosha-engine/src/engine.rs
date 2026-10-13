@@ -107,6 +107,11 @@ pub trait ChunkPlacement: Send + Sync + 'static {
     fn put(&self, id: ChunkId, data: Bytes) -> BoxFuture<'static, Result<u64>>;
     /// Fetch a chunk from wherever a replica lives.
     fn get(&self, id: ChunkId, len: u32) -> BoxFuture<'static, Result<Bytes>>;
+    /// Re-encrypt up to `limit` of this node's shards under the primary key.
+    /// Returns (rewritten, pending, legacy shards that cannot be).
+    fn rotate_shards(&self, _limit: usize) -> BoxFuture<'static, Result<(usize, usize, usize)>> {
+        Box::pin(async { Ok((0, 0, 0)) })
+    }
     /// Whether cold chunks can be converted to erasure-coded shards.
     fn supports_erasure(&self) -> bool {
         false
@@ -131,6 +136,7 @@ struct Inner {
     consensus: OnceLock<Arc<dyn Consensus>>,
     placement: OnceLock<Arc<dyn ChunkPlacement>>,
     cold: OnceLock<Arc<dyn crate::tier::ColdStore>>,
+    rotation: crate::rotation::RotationCell,
     /// Reads not yet recorded, for access-based tiering.
     access_log:
         parking_lot::Mutex<std::collections::HashMap<(String, String), chrono::DateTime<Utc>>>,
@@ -218,6 +224,7 @@ impl Engine {
                 placement: OnceLock::new(),
                 cold: OnceLock::new(),
                 access_log: Default::default(),
+                rotation: Default::default(),
             }),
         })
     }
@@ -229,11 +236,7 @@ impl Engine {
 
     /// Fingerprint of the encryption key, if data is encrypted at rest.
     pub fn encryption_fingerprint(&self) -> Option<&str> {
-        self.inner
-            .cfg
-            .encryption
-            .as_deref()
-            .map(|k| k.fingerprint())
+        self.inner.store.keys().map(|k| k.fingerprint())
     }
 
     pub fn config(&self) -> &EngineConfig {
@@ -382,6 +385,10 @@ impl Engine {
 
     pub(crate) fn cold_cell(&self) -> &OnceLock<Arc<dyn crate::tier::ColdStore>> {
         &self.inner.cold
+    }
+
+    pub(crate) fn rotation_cell(&self) -> &crate::rotation::RotationCell {
+        &self.inner.rotation
     }
 
     pub(crate) fn access_log(

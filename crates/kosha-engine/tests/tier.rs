@@ -517,3 +517,53 @@ async fn access_based_tiering_demotes_unread_objects_and_promotes_on_read() {
         "{s:?}"
     );
 }
+
+#[tokio::test]
+async fn key_rotation_re_encrypts_cold_copies() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = ([0x0Au8; 32], [0x0Bu8; 32]);
+    let cold = Arc::new(MemCold::default());
+    let open = |keys: ChunkKeys| {
+        let mut cfg = EngineConfig::new(dir.path());
+        cfg.sync = SyncMode::None;
+        cfg.chunking = ChunkerConfig {
+            min: 1024,
+            avg: 4096,
+            max: 16384,
+        };
+        cfg.encryption = Some(Arc::new(keys));
+        let e = Engine::open(cfg).unwrap();
+        e.set_cold_store(Arc::new(Cold(cold.clone()))).unwrap();
+        e
+    };
+    let body = data(100_000, 31);
+    {
+        let e = open(ChunkKeys::new(&a));
+        e.create_bucket("arch").await.unwrap();
+        put(&e, "arch", "x", &body).await;
+        e.transition_objects("arch", target("x"), "GLACIER")
+            .await
+            .unwrap();
+        assert!(e.run_offloader().await.unwrap() > 0);
+    }
+    let before: Vec<String> = cold.objects.lock().keys().cloned().collect();
+    {
+        let e = open(ChunkKeys::ring(b, vec![a], None));
+        let s = e.rotate_keys(true).await.unwrap();
+        assert_eq!(
+            (s.remote_pending, s.rewritten as usize),
+            (0, before.len()),
+            "{s:?}"
+        );
+        e.collect_remote_garbage().await;
+        let after: Vec<String> = cold.objects.lock().keys().cloned().collect();
+        assert_eq!(after.len(), before.len());
+        assert!(
+            after.iter().all(|k| !before.contains(k)),
+            "old copies deleted"
+        );
+    }
+    // B alone reads the cold data.
+    let e = open(ChunkKeys::new(&b));
+    assert_eq!(get(&e, "arch", "x").await, body);
+}

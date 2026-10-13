@@ -25,6 +25,7 @@ pub mod io;
 mod keys;
 mod lifecycle;
 mod meta;
+mod rotation;
 mod tier;
 mod types;
 mod users;
@@ -33,7 +34,7 @@ mod writer;
 
 pub use chunker::ChunkerConfig;
 pub use chunkstore::{ChunkStore, StoredChunk};
-pub use crypt::ChunkKeys;
+pub use crypt::{ChunkKeys, KeyTag, read_key_file};
 pub use durability::SyncMode;
 pub use engine::{
     ChunkPlacement, Consensus, CopySource, Engine, EngineConfig, WriteStats, validate_bucket_name,
@@ -42,6 +43,7 @@ pub use error::{Error, Result};
 pub use io::{IoBackend, IoMode};
 pub use lifecycle::LifecycleReport;
 pub use meta::{Command, CommandOutput, CommandResult, Rejection, Request, RequestId};
+pub use rotation::RotationStatus;
 pub use tier::{COLD_CLASSES, ColdStore, is_cold_class};
 pub use types::*;
 pub use versions::NULL_VERSION;

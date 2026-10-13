@@ -130,3 +130,73 @@ async fn control_unencrypted_data_is_visible() {
     // An unencrypted store cannot be switched to encryption later.
     assert!(Engine::open(config(dir.path(), Some([1u8; 32]))).is_err());
 }
+
+fn ring_config(dir: &std::path::Path, primary: [u8; 32], old: Vec<[u8; 32]>) -> EngineConfig {
+    let mut cfg = config(dir, None);
+    cfg.encryption = Some(Arc::new(ChunkKeys::ring(primary, old, None)));
+    cfg
+}
+
+/// Key tags of every full chunk file (bytes 1..5 of tagged chunks).
+fn chunk_tags(dir: &std::path::Path) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.join("chunks")];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let e = e.unwrap();
+            let name = e.file_name().into_string().unwrap();
+            if e.file_type().unwrap().is_dir() {
+                if name != "tmp" {
+                    stack.push(e.path());
+                }
+            } else if name.len() == 64 {
+                out.push(std::fs::read(e.path()).unwrap()[1..5].to_vec());
+            }
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn key_rotation_lets_the_old_key_go() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = ([0xA1u8; 32], [0xB2u8; 32]);
+    let body = secret_text(150_000);
+    {
+        let e = Engine::open(config(dir.path(), Some(a))).unwrap();
+        e.create_bucket("vault").await.unwrap();
+        put(&e, "vault", "doc", &body).await;
+    }
+    let tag_a = ChunkKeys::new(&a).primary_tag().to_vec();
+    let tag_b = ChunkKeys::new(&b).primary_tag().to_vec();
+    assert!(chunk_tags(dir.path()).iter().all(|t| *t == tag_a));
+
+    // Rotate: B is primary, A still decrypts.
+    {
+        let e = Engine::open(ring_config(dir.path(), b, vec![a])).unwrap();
+        let fp = e.encryption_fingerprint().unwrap().to_string();
+        assert_eq!(get(&e, "vault", "doc").await, body);
+        put(&e, "vault", "new", b"written during rotation").await;
+        let s = e.rotate_keys(true).await.unwrap();
+        assert!(s.rewritten > 0 && s.done(), "{s:?}");
+        assert!(chunk_tags(dir.path()).iter().all(|t| *t == tag_b));
+        assert_eq!(
+            e.rotate_keys(true).await.unwrap().rewritten,
+            s.rewritten,
+            "nothing left"
+        );
+        assert_eq!(get(&e, "vault", "doc").await, body);
+        drop(e);
+        // B alone now: same identity, everything readable.
+        let e = Engine::open(config(dir.path(), Some(b))).unwrap();
+        assert_eq!(
+            e.encryption_fingerprint().unwrap(),
+            fp,
+            "identity survives rotation"
+        );
+        assert_eq!(get(&e, "vault", "doc").await, body);
+        assert_eq!(get(&e, "vault", "new").await, b"written during rotation");
+    }
+    // A alone can no longer open the directory.
+    assert!(Engine::open(config(dir.path(), Some(a))).is_err());
+}
