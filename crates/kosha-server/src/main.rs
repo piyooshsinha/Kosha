@@ -48,7 +48,8 @@ struct Args {
     #[arg(long, env = "KOSHA_COMPRESSION_LEVEL", default_value_t = 3)]
     compression_level: i32,
 
-    /// Skip fsync on writes. Faster, but recent writes can be lost on power failure.
+    /// Skip fsync of chunk files (metadata commits stay durable). Chunk data written
+    /// just before a power failure can be lost.
     #[arg(long, env = "KOSHA_NO_FSYNC")]
     no_fsync: bool,
 
