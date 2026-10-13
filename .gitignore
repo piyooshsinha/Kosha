@@ -1,3 +1,6 @@
 /target
 /data
+/dev-cluster
 *.redb
+ui/node_modules
+ui/dist

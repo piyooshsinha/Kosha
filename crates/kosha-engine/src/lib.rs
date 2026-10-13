@@ -17,12 +17,17 @@ mod chunker;
 mod chunkstore;
 mod engine;
 mod error;
+pub mod io;
 mod keys;
+mod meta;
 mod types;
 mod writer;
 
 pub use chunker::ChunkerConfig;
-pub use engine::{Engine, EngineConfig, validate_bucket_name};
+pub use chunkstore::{ChunkStore, StoredChunk};
+pub use engine::{ChunkPlacement, Consensus, Engine, EngineConfig, validate_bucket_name};
 pub use error::{Error, Result};
+pub use io::{IoBackend, IoMode};
+pub use meta::{Command, CommandOutput, CommandResult, Rejection};
 pub use types::*;
 pub use writer::{ObjectWriter, WrittenData};

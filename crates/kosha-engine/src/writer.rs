@@ -10,11 +10,20 @@ use tokio::task::JoinHandle;
 
 use crate::chunker::{Chunker, ChunkerConfig};
 use crate::chunkstore::{ChunkStore, PinSet, StoredChunk};
+use crate::engine::ChunkPlacement;
 use crate::error::Result;
 use crate::types::{ChunkId, Segment};
 
+/// Where an upload's chunks go.
+pub(crate) enum ChunkSink {
+    /// This node's chunk store (pinned until the metadata commit).
+    Local(Arc<ChunkStore>),
+    /// A cluster replica set (protected by the GC grace period).
+    Placed(Arc<dyn ChunkPlacement>),
+}
+
 pub struct ObjectWriter {
-    store: Arc<ChunkStore>,
+    sink: ChunkSink,
     chunker: Chunker,
     inline_max: usize,
     parallelism: usize,
@@ -46,6 +55,7 @@ impl WrittenData {
 
 impl ObjectWriter {
     pub(crate) fn new(
+        sink: ChunkSink,
         store: Arc<ChunkStore>,
         cfg: ChunkerConfig,
         inline_max: usize,
@@ -53,7 +63,7 @@ impl ObjectWriter {
     ) -> Self {
         let pins = Arc::new(PinSet::new(store.clone()));
         ObjectWriter {
-            store,
+            sink,
             chunker: Chunker::new(cfg),
             inline_max,
             parallelism: parallelism.max(1),
@@ -106,16 +116,34 @@ impl ObjectWriter {
             let h = self.in_flight.pop_front().expect("non-empty");
             self.complete(h.await??);
         }
-        let store = self.store.clone();
         let pins = self.pins.clone();
-        self.in_flight
-            .push_back(tokio::task::spawn_blocking(move || {
-                let c = store.put(&chunk)?;
-                // Hand the pin to the PinSet immediately so it is released even
-                // if the writer is dropped before this task is awaited.
-                pins.adopt(c.id);
-                Ok(c)
-            }));
+        let task = match &self.sink {
+            ChunkSink::Local(store) => {
+                let store = store.clone();
+                tokio::spawn(async move {
+                    let c = store.put(chunk).await?;
+                    // Hand the pin to the PinSet immediately so it is released
+                    // even if the writer is dropped before this task is awaited.
+                    pins.adopt(c.id);
+                    Ok(c)
+                })
+            }
+            ChunkSink::Placed(placement) => {
+                let placement = placement.clone();
+                tokio::spawn(async move {
+                    let (id, chunk) =
+                        tokio::task::spawn_blocking(move || (ChunkId::of(&chunk), chunk)).await?;
+                    let len = chunk.len() as u32;
+                    let stored_len = placement.put(id, chunk).await?;
+                    Ok(StoredChunk {
+                        id,
+                        len,
+                        stored_len,
+                    })
+                })
+            }
+        };
+        self.in_flight.push_back(task);
         Ok(())
     }
 

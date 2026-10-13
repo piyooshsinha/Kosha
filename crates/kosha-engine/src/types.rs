@@ -120,7 +120,7 @@ pub struct ListPage {
 }
 
 /// Preconditions evaluated atomically with a write.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct WriteCondition {
     /// `If-None-Match: *` - only write if the key does not exist.
     pub if_none_match_any: bool,

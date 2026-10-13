@@ -134,6 +134,13 @@ async fn handle(st: Arc<AppState>, req: Request) -> S3Result<Response> {
     if raw_path == "/_kosha/stats" {
         return stats(&st).await;
     }
+    if raw_path == "/_kosha/cluster" {
+        let body = match &st.cfg.cluster_status {
+            Some(p) => (p.0)(),
+            None => serde_json::json!({ "mode": "single-node" }),
+        };
+        return Ok(axum::Json(body).into_response());
+    }
 
     let (bucket, key) = resolve_target(&st, &parts.headers, &raw_path);
     let ctx = Ctx {
@@ -341,7 +348,8 @@ async fn stats(st: &AppState) -> S3Result<Response> {
     let s = st.engine.stats().await?;
     let ratio = |a: u64, b: u64| if b == 0 { 1.0 } else { a as f64 / b as f64 };
     let body = format!(
-        "{{\"buckets\":{},\"objects\":{},\"logical_bytes\":{},\"unique_bytes\":{},\"physical_bytes\":{},\"chunks\":{},\"dedup_ratio\":{:.3},\"compression_ratio\":{:.3},\"overall_ratio\":{:.3}}}\n",
+        "{{\"io_backend\":\"{}\",\"buckets\":{},\"objects\":{},\"logical_bytes\":{},\"unique_bytes\":{},\"physical_bytes\":{},\"chunks\":{},\"dedup_ratio\":{:.3},\"compression_ratio\":{:.3},\"overall_ratio\":{:.3}}}\n",
+        st.engine.io_backend(),
         s.buckets,
         s.objects,
         s.logical_bytes,

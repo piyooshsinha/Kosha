@@ -23,6 +23,18 @@ pub struct S3Config {
     pub credentials: Credentials,
     /// Enables virtual-hosted-style requests (`bucket.<domain>`).
     pub domain: Option<String>,
+    /// Source of `/_kosha/cluster` (absent on a single node).
+    pub cluster_status: Option<StatusProvider>,
+}
+
+/// Produces the JSON served at `/_kosha/cluster`.
+#[derive(Clone)]
+pub struct StatusProvider(pub Arc<dyn Fn() -> serde_json::Value + Send + Sync>);
+
+impl std::fmt::Debug for StatusProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StatusProvider")
+    }
 }
 
 impl Default for S3Config {
@@ -31,6 +43,7 @@ impl Default for S3Config {
             region: "us-east-1".into(),
             credentials: Credentials::new(),
             domain: None,
+            cluster_status: None,
         }
     }
 }

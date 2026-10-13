@@ -1,21 +1,26 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
-use kosha_engine::{Engine, EngineConfig};
-use kosha_s3::{Credentials, S3Config};
+use kosha_cluster::{Cluster, ClusterConfig};
+use kosha_engine::{Engine, EngineConfig, IoMode};
+use kosha_s3::{Credentials, S3Config, StatusProvider};
 use tracing_subscriber::EnvFilter;
+
+mod ui;
 
 /// Kosha: an S3-compatible object store with content-addressed, deduplicated storage.
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Args {
-    /// Address to listen on.
+    /// Address to listen on for the S3 API and web console.
     #[arg(long, env = "KOSHA_LISTEN", default_value = "127.0.0.1:9000")]
     listen: SocketAddr,
 
-    /// Directory holding metadata and chunk files.
+    /// Directory holding metadata, chunks and (in a cluster) the Raft log.
     #[arg(long, env = "KOSHA_DATA_DIR", default_value = "./data")]
     data_dir: PathBuf,
 
@@ -46,15 +51,56 @@ struct Args {
     /// Skip fsync on writes. Faster, but recent writes can be lost on power failure.
     #[arg(long, env = "KOSHA_NO_FSYNC")]
     no_fsync: bool,
+
+    /// Chunk I/O backend: auto (io_uring if available), uring, threads.
+    #[arg(long, env = "KOSHA_IO", default_value = "auto")]
+    io: IoMode,
+
+    // ----------------------------------------------------------- cluster
+    /// Enable cluster mode with this node id (unique, non-zero).
+    #[arg(long, env = "KOSHA_NODE_ID")]
+    node_id: Option<u64>,
+
+    /// Bind address for internal cluster traffic (Raft + chunk replication).
+    #[arg(long, env = "KOSHA_CLUSTER_LISTEN", default_value = "127.0.0.1:9100")]
+    cluster_listen: SocketAddr,
+
+    /// Address other nodes use to reach this node's cluster port (defaults to --cluster-listen).
+    #[arg(long, env = "KOSHA_CLUSTER_ADVERTISE")]
+    cluster_advertise: Option<String>,
+
+    /// Address of this node's S3 API as clients see it (shown in the console).
+    #[arg(long, env = "KOSHA_API_ADVERTISE")]
+    api_advertise: Option<String>,
+
+    /// Shared secret for internal cluster traffic (same on every node).
+    #[arg(long, env = "KOSHA_CLUSTER_SECRET", hide_env_values = true)]
+    cluster_secret: Option<String>,
+
+    /// Bootstrap a new cluster with this node as its first member.
+    #[arg(long, env = "KOSHA_INIT")]
+    init: bool,
+
+    /// Join an existing cluster through any member's cluster address.
+    #[arg(long, env = "KOSHA_JOIN")]
+    join: Option<String>,
+
+    /// Copies of every chunk across the cluster.
+    #[arg(long, env = "KOSHA_REPLICATION", default_value_t = 2)]
+    replication: usize,
+
+    /// Seconds an unreferenced chunk file is kept before it may be collected
+    /// (gives uploads on other nodes time to commit).
+    #[arg(long, env = "KOSHA_GC_GRACE_SECS", default_value_t = 900)]
+    gc_grace_secs: u64,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "kosha=info,kosha_s3=info,kosha_engine=info".into()),
-        )
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            "kosha=info,kosha_s3=info,kosha_engine=info,kosha_cluster=info,openraft=warn".into()
+        }))
         .init();
     let args = Args::parse();
 
@@ -72,30 +118,92 @@ async fn main() -> anyhow::Result<()> {
         _ => anyhow::bail!("KOSHA_ACCESS_KEY and KOSHA_SECRET_KEY must be set together"),
     };
 
+    let clustered = args.node_id.is_some();
     let mut cfg = EngineConfig::new(&args.data_dir);
     cfg.compression_level = args.compression_level;
     cfg.fsync = !args.no_fsync;
+    cfg.io_mode = args.io;
+    // A single node protects in-flight uploads with pins alone; a cluster also
+    // needs the grace period for uploads coordinated by other nodes.
+    cfg.gc_grace = if clustered {
+        Duration::from_secs(args.gc_grace_secs)
+    } else {
+        Duration::ZERO
+    };
     let engine = Engine::open(cfg)
         .with_context(|| format!("opening data directory {}", args.data_dir.display()))?;
+    tracing::info!(io = engine.io_backend(), "storage engine ready");
 
-    let app = kosha_s3::router(
-        engine,
-        S3Config {
-            region: args.region,
-            credentials,
-            domain: args.domain,
-        },
-    );
+    let mut s3 = S3Config {
+        region: args.region.clone(),
+        credentials,
+        domain: args.domain.clone(),
+        cluster_status: None,
+    };
 
+    let cluster = match args.node_id {
+        None => None,
+        Some(0) => anyhow::bail!("--node-id must be non-zero"),
+        Some(id) => {
+            let secret = args
+                .cluster_secret
+                .clone()
+                .context("cluster mode requires --cluster-secret / KOSHA_CLUSTER_SECRET")?;
+            anyhow::ensure!(
+                secret.len() >= 16,
+                "the cluster secret must be at least 16 characters"
+            );
+            let mut ccfg =
+                ClusterConfig::new(id, args.cluster_listen, secret, args.data_dir.join("raft"));
+            ccfg.advertise = args
+                .cluster_advertise
+                .clone()
+                .unwrap_or_else(|| args.cluster_listen.to_string());
+            ccfg.api_addr = args
+                .api_advertise
+                .clone()
+                .unwrap_or_else(|| args.listen.to_string());
+            ccfg.replication = args.replication.max(1);
+            let cluster = Cluster::start(engine.clone(), ccfg).await?;
+            if args.init {
+                cluster.initialize().await?;
+            }
+            if let Some(seed) = &args.join {
+                cluster.join(seed).await?;
+            }
+            if !cluster.is_initialized().await {
+                tracing::warn!(
+                    "this node is not part of a cluster yet: start one with --init or join one with --join"
+                );
+            }
+            let c = cluster.clone();
+            s3.cluster_status = Some(StatusProvider(Arc::new(move || {
+                serde_json::to_value(c.status()).unwrap_or_default()
+            })));
+            Some(cluster)
+        }
+    };
+
+    engine.spawn_sweeper(Duration::from_secs(600));
+
+    let app = ui::router().merge(kosha_s3::router(engine, s3));
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await
         .with_context(|| format!("binding {}", args.listen))?;
-    tracing::info!(listen = %args.listen, data_dir = %args.data_dir.display(), "Kosha is ready");
+    tracing::info!(
+        listen = %args.listen,
+        console = %format!("http://{}/_kosha/ui/", args.listen),
+        mode = if clustered { "cluster" } else { "single-node" },
+        "Kosha is ready"
+    );
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
             tracing::info!("shutting down");
         })
         .await?;
+    if let Some(c) = cluster {
+        c.shutdown().await;
+    }
     Ok(())
 }

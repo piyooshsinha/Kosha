@@ -1,0 +1,607 @@
+//! Kosha clustering: Raft-replicated metadata and rendezvous-placed chunks.
+//!
+//! * **Metadata** goes through a Raft log (openraft). Every node applies
+//!   the same command sequence to its own redb state machine.
+//! * **Writes** are proposed to the leader. A follower forwards them and then
+//!   waits until it has applied the entry itself, so a client always reads its
+//!   own writes on whichever node it talks to.
+//! * **Reads** are linearizable via ReadIndex: the leader confirms its
+//!   leadership with a quorum and returns its commit index, and the reading
+//!   node waits until it has applied that index.
+//! * **Chunks** are stored on `replication` nodes picked by rendezvous
+//!   hashing of the chunk id over the voters. Unreachable nodes are skipped
+//!   (the next-ranked node takes the replica), reads try nodes in rank order
+//!   and verify content hashes, and a node that should hold a chunk but does
+//!   not repairs itself on read.
+
+// openraft's trait signatures fix the (large) `StorageError` type.
+#![allow(clippy::result_large_err)]
+
+mod log_store;
+mod network;
+mod rpc;
+mod server;
+mod state_machine;
+mod types;
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use bytes::Bytes;
+use futures::future::BoxFuture;
+use kosha_engine::{ChunkId, ChunkPlacement, Command, CommandResult, Consensus, Engine};
+use openraft::error::{CheckIsLeaderError, ClientWriteError, RaftError};
+use openraft::{ChangeMembers, ServerState};
+use serde::Serialize;
+
+use crate::rpc::{Client, JoinRequest, LeaderReply, Proposed};
+use crate::types::*;
+pub use crate::types::{KoshaNode, NodeId};
+
+#[derive(Clone, Debug)]
+pub struct ClusterConfig {
+    pub node_id: NodeId,
+    /// Bind address for internal traffic (Raft, chunk replication).
+    pub listen: SocketAddr,
+    /// Address other nodes use to reach `listen` (`host:port`).
+    pub advertise: String,
+    /// This node's public S3 address, shown in cluster status.
+    pub api_addr: String,
+    /// Shared secret authenticating internal requests.
+    pub secret: String,
+    /// Copies of each chunk.
+    pub replication: usize,
+    /// Directory for the Raft log and snapshots.
+    pub data_dir: PathBuf,
+    pub heartbeat_ms: u64,
+    pub election_timeout_ms: (u64, u64),
+    /// Build a snapshot after this many new log entries.
+    pub snapshot_every: u64,
+    /// Log entries kept behind the latest snapshot (lets slow followers catch
+    /// up from the log instead of a full snapshot).
+    pub logs_to_keep: u64,
+}
+
+impl ClusterConfig {
+    pub fn new(
+        node_id: NodeId,
+        listen: SocketAddr,
+        secret: impl Into<String>,
+        data_dir: impl Into<PathBuf>,
+    ) -> Self {
+        ClusterConfig {
+            node_id,
+            listen,
+            advertise: listen.to_string(),
+            api_addr: String::new(),
+            secret: secret.into(),
+            replication: 2,
+            data_dir: data_dir.into(),
+            heartbeat_ms: 250,
+            election_timeout_ms: (1000, 2000),
+            snapshot_every: 10_000,
+            logs_to_keep: 1_000,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ClusterError {
+    #[error("{0}")]
+    Storage(#[from] StorageError),
+    #[error("raft: {0}")]
+    Raft(String),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("engine: {0}")]
+    Engine(#[from] kosha_engine::Error),
+    #[error("{0}")]
+    Join(String),
+}
+
+pub(crate) struct Inner {
+    pub raft: Raft,
+    pub engine: Engine,
+    pub cfg: ClusterConfig,
+    pub client: Client,
+}
+
+/// A running cluster member.
+#[derive(Clone)]
+pub struct Cluster {
+    inner: Arc<Inner>,
+    server: Arc<tokio::task::JoinHandle<()>>,
+}
+
+const FORWARD_TIMEOUT: Duration = Duration::from_secs(30);
+const APPLY_WAIT: Duration = Duration::from_secs(30);
+const RETRIES: u32 = 50;
+
+fn backoff(attempt: u32) -> Duration {
+    Duration::from_millis((50 * (attempt as u64 + 1)).min(500))
+}
+
+impl Cluster {
+    /// Start Raft and the internal endpoint, and route the engine's metadata
+    /// and chunks through the cluster.
+    pub async fn start(engine: Engine, cfg: ClusterConfig) -> Result<Cluster, ClusterError> {
+        std::fs::create_dir_all(&cfg.data_dir)?;
+        let log = log_store::LogStore::open(&cfg.data_dir.join("raft-log.redb"))?;
+        let sm = state_machine::StateMachine::open(
+            engine.clone(),
+            cfg.data_dir.join("raft-snapshot.bin"),
+        )?;
+        let client = Client::new(cfg.secret.clone());
+
+        let raft_cfg = openraft::Config {
+            cluster_name: "kosha".into(),
+            heartbeat_interval: cfg.heartbeat_ms,
+            election_timeout_min: cfg.election_timeout_ms.0,
+            election_timeout_max: cfg.election_timeout_ms.1,
+            snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(cfg.snapshot_every),
+            max_in_snapshot_log_to_keep: cfg.logs_to_keep,
+            install_snapshot_timeout: 10_000,
+            ..Default::default()
+        }
+        .validate()
+        .map_err(|e| ClusterError::Raft(e.to_string()))?;
+
+        let raft = Raft::new(
+            cfg.node_id,
+            Arc::new(raft_cfg),
+            network::NetworkFactory {
+                client: client.clone(),
+            },
+            log,
+            sm,
+        )
+        .await
+        .map_err(|e| ClusterError::Raft(e.to_string()))?;
+
+        let inner = Arc::new(Inner {
+            raft,
+            engine: engine.clone(),
+            cfg: cfg.clone(),
+            client,
+        });
+        engine.attach_cluster(
+            Arc::new(RaftConsensus {
+                inner: inner.clone(),
+            }),
+            Arc::new(RendezvousPlacement {
+                inner: inner.clone(),
+            }),
+        )?;
+
+        let listener = tokio::net::TcpListener::bind(cfg.listen).await?;
+        let app = server::router(inner.clone());
+        let server = tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, app).await {
+                tracing::error!(error = %e, "cluster endpoint stopped");
+            }
+        });
+        tracing::info!(node = cfg.node_id, listen = %cfg.listen, "cluster endpoint ready");
+        Ok(Cluster {
+            inner,
+            server: Arc::new(server),
+        })
+    }
+
+    pub fn node_id(&self) -> NodeId {
+        self.inner.cfg.node_id
+    }
+
+    pub fn raft(&self) -> &Raft {
+        &self.inner.raft
+    }
+
+    fn self_node(&self) -> KoshaNode {
+        KoshaNode {
+            addr: self.inner.cfg.advertise.clone(),
+            api: self.inner.cfg.api_addr.clone(),
+        }
+    }
+
+    pub async fn is_initialized(&self) -> bool {
+        self.inner.raft.is_initialized().await.unwrap_or(false)
+    }
+
+    /// Bootstrap a new single-member cluster (no-op if already initialized).
+    pub async fn initialize(&self) -> Result<(), ClusterError> {
+        if self.is_initialized().await {
+            return Ok(());
+        }
+        let members = BTreeMap::from([(self.node_id(), self.self_node())]);
+        self.inner
+            .raft
+            .initialize(members)
+            .await
+            .map_err(|e| ClusterError::Raft(e.to_string()))
+    }
+
+    /// Ask an existing member (any node; it redirects to the leader) to add
+    /// this node as a voter. No-op if this node already has cluster state.
+    pub async fn join(&self, seed: &str) -> Result<(), ClusterError> {
+        if self.is_initialized().await {
+            return Ok(());
+        }
+        let req = JoinRequest {
+            id: self.node_id(),
+            node: self.self_node(),
+        };
+        let mut target = seed.to_string();
+        let mut last_err = String::new();
+        for attempt in 0..RETRIES {
+            match self
+                .inner
+                .client
+                .call::<_, LeaderReply<()>>(&target, "/cluster/join", &req, FORWARD_TIMEOUT)
+                .await
+            {
+                Ok(LeaderReply::Ok(())) => {
+                    tracing::info!(node = self.node_id(), "joined cluster");
+                    return Ok(());
+                }
+                Ok(LeaderReply::NotLeader(Some((_, leader)))) => target = leader.addr,
+                Ok(LeaderReply::NotLeader(None)) => last_err = "no leader elected yet".into(),
+                Err(e) => last_err = e.to_string(),
+            }
+            tokio::time::sleep(backoff(attempt)).await;
+        }
+        Err(ClusterError::Join(last_err))
+    }
+
+    /// Remove a node from the voter set (run on any member).
+    pub async fn remove_node(&self, id: NodeId) -> Result<(), ClusterError> {
+        self.inner
+            .raft
+            .change_membership(ChangeMembers::RemoveVoters(BTreeSet::from([id])), false)
+            .await
+            .map(drop)
+            .map_err(|e| ClusterError::Raft(e.to_string()))
+    }
+
+    pub fn status(&self) -> ClusterStatus {
+        status(&self.inner)
+    }
+
+    /// Wait until some node is leader (useful at startup and in tests).
+    pub async fn wait_for_leader(&self, timeout: Duration) -> Result<NodeId, ClusterError> {
+        let m = self
+            .inner
+            .raft
+            .wait(Some(timeout))
+            .metrics(|m| m.current_leader.is_some(), "leader elected")
+            .await
+            .map_err(|e| ClusterError::Raft(e.to_string()))?;
+        Ok(m.current_leader.expect("checked"))
+    }
+
+    /// Stop Raft and the internal endpoint (simulates a node failure in tests).
+    pub async fn shutdown(&self) {
+        self.server.abort();
+        let _ = self.inner.raft.shutdown().await;
+    }
+}
+
+// ------------------------------------------------------------------ status
+
+#[derive(Clone, Debug, Serialize)]
+pub struct NodeStatus {
+    pub id: NodeId,
+    pub addr: String,
+    pub api: String,
+    pub voter: bool,
+    /// Highest log index known replicated to this node (leader view only).
+    pub matched: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ClusterStatus {
+    pub node_id: NodeId,
+    pub state: String,
+    pub term: u64,
+    pub leader: Option<NodeId>,
+    pub last_log_index: Option<u64>,
+    pub last_applied: Option<u64>,
+    pub snapshot_index: Option<u64>,
+    pub replication_factor: usize,
+    pub nodes: Vec<NodeStatus>,
+}
+
+fn status(inner: &Inner) -> ClusterStatus {
+    let m = inner.raft.metrics().borrow().clone();
+    let membership = m.membership_config.membership();
+    let voters: BTreeSet<NodeId> = membership.voter_ids().collect();
+    let nodes = membership
+        .nodes()
+        .map(|(id, n)| NodeStatus {
+            id: *id,
+            addr: n.addr.clone(),
+            api: n.api.clone(),
+            voter: voters.contains(id),
+            matched: m
+                .replication
+                .as_ref()
+                .and_then(|r| r.get(id).cloned().flatten())
+                .map(|l| l.index),
+        })
+        .collect();
+    ClusterStatus {
+        node_id: m.id,
+        state: match m.state {
+            ServerState::Leader => "leader",
+            ServerState::Follower => "follower",
+            ServerState::Candidate => "candidate",
+            ServerState::Learner => "learner",
+            ServerState::Shutdown => "shutdown",
+        }
+        .into(),
+        term: m.current_term,
+        leader: m.current_leader,
+        last_log_index: m.last_log_index,
+        last_applied: m.last_applied.map(|l| l.index),
+        snapshot_index: m.snapshot.map(|l| l.index),
+        replication_factor: inner.cfg.replication,
+        nodes,
+    }
+}
+
+// --------------------------------------------------------------- consensus
+
+struct RaftConsensus {
+    inner: Arc<Inner>,
+}
+
+fn raft_err(e: impl std::fmt::Display) -> kosha_engine::Error {
+    kosha_engine::Error::Internal(format!("raft: {e}"))
+}
+
+impl Inner {
+    async fn wait_applied(&self, index: u64) -> kosha_engine::Result<()> {
+        self.raft
+            .wait(Some(APPLY_WAIT))
+            .applied_index_at_least(Some(index), "local apply")
+            .await
+            .map(drop)
+            .map_err(raft_err)
+    }
+
+    async fn propose(&self, cmd: Command) -> kosha_engine::Result<CommandResult> {
+        let mut last = String::from("no leader");
+        for attempt in 0..RETRIES {
+            match self.raft.client_write(cmd.clone()).await {
+                Ok(resp) => {
+                    return resp.data.0.ok_or_else(|| {
+                        kosha_engine::Error::Internal("missing command result".into())
+                    });
+                }
+                Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) => {
+                    if let Some(leader) = f.leader_node {
+                        match self
+                            .client
+                            .call::<_, LeaderReply<Proposed>>(
+                                &leader.addr,
+                                "/raft/propose",
+                                &cmd,
+                                FORWARD_TIMEOUT,
+                            )
+                            .await
+                        {
+                            Ok(LeaderReply::Ok(p)) => {
+                                // Read-your-writes on this node.
+                                self.wait_applied(p.index).await?;
+                                return Ok(p.result);
+                            }
+                            Ok(LeaderReply::NotLeader(_)) => last = "leader changed".into(),
+                            Err(e) => last = e.to_string(),
+                        }
+                    }
+                }
+                Err(e) => last = e.to_string(),
+            }
+            tokio::time::sleep(backoff(attempt)).await;
+        }
+        Err(kosha_engine::Error::Internal(format!(
+            "cluster unavailable for writes: {last}"
+        )))
+    }
+
+    async fn read_barrier(&self) -> kosha_engine::Result<()> {
+        let mut last = String::from("no leader");
+        for attempt in 0..RETRIES {
+            match self.raft.ensure_linearizable().await {
+                Ok(_) => return Ok(()),
+                Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(f))) => {
+                    if let Some(leader) = f.leader_node {
+                        match self
+                            .client
+                            .call::<_, LeaderReply<Option<u64>>>(
+                                &leader.addr,
+                                "/raft/read-index",
+                                &(),
+                                FORWARD_TIMEOUT,
+                            )
+                            .await
+                        {
+                            Ok(LeaderReply::Ok(index)) => {
+                                if let Some(i) = index {
+                                    self.wait_applied(i).await?;
+                                }
+                                return Ok(());
+                            }
+                            Ok(LeaderReply::NotLeader(_)) => last = "leader changed".into(),
+                            Err(e) => last = e.to_string(),
+                        }
+                    }
+                }
+                Err(e) => last = e.to_string(),
+            }
+            tokio::time::sleep(backoff(attempt)).await;
+        }
+        Err(kosha_engine::Error::Internal(format!(
+            "cluster unavailable for reads: {last}"
+        )))
+    }
+}
+
+impl Consensus for RaftConsensus {
+    fn propose(&self, cmd: Command) -> BoxFuture<'static, kosha_engine::Result<CommandResult>> {
+        let inner = self.inner.clone();
+        Box::pin(async move { inner.propose(cmd).await })
+    }
+
+    fn read_barrier(&self) -> BoxFuture<'static, kosha_engine::Result<()>> {
+        let inner = self.inner.clone();
+        Box::pin(async move { inner.read_barrier().await })
+    }
+}
+
+// --------------------------------------------------------------- placement
+
+struct RendezvousPlacement {
+    inner: Arc<Inner>,
+}
+
+/// Voters ordered by rendezvous (highest-random-weight) score for `id`.
+/// Every node computes the same order without coordination, and adding or
+/// removing a node only moves the chunks that rank it first.
+fn rank(inner: &Inner, id: &ChunkId) -> Vec<(NodeId, KoshaNode)> {
+    let m = inner.raft.metrics().borrow().clone();
+    let membership = m.membership_config.membership();
+    let voters: BTreeSet<NodeId> = membership.voter_ids().collect();
+    let mut nodes: Vec<(NodeId, KoshaNode, [u8; 32])> = membership
+        .nodes()
+        .filter(|(n, _)| voters.contains(n))
+        .map(|(n, node)| {
+            let mut h = blake3::Hasher::new();
+            h.update(&id.0);
+            h.update(&n.to_le_bytes());
+            (*n, node.clone(), *h.finalize().as_bytes())
+        })
+        .collect();
+    nodes.sort_by_key(|n| std::cmp::Reverse(n.2));
+    nodes.into_iter().map(|(n, node, _)| (n, node)).collect()
+}
+
+impl Inner {
+    async fn store_replica(
+        &self,
+        node: &(NodeId, KoshaNode),
+        id: ChunkId,
+        data: Bytes,
+    ) -> kosha_engine::Result<u64> {
+        if node.0 == self.cfg.node_id {
+            Ok(self
+                .engine
+                .chunk_store()
+                .put_replica(id, data)
+                .await?
+                .stored_len)
+        } else {
+            self.client
+                .put_chunk(&node.1.addr, &id.to_hex(), data)
+                .await
+                .map_err(|e| {
+                    kosha_engine::Error::Internal(format!("replica to node {}: {e}", node.0))
+                })
+        }
+    }
+
+    async fn place(self: Arc<Self>, id: ChunkId, data: Bytes) -> kosha_engine::Result<u64> {
+        let ranked = rank(&self, &id);
+        let want = self.cfg.replication.clamp(1, ranked.len().max(1));
+        let mut stored = 0u64;
+        let mut ok = 0usize;
+        // Write the preferred replicas in parallel, then fall back down the
+        // ranking for any that failed.
+        let first = futures::future::join_all(
+            ranked
+                .iter()
+                .take(want)
+                .map(|n| self.store_replica(n, id, data.clone())),
+        )
+        .await;
+        for r in first {
+            match r {
+                Ok(s) => {
+                    ok += 1;
+                    stored = stored.max(s);
+                }
+                Err(e) => tracing::warn!(error = %e, "replica write failed, trying next node"),
+            }
+        }
+        for n in ranked.iter().skip(want) {
+            if ok >= want {
+                break;
+            }
+            match self.store_replica(n, id, data.clone()).await {
+                Ok(s) => {
+                    ok += 1;
+                    stored = stored.max(s);
+                }
+                Err(e) => tracing::warn!(error = %e, "fallback replica write failed"),
+            }
+        }
+        if ok < want {
+            return Err(kosha_engine::Error::Internal(format!(
+                "stored {ok} of {want} replicas for chunk {}",
+                id.to_hex()
+            )));
+        }
+        Ok(stored)
+    }
+
+    async fn fetch(self: Arc<Self>, id: ChunkId, len: u32) -> kosha_engine::Result<Bytes> {
+        let store = self.engine.chunk_store();
+        if store.has(&id) {
+            match store.get(&id, len).await {
+                Ok(b) => return Ok(b),
+                Err(e) => tracing::warn!(error = %e, "local replica unusable, fetching remotely"),
+            }
+        }
+        let ranked = rank(&self, &id);
+        let want = self.cfg.replication.clamp(1, ranked.len().max(1));
+        let should_hold = ranked
+            .iter()
+            .take(want)
+            .any(|(n, _)| *n == self.cfg.node_id);
+        for (n, node) in ranked.iter().filter(|(n, _)| *n != self.cfg.node_id) {
+            match self.client.get_chunk(&node.addr, &id.to_hex(), len).await {
+                Ok(data) if data.len() == len as usize && ChunkId::of(&data) == id => {
+                    if should_hold {
+                        // Read-repair: this node is a designated replica.
+                        let (store, data) = (store.clone(), data.clone());
+                        tokio::spawn(async move {
+                            if let Err(e) = store.put_replica(id, data).await {
+                                tracing::warn!(error = %e, "read-repair failed");
+                            }
+                        });
+                    }
+                    return Ok(data);
+                }
+                Ok(_) => {
+                    tracing::warn!(node = n, chunk = %id.to_hex(), "replica failed verification")
+                }
+                Err(e) => tracing::debug!(node = n, error = %e, "replica fetch failed"),
+            }
+        }
+        Err(kosha_engine::Error::Corrupt(format!(
+            "chunk {} is unavailable on every replica",
+            id.to_hex()
+        )))
+    }
+}
+
+impl ChunkPlacement for RendezvousPlacement {
+    fn put(&self, id: ChunkId, data: Bytes) -> BoxFuture<'static, kosha_engine::Result<u64>> {
+        Box::pin(self.inner.clone().place(id, data))
+    }
+
+    fn get(&self, id: ChunkId, len: u32) -> BoxFuture<'static, kosha_engine::Result<Bytes>> {
+        Box::pin(self.inner.clone().fetch(id, len))
+    }
+}
