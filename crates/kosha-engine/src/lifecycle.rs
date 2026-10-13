@@ -28,6 +28,8 @@ pub struct LifecycleReport {
     /// Delete markers removed because no other version remained.
     pub markers_removed: u64,
     pub uploads_aborted: u64,
+    /// Current objects moved to the cold tier.
+    pub transitioned: u64,
     /// Actions refused by Object Lock.
     pub refused: u64,
 }
@@ -133,6 +135,61 @@ impl Engine {
             }
             self.delete_batch(bucket, &mut targets, report, |r| &mut r.expired)
                 .await?;
+        }
+
+        // Transition current objects to the cold tier.
+        let transition_due = |t: DateTime<Utc>| {
+            rule.transition_days.is_some_and(|d| older_than(t, d, now))
+                || rule.transition_date.is_some_and(|d| now >= d)
+        };
+        if let Some(class) = &rule.transition_class
+            && self.has_cold_store()
+        {
+            let mut targets = Vec::new();
+            let mut after = None;
+            loop {
+                let page = self
+                    .list_objects(
+                        bucket,
+                        ListQuery {
+                            prefix: rule.prefix.clone(),
+                            delimiter: None,
+                            start_after: after.clone(),
+                            max_keys: BATCH,
+                        },
+                    )
+                    .await?;
+                for o in &page.objects {
+                    if o.storage_class.is_some()
+                        || !transition_due(o.last_modified)
+                        || expires(o.last_modified)
+                    {
+                        continue;
+                    }
+                    if !rule.tags.is_empty() {
+                        match self.head_object(bucket, &o.key).await {
+                            Ok(m) if tags_match(rule, &m.attrs.tags) => {}
+                            _ => continue,
+                        }
+                    }
+                    targets.push(DeleteTarget {
+                        key: o.key.clone(),
+                        version_id: None,
+                    });
+                    if targets.len() >= BATCH {
+                        report.transitioned += self
+                            .transition_objects(bucket, std::mem::take(&mut targets), class)
+                            .await?;
+                    }
+                }
+                if !page.is_truncated {
+                    break;
+                }
+                after = page.next_marker;
+            }
+            if !targets.is_empty() {
+                report.transitioned += self.transition_objects(bucket, targets, class).await?;
+            }
         }
 
         // Noncurrent versions and lone delete markers (versioned buckets).

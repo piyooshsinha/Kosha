@@ -213,6 +213,18 @@ async fn metrics_response(st: &AppState) -> S3Result<Response> {
         s.physical_bytes,
     );
     gauge(&mut out, "kosha_chunks", "Unique chunks.", s.chunks);
+    gauge(
+        &mut out,
+        "kosha_cold_bytes",
+        "Bytes of chunks stored in the cold tier.",
+        s.cold_bytes,
+    );
+    gauge(
+        &mut out,
+        "kosha_cold_chunks",
+        "Chunks stored in the cold tier.",
+        s.cold_chunks,
+    );
     let w = st.engine.write_stats();
     counter(
         &mut out,
@@ -815,6 +827,11 @@ async fn bucket_config(ctx: &Ctx, bucket: &str, body: Body) -> S3Result<Option<R
         return Ok(Some(match *m {
             Method::PUT => {
                 let rules = crate::protection::parse_lifecycle(&read_text(ctx, body).await?)?;
+                if rules.iter().any(|r| r.transition_class.is_some()) && !engine.has_cold_store() {
+                    return Err(S3Error::invalid_request(
+                        "Transition rules need a cold tier, and none is configured on this server",
+                    ));
+                }
                 engine
                     .set_bucket_config(bucket, BucketConfigUpdate::Lifecycle(Some(rules)))
                     .await?;
@@ -1040,18 +1057,22 @@ async fn list_buckets(ctx: &Ctx) -> S3Result<Response> {
 async fn stats(st: &AppState) -> S3Result<Response> {
     let s = st.engine.stats().await?;
     let ratio = |a: u64, b: u64| if b == 0 { 1.0 } else { a as f64 / b as f64 };
+    // Stored bytes live locally or in the cold tier.
+    let stored = s.physical_bytes + s.cold_bytes;
     let body = format!(
-        "{{\"io_backend\":\"{}\",\"buckets\":{},\"objects\":{},\"logical_bytes\":{},\"unique_bytes\":{},\"physical_bytes\":{},\"chunks\":{},\"dedup_ratio\":{:.3},\"compression_ratio\":{:.3},\"overall_ratio\":{:.3}}}\n",
+        "{{\"io_backend\":\"{}\",\"buckets\":{},\"objects\":{},\"logical_bytes\":{},\"unique_bytes\":{},\"physical_bytes\":{},\"cold_bytes\":{},\"chunks\":{},\"cold_chunks\":{},\"dedup_ratio\":{:.3},\"compression_ratio\":{:.3},\"overall_ratio\":{:.3}}}\n",
         st.engine.io_backend(),
         s.buckets,
         s.objects,
         s.logical_bytes,
         s.unique_bytes,
         s.physical_bytes,
+        s.cold_bytes,
         s.chunks,
+        s.cold_chunks,
         ratio(s.logical_bytes, s.unique_bytes),
-        ratio(s.unique_bytes, s.physical_bytes),
-        ratio(s.logical_bytes, s.physical_bytes),
+        ratio(s.unique_bytes, stored),
+        ratio(s.logical_bytes, stored),
     );
     Ok(Response::builder()
         .header(header::CONTENT_TYPE, "application/json")
@@ -1204,7 +1225,10 @@ async fn list_objects(ctx: &Ctx, bucket: &str) -> S3Result<Response> {
             .elem("LastModified", iso8601(&o.last_modified))
             .elem("ETag", quoted(&o.etag))
             .elem("Size", o.size.to_string())
-            .elem("StorageClass", "STANDARD");
+            .elem(
+                "StorageClass",
+                o.storage_class.as_deref().unwrap_or("STANDARD"),
+            );
         if fetch_owner {
             x.open("Owner")
                 .elem("ID", OWNER_ID)
@@ -1469,15 +1493,40 @@ async fn ingest(ctx: &Ctx, body: Body) -> S3Result<kosha_engine::WrittenData> {
     Ok(data)
 }
 
+/// `x-amz-storage-class`: `None` for STANDARD, or a cold class (which
+/// needs a configured cold tier).
+fn storage_class(ctx: &Ctx) -> S3Result<Option<String>> {
+    match ctx.header("x-amz-storage-class") {
+        None | Some("STANDARD") | Some("REDUCED_REDUNDANCY") => Ok(None),
+        Some(c) if kosha_engine::is_cold_class(c) => {
+            if ctx.engine().has_cold_store() {
+                Ok(Some(c.to_string()))
+            } else {
+                Err(S3Error::new(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidStorageClass",
+                    format!("{c} needs a cold tier, and none is configured on this server"),
+                ))
+            }
+        }
+        Some(c) => Err(S3Error::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidStorageClass",
+            format!("The storage class you specified is not valid: {c}"),
+        )),
+    }
+}
+
 async fn put_object(ctx: &Ctx, bucket: &str, key: &str, body: Body) -> S3Result<Response> {
     // Fail fast before reading a potentially large body.
     ctx.engine().bucket(bucket).await?;
     let lock = crate::protection::lock_from_headers(&ctx.headers)?;
     let attrs = attrs_with_tags(&ctx.headers)?;
+    let class = storage_class(ctx)?;
     let data = ingest(ctx, body).await?;
     let meta = ctx
         .engine()
-        .put_object_locked(bucket, key, data, attrs, write_condition(ctx), lock)
+        .put_object_as(bucket, key, data, attrs, write_condition(ctx), lock, class)
         .await?;
     let resp = Response::builder()
         .header(header::ETAG, quoted(&meta.etag))
@@ -1735,6 +1784,7 @@ async fn copy_object(ctx: &Ctx, bucket: &str, key: &str) -> S3Result<Response> {
             Some(attrs),
             write_condition(ctx),
             lock,
+            storage_class(ctx)?,
         )
         .await?;
     let mut x = Xml::new("CopyObjectResult");
@@ -1900,6 +1950,9 @@ async fn get_object(ctx: &Ctx, bucket: &str, key: &str) -> S3Result<Response> {
     if !meta.attrs.tags.is_empty() {
         b = b.header("x-amz-tagging-count", meta.attrs.tags.len().to_string());
     }
+    if let Some(class) = &meta.storage_class {
+        b = b.header("x-amz-storage-class", class);
+    }
 
     let range = match ctx.header("range") {
         Some(r) => parse_range(r, meta.size)?,
@@ -1929,10 +1982,16 @@ async fn get_object(ctx: &Ctx, bucket: &str, key: &str) -> S3Result<Response> {
 async fn create_upload(ctx: &Ctx, bucket: &str, key: &str) -> S3Result<Response> {
     let info = ctx
         .engine()
-        .create_upload_with(bucket, key, attrs_with_tags(&ctx.headers)?, {
-            let lock = crate::protection::lock_from_headers(&ctx.headers)?;
-            (lock != kosha_engine::ObjectLockState::default()).then_some(lock)
-        })
+        .create_upload_with(
+            bucket,
+            key,
+            attrs_with_tags(&ctx.headers)?,
+            {
+                let lock = crate::protection::lock_from_headers(&ctx.headers)?;
+                (lock != kosha_engine::ObjectLockState::default()).then_some(lock)
+            },
+            storage_class(ctx)?,
+        )
         .await?;
     let mut x = Xml::new("InitiateMultipartUploadResult");
     x.elem("Bucket", bucket)

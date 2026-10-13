@@ -29,7 +29,7 @@ use crate::types::*;
 
 pub(crate) const BUCKETS: TableDefinition<&str, &[u8]> = TableDefinition::new("buckets");
 pub(crate) const OBJECTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("objects");
-const CHUNKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("chunks");
+pub(crate) const CHUNKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("chunks");
 const UPLOADS: TableDefinition<&str, &[u8]> = TableDefinition::new("uploads");
 const UPLOAD_INDEX: TableDefinition<&[u8], &str> = TableDefinition::new("upload_index");
 const PARTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("parts");
@@ -42,6 +42,8 @@ const REQUEST_SEQ: TableDefinition<&[u8], &[u8]> = TableDefinition::new("request
 /// Every version of every key in versioned buckets (see `versions.rs`).
 /// `target \0 seq` (big-endian) -> `Event`: undelivered notifications.
 pub(crate) const EVENTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("events");
+/// chunk id -> length: chunks waiting to be copied to the cold tier.
+pub(crate) const TIER_QUEUE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("tier_queue");
 /// access key -> `User`.
 pub(crate) const USERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("users");
 pub(crate) const VERSIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("versions");
@@ -49,7 +51,7 @@ pub(crate) const VERSIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new(
 /// Byte-keyed tables included in snapshots generically. New tables only need
 /// to be listed here.
 const BYTE_TABLES: &[TableDefinition<&[u8], &[u8]>] =
-    &[REQUESTS, REQUEST_SEQ, VERSIONS, USERS, EVENTS];
+    &[REQUESTS, REQUEST_SEQ, VERSIONS, USERS, EVENTS, TIER_QUEUE];
 
 /// How many request ids are remembered for deduplication.
 const REMEMBERED_REQUESTS: u64 = 100_000;
@@ -98,6 +100,9 @@ pub enum Command {
         attrs: Option<ObjectAttrs>,
         now: DateTime<Utc>,
         cond: WriteCondition,
+        /// Cold storage class for the copy (`None`: STANDARD).
+        #[serde(default)]
+        storage_class: Option<String>,
     },
     CreateUpload {
         info: UploadInfo,
@@ -156,6 +161,17 @@ pub enum Command {
     DeleteUser {
         access_key: String,
     },
+    /// Move objects' data to the cold tier as `class`.
+    TransitionObjects {
+        bucket: String,
+        targets: Vec<DeleteTarget>,
+        class: String,
+    },
+    /// A chunk was copied to the cold tier under `key`.
+    ChunkOffloaded {
+        id: ChunkId,
+        key: String,
+    },
     /// Delivered notifications for `target` up to and including `upto`.
     AckEvents {
         target: String,
@@ -188,10 +204,15 @@ impl From<Command> for Request {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+// Outputs are short-lived and moved once per command; boxing the common
+// `Object` case would cost more than the size difference.
+#[allow(clippy::large_enum_variant)]
 pub enum CommandOutput {
     Done,
     Object(ObjectMeta),
     Deleted(Vec<DeleteOutcome>),
+    /// How many of the targets moved to the cold class.
+    Transitioned(u64),
 }
 
 /// A command rejected by a precondition. Deterministic, so it is part of
@@ -260,10 +281,24 @@ pub(crate) fn reject<T>(r: Rejection) -> Step<T> {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct ChunkInfo {
-    refs: u64,
-    len: u32,
-    stored: u64,
+pub(crate) struct ChunkInfo {
+    pub(crate) refs: u64,
+    pub(crate) len: u32,
+    pub(crate) stored: u64,
+    /// References from objects in a cold storage class.
+    #[serde(default)]
+    pub(crate) cold_refs: u64,
+    /// Key of this chunk's copy in the cold tier, once offloaded.
+    #[serde(default)]
+    pub(crate) remote: Option<String>,
+}
+
+impl ChunkInfo {
+    /// Only cold objects use it, and the cold tier holds it: no node needs
+    /// a local copy.
+    pub(crate) fn evicted(&self) -> bool {
+        self.remote.is_some() && self.cold_refs == self.refs
+    }
 }
 
 pub(crate) fn enc<T: Serialize>(v: &T) -> Result<Vec<u8>> {
@@ -295,6 +330,10 @@ pub(crate) struct Tx<'a> {
     pub(crate) txn: &'a WriteTransaction,
     pub(crate) stats: Stats,
     pub(crate) freed: Vec<ChunkId>,
+    /// Chunks now served from the cold tier: local copies can go.
+    pub(crate) evicted: Vec<ChunkId>,
+    /// Cold-tier keys no longer referenced.
+    pub(crate) remote_garbage: Vec<String>,
 }
 
 impl Tx<'_> {
@@ -381,6 +420,8 @@ impl Tx<'_> {
                         refs: 1,
                         len: *len,
                         stored,
+                        cold_refs: 0,
+                        remote: None,
                     }
                 }
             };
@@ -390,6 +431,15 @@ impl Tx<'_> {
     }
 
     pub(crate) fn drop_refs(&mut self, segments: &[Segment]) -> Result<()> {
+        self.drop_refs_as(segments, false)
+    }
+
+    /// Release what an object (or version) held, cold or not.
+    pub(crate) fn drop_object_refs(&mut self, meta: &ObjectMeta) -> Result<()> {
+        self.drop_refs_as(&meta.segments, meta.storage_class.is_some())
+    }
+
+    fn drop_refs_as(&mut self, segments: &[Segment], cold: bool) -> Result<()> {
         let mut chunks = self.txn.open_table(CHUNKS)?;
         for seg in segments {
             let Segment::Chunk { id, .. } = seg else {
@@ -401,13 +451,36 @@ impl Tx<'_> {
             };
             let mut info: ChunkInfo = dec(&raw)?;
             info.refs -= 1;
+            if cold {
+                info.cold_refs = info.cold_refs.saturating_sub(1);
+            }
             if info.refs == 0 {
                 chunks.remove(id.0.as_slice())?;
                 self.stats.chunks -= 1;
                 self.stats.unique_bytes -= info.len as u64;
-                self.stats.physical_bytes -= info.stored;
+                match info.remote {
+                    Some(key) => {
+                        self.stats.cold_chunks -= 1;
+                        self.stats.cold_bytes -= info.stored;
+                        self.remote_garbage.push(key);
+                    }
+                    None => self.stats.physical_bytes -= info.stored,
+                }
                 self.freed.push(*id);
+                self.txn.open_table(TIER_QUEUE)?.remove(id.0.as_slice())?;
             } else {
+                // The last hot reference is gone: the chunk joins the cold
+                // tier (or, if it is already there, local copies can go).
+                if !cold && info.cold_refs == info.refs {
+                    match info.remote {
+                        Some(_) => self.evicted.push(*id),
+                        None => {
+                            self.txn
+                                .open_table(TIER_QUEUE)?
+                                .insert(id.0.as_slice(), info.len.to_be_bytes().as_slice())?;
+                        }
+                    }
+                }
                 chunks.insert(id.0.as_slice(), enc(&info)?.as_slice())?;
             }
         }
@@ -431,7 +504,7 @@ impl Tx<'_> {
         drop(t);
         if let Some(old) = old {
             self.stats.logical_bytes -= old.size;
-            self.drop_refs(&old.segments)?;
+            self.drop_object_refs(&old)?;
         } else {
             self.stats.objects += 1;
         }
@@ -449,7 +522,7 @@ impl Tx<'_> {
         let Some(old) = old else { return Ok(false) };
         self.stats.objects -= 1;
         self.stats.logical_bytes -= old.size;
-        self.drop_refs(&old.segments)?;
+        self.drop_object_refs(&old)?;
         Ok(true)
     }
 
@@ -563,9 +636,13 @@ impl Tx<'_> {
                         "Object Lock headers require a bucket with Object Lock enabled".into(),
                     ));
                 }
+                let mut meta = meta;
+                let class = meta.storage_class.take();
                 self.add_refs(&meta.segments, &stored.into_iter().collect())?;
                 let meta = self.write_object(&info, &key, meta)?;
-                Ok(CommandOutput::Object(meta))
+                Ok(CommandOutput::Object(
+                    self.settle_class(&bucket, &key, meta, class)?,
+                ))
             }
             Command::DeleteObjects {
                 bucket,
@@ -606,6 +683,7 @@ impl Tx<'_> {
                 attrs,
                 now,
                 cond,
+                storage_class,
             } => {
                 let src_info = self.bucket_info(&src_bucket)?;
                 let dst_info = self.bucket_info(&dst_bucket)?;
@@ -643,11 +721,19 @@ impl Tx<'_> {
                     attrs: attrs.unwrap_or_else(|| src.attrs.clone()),
                     version_id: None,
                     lock,
+                    // A copy takes new (hot) references; its data is
+                    // served locally again where it is stored.
+                    storage_class: None,
                     ..src
                 };
                 self.add_refs(&meta.segments, &HashMap::new())?;
                 let meta = self.write_object(&dst_info, &dst_key, meta)?;
-                Ok(CommandOutput::Object(meta))
+                Ok(CommandOutput::Object(self.settle_class(
+                    &dst_bucket,
+                    &dst_key,
+                    meta,
+                    storage_class,
+                )?))
             }
             Command::CreateUpload { info } => {
                 self.require_bucket(&info.bucket)?;
@@ -741,12 +827,18 @@ impl Tx<'_> {
                     segments,
                     version_id: None,
                     lock: info.lock.clone().unwrap_or_default(),
+                    storage_class: None,
                 };
                 // Reference the chunks from the object before the parts release them.
                 self.add_refs(&meta.segments, &HashMap::new())?;
                 let meta = self.write_object(&bucket_info, &key, meta)?;
                 self.remove_upload(&info)?;
-                Ok(CommandOutput::Object(meta))
+                Ok(CommandOutput::Object(self.settle_class(
+                    &bucket,
+                    &key,
+                    meta,
+                    info.storage_class.clone(),
+                )?))
             }
             Command::AbortUpload {
                 bucket,
@@ -844,6 +936,17 @@ impl Tx<'_> {
                 self.delete_user(&access_key)?;
                 Ok(CommandOutput::Done)
             }
+            Command::TransitionObjects {
+                bucket,
+                targets,
+                class,
+            } => Ok(CommandOutput::Transitioned(
+                self.transition(&bucket, targets, &class)?,
+            )),
+            Command::ChunkOffloaded { id, key } => {
+                self.chunk_offloaded(id, key)?;
+                Ok(CommandOutput::Done)
+            }
             Command::AckEvents { target, upto } => {
                 self.ack_events(&target, upto)?;
                 Ok(CommandOutput::Done)
@@ -879,6 +982,8 @@ pub struct Applied {
     pub results: Vec<CommandResult>,
     /// Chunks whose last reference was dropped.
     pub freed: Vec<ChunkId>,
+    pub evicted: Vec<ChunkId>,
+    pub remote_garbage: Vec<String>,
 }
 
 impl MetaStore {
@@ -909,6 +1014,8 @@ impl MetaStore {
             txn: &txn,
             stats,
             freed: Vec::new(),
+            evicted: Vec::new(),
+            remote_garbage: Vec::new(),
         };
         let mut results = Vec::with_capacity(reqs.len());
         for Request { id, cmd } in reqs {
@@ -938,7 +1045,13 @@ impl MetaStore {
             }
             results.push(result);
         }
-        let Tx { stats, freed, .. } = tx;
+        let Tx {
+            stats,
+            freed,
+            evicted,
+            remote_garbage,
+            ..
+        } = tx;
         {
             let mut meta = txn.open_table(META)?;
             meta.insert(STATS_KEY, enc(&stats)?.as_slice())?;
@@ -947,7 +1060,12 @@ impl MetaStore {
             }
         }
         txn.commit()?;
-        Ok(Applied { results, freed })
+        Ok(Applied {
+            results,
+            freed,
+            evicted,
+            remote_garbage,
+        })
     }
 
     pub fn sm_state(&self) -> Result<Option<Vec<u8>>> {
@@ -963,8 +1081,9 @@ impl MetaStore {
         self.apply(Vec::new(), Some(sm_state)).map(drop)
     }
 
-    /// Referenced chunks in id order, starting after `after`, with their
-    /// lengths. Used by cluster repair to walk every chunk in pages.
+    /// Referenced chunks that need local replicas, in id order, starting
+    /// after `after`, with their lengths. Used by cluster repair to walk
+    /// every chunk in pages.
     pub fn chunk_page(&self, after: Option<ChunkId>, limit: usize) -> Result<Vec<(ChunkId, u32)>> {
         let r = self.db.begin_read()?;
         let t = r.open_table(CHUNKS)?;
@@ -974,14 +1093,20 @@ impl MetaStore {
             None => t.range::<&[u8]>(..)?,
         };
         let mut out = Vec::with_capacity(limit.min(4096));
-        for item in range.take(limit) {
+        for item in range {
+            if out.len() == limit {
+                break;
+            }
             let (k, v) = item?;
             let id: [u8; 32] = k
                 .value()
                 .try_into()
                 .map_err(|_| Error::Internal("malformed chunk id".into()))?;
             let info: ChunkInfo = dec(v.value())?;
-            out.push((ChunkId(id), info.len));
+            // Chunks served from the cold tier need no local replicas.
+            if !info.evicted() {
+                out.push((ChunkId(id), info.len));
+            }
         }
         Ok(out)
     }
@@ -1280,6 +1405,7 @@ fn list_page(
                 size: meta.size,
                 etag: meta.etag,
                 last_modified: meta.last_modified,
+                storage_class: meta.storage_class,
             });
             page.next_marker = Some(key);
         }

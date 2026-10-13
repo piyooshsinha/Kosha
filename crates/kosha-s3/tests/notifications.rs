@@ -346,6 +346,9 @@ async fn webhook_notifications() {
                 expired_object_delete_marker: false,
                 noncurrent_days: None,
                 abort_incomplete_days: None,
+                transition_days: None,
+                transition_date: None,
+                transition_class: None,
             }])),
         )
         .await

@@ -29,7 +29,8 @@ export function Overview({ s3 }: { s3: S3 }) {
   if (error) return <div className="error-box">{error}</div>;
   if (!stats) return <div className="muted pad">Loading…</div>;
 
-  const saved = Math.max(0, stats.logical_bytes - stats.physical_bytes);
+  const cold = stats.cold_bytes ?? 0;
+  const saved = Math.max(0, stats.logical_bytes - stats.physical_bytes - cold);
   const savedPct = stats.logical_bytes ? (saved / stats.logical_bytes) * 100 : 0;
   const max = Math.max(stats.logical_bytes, 1);
   const clustered = cluster && cluster.mode !== "single-node";
@@ -52,6 +53,7 @@ export function Overview({ s3 }: { s3: S3 }) {
         <Tile label="Objects" value={count(stats.objects)} sub={`${count(stats.buckets)} buckets`} />
         <Tile label="Data stored by clients" value={bytes(stats.logical_bytes)} sub="logical size" />
         <Tile label="On disk" value={bytes(stats.physical_bytes)} sub={clustered ? "per replica" : "after dedup + compression"} />
+        {cold > 0 && <Tile label="Cold tier" value={bytes(cold)} sub={`${count(stats.cold_chunks ?? 0)} chunks offloaded`} />}
         <Tile
           label="Space saved"
           value={`${savedPct.toFixed(1)}%`}
@@ -67,7 +69,7 @@ export function Overview({ s3 }: { s3: S3 }) {
           <Bar label="After dedup" value={stats.unique_bytes} max={max} tone="b" note={`${ratio(stats.dedup_ratio)} from content-defined chunking`} />
           <Bar
             label="After compression"
-            value={stats.physical_bytes}
+            value={stats.physical_bytes + cold}
             max={max}
             tone="c"
             note={`${ratio(stats.compression_ratio)} from adaptive zstd`}

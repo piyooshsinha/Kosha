@@ -279,6 +279,43 @@ replication, ordering and Object Lock checks for free; locked versions are
 reported as refused and left in place. A version counts as noncurrent from
 the moment its successor was written.
 
+## Cold tier
+
+Tiering works on chunks, so it composes with dedup. Each chunk record keeps
+`cold_refs`, the number of its references held by objects in a cold storage
+class, next to `refs`. The rules:
+
+- **Transition** (lifecycle, or a cold class requested on PUT/COPY/
+  CompleteMultipartUpload) sets the version's `storage_class` and increments
+  `cold_refs` on its chunks, in the same command as the write when requested
+  on upload. A chunk with `cold_refs == refs` and no remote copy goes into
+  the `tier_queue` table. Dropping the last *hot* reference does the same.
+- **Offload** runs on the leader. It reads each queued chunk (locally or from a
+  replica, verified), re-encodes it to its stored form (deterministic
+  compression, then encryption if enabled), and uploads it under a fresh key
+  `<id>.<random>`. It then commits `ChunkOffloaded { id, key }`.
+- **Eviction**: applying that command records `remote = key`. If the chunk
+  is still cold-only it is *evicted*, and every node deletes its local copy
+  in `apply_and_collect`. The same pin lock that protects garbage collection
+  protects an upload that is writing the same content at that moment.
+- **Reads** go to the local store or the replicas first. On a miss, a chunk
+  with a remote key is fetched from the cold store and decoded with the same
+  verification as a local read.
+- **Repair** walks only chunks that need local replicas (`chunk_page` skips
+  evicted ones).
+- **Hot again**: a new upload of the same content writes a local copy again
+  and adds a hot reference, so that chunk is served locally. Copies are
+  STANDARD.
+- **Deletion**: when `refs` reaches 0, the remote key goes to a garbage list
+  and is deleted. Because every upload uses a fresh key, a late delete can
+  only remove the copy it was meant for, never a newer upload of the same
+  content. If an upload finishes after its chunk was freed, or twice across
+  a leader change, the extra key is garbage too.
+
+The cold store is a small trait (`put`/`get`/`delete`). The server
+implements it with a minimal SigV4 client, so any S3-compatible service
+works, including another Kosha.
+
 ## Event notifications
 
 Notifications are produced by the state machine, not by request handlers.
@@ -393,8 +430,9 @@ thread pool when io_uring is disabled.
 |---|---|---|
 | `buckets` | name | created time |
 | `objects` | `bucket \0 key` | manifest: size, ETag, attrs, segments |
-| `chunks` | BLAKE3 id | refcount, raw length, stored length |
+| `chunks` | BLAKE3 id | refcount, cold refcount, raw length, stored length, cold-tier key |
 | `uploads` / `upload_index` / `parts` | upload id / `bucket \0 key \0 id` / `id \0 part#` | multipart state |
+| `tier_queue` | chunk id | chunks waiting to be offloaded |
 | `events` | `target \0 seq` | undelivered notifications |
 | `users` | access key | user: secret, name, identity policy, enabled |
 | `versions` | `bucket \0 key \0 (MAX - seq)` | version: manifest or delete marker, lock state |
@@ -442,6 +480,7 @@ Versioning, Object Lock (retention and legal hold) and lifecycle rules.
 Users, identity and bucket policies (with anonymous access), SigV2 header
 auth, HTTPS, mutual TLS between nodes, and dedup-preserving encryption at
 rest. Event notifications to webhooks from the replicated metadata log.
+A chunk-level cold tier on any S3-compatible service.
 
 **Next**
 - io_uring with registered buffers and `O_DIRECT` for large chunks.
@@ -452,6 +491,6 @@ rest. Event notifications to webhooks from the replicated metadata log.
 - Reed–Solomon erasure coding for cold chunks (for example 8+3), with
   replication for hot ones.
 - Metadata sharding: multiple Raft groups by bucket or key range.
-- Tiering: track access frequency per chunk, demote to a cold tier
-  (HDD or another S3) and promote on read.
+- Access-driven tiering: demote chunks by read frequency rather than by
+  lifecycle rules, and promote hot chunks back on read.
 - Per-bucket trained zstd dictionaries and similarity-aware placement.

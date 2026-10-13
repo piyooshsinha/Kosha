@@ -44,6 +44,13 @@ pub(crate) fn apply_and_collect(
     sm_state: Option<Vec<u8>>,
 ) -> Result<Vec<CommandResult>> {
     let applied = meta.apply_requests(reqs, sm_state)?;
+    if !applied.evicted.is_empty() {
+        let removed = store.evict(&applied.evicted, |id| meta.is_evicted(id))?;
+        tracing::debug!(removed, "evicted chunks now in the cold tier");
+    }
+    if !applied.remote_garbage.is_empty() {
+        store.defer_remote_delete(applied.remote_garbage);
+    }
     if !applied.freed.is_empty() {
         let removed = store.collect(&applied.freed, |id| Ok(!meta.is_referenced(id)?))?;
         tracing::debug!(

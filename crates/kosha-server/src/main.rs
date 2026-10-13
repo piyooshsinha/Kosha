@@ -81,6 +81,34 @@ struct Args {
     )]
     notify_webhooks: Vec<String>,
 
+    /// S3-compatible endpoint for the cold tier (e.g. https://s3.eu-west-1.amazonaws.com).
+    /// Objects in a cold storage class (by lifecycle transition or on
+    /// upload) have their chunks moved there; reads stay transparent.
+    #[arg(long, env = "KOSHA_COLD_TIER_ENDPOINT", requires_all = ["cold_tier_bucket", "cold_tier_access_key", "cold_tier_secret_key"])]
+    cold_tier_endpoint: Option<String>,
+
+    /// Bucket in the cold tier (must exist).
+    #[arg(long, env = "KOSHA_COLD_TIER_BUCKET")]
+    cold_tier_bucket: Option<String>,
+
+    /// Key prefix for chunk objects in the cold bucket.
+    #[arg(long, env = "KOSHA_COLD_TIER_PREFIX", default_value = "kosha-cold/")]
+    cold_tier_prefix: String,
+
+    /// Region the cold tier signs requests for.
+    #[arg(long, env = "KOSHA_COLD_TIER_REGION", default_value = "us-east-1")]
+    cold_tier_region: String,
+
+    #[arg(long, env = "KOSHA_COLD_TIER_ACCESS_KEY")]
+    cold_tier_access_key: Option<String>,
+
+    #[arg(long, env = "KOSHA_COLD_TIER_SECRET_KEY", hide_env_values = true)]
+    cold_tier_secret_key: Option<String>,
+
+    /// Seconds between passes that copy newly cold chunks to the cold tier.
+    #[arg(long, env = "KOSHA_OFFLOAD_INTERVAL_SECS", default_value_t = 60)]
+    offload_interval_secs: u64,
+
     /// PEM certificate (chain) for serving the S3 API and console over HTTPS.
     #[arg(long, env = "KOSHA_TLS_CERT", requires = "tls_key")]
     tls_cert: Option<PathBuf>,
@@ -225,6 +253,22 @@ async fn main() -> anyhow::Result<()> {
     };
     let engine = Engine::open(cfg)
         .with_context(|| format!("opening data directory {}", args.data_dir.display()))?;
+    if let Some(endpoint) = &args.cold_tier_endpoint {
+        let store = kosha_s3::coldtier::S3ColdStore::new(kosha_s3::coldtier::S3ColdConfig {
+            endpoint: endpoint.clone(),
+            bucket: args.cold_tier_bucket.clone().expect("required by clap"),
+            prefix: args.cold_tier_prefix.clone(),
+            region: args.cold_tier_region.clone(),
+            access_key: args.cold_tier_access_key.clone().expect("required by clap"),
+            secret_key: args.cold_tier_secret_key.clone().expect("required by clap"),
+        })?;
+        store
+            .probe()
+            .await
+            .context("the cold tier is not writable with the given settings")?;
+        engine.set_cold_store(Arc::new(store))?;
+        tracing::info!(%endpoint, bucket = args.cold_tier_bucket.as_deref().unwrap_or_default(), "cold tier ready");
+    }
     tracing::info!(
         io = engine.io_backend(),
         sync = ?engine.config().sync,
@@ -328,6 +372,12 @@ async fn main() -> anyhow::Result<()> {
     if args.lifecycle_interval_secs > 0 {
         engine.spawn_lifecycle(
             Duration::from_secs(args.lifecycle_interval_secs),
+            leader_gate.clone(),
+        );
+    }
+    if engine.has_cold_store() {
+        engine.spawn_offloader(
+            Duration::from_secs(args.offload_interval_secs.max(1)),
             leader_gate.clone(),
         );
     }

@@ -334,9 +334,19 @@ struct RuleXml {
     #[serde(rename = "AbortIncompleteMultipartUpload")]
     abort: Option<AbortXml>,
     #[serde(rename = "Transition", default)]
-    transitions: Vec<serde::de::IgnoredAny>,
+    transitions: Vec<TransitionXml>,
     #[serde(rename = "NoncurrentVersionTransition", default)]
     noncurrent_transitions: Vec<serde::de::IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+struct TransitionXml {
+    #[serde(rename = "Days")]
+    days: Option<u32>,
+    #[serde(rename = "Date")]
+    date: Option<String>,
+    #[serde(rename = "StorageClass")]
+    class: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -396,12 +406,28 @@ pub fn parse_lifecycle(xml: &str) -> S3Result<Vec<LifecycleRule>> {
     }
     let mut out = Vec::new();
     for r in c.rules {
-        if !r.transitions.is_empty() || !r.noncurrent_transitions.is_empty() {
+        if !r.noncurrent_transitions.is_empty() || r.transitions.len() > 1 {
             return Err(S3Error::new(
                 StatusCode::NOT_IMPLEMENTED,
                 "NotImplemented",
-                "lifecycle transitions are not supported (Kosha has a single storage class)",
+                "only one Transition (of current versions) per rule is supported",
             ));
+        }
+        let (mut transition_days, mut transition_date, mut transition_class) = (None, None, None);
+        if let Some(t) = r.transitions.into_iter().next() {
+            if !kosha_engine::is_cold_class(&t.class) {
+                return Err(S3Error::new(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidStorageClass",
+                    format!("cannot transition to {}", t.class),
+                ));
+            }
+            if t.days.is_none() == t.date.is_none() {
+                return Err(S3Error::malformed_xml("a Transition needs Days or Date"));
+            }
+            transition_days = t.days;
+            transition_date = t.date.as_deref().map(parse_date).transpose()?;
+            transition_class = Some(t.class);
         }
         let mut prefix = r.prefix.unwrap_or_default();
         let mut tags = BTreeMap::new();
@@ -445,8 +471,12 @@ pub fn parse_lifecycle(xml: &str) -> S3Result<Vec<LifecycleRule>> {
             expired_object_delete_marker: expired_marker,
             noncurrent_days: r.noncurrent.map(|n| n.days),
             abort_incomplete_days: r.abort.map(|a| a.days),
+            transition_days,
+            transition_date,
+            transition_class,
         };
         if rule.expiration_days.is_none()
+            && rule.transition_class.is_none()
             && rule.expiration_date.is_none()
             && !rule.expired_object_delete_marker
             && rule.noncurrent_days.is_none()
@@ -490,6 +520,12 @@ pub fn render_lifecycle(rules: &[LifecycleRule]) -> String {
             }
             x.close("Expiration");
         }
+        if let Some(class) = &r.transition_class {
+            x.open("Transition");
+            x.opt("Days", r.transition_days.map(|d| d.to_string()));
+            x.opt("Date", r.transition_date.as_ref().map(iso8601));
+            x.elem("StorageClass", class).close("Transition");
+        }
         if let Some(d) = r.noncurrent_days {
             x.open("NoncurrentVersionExpiration")
                 .elem("NoncurrentDays", d.to_string())
@@ -525,8 +561,25 @@ mod tests {
         );
         assert_eq!(parse_lifecycle(&render_lifecycle(&rules)).unwrap(), rules);
         let transition = r#"<LifecycleConfiguration><Rule><Status>Enabled</Status><Filter><Prefix></Prefix></Filter><Transition><Days>30</Days><StorageClass>GLACIER</StorageClass></Transition></Rule></LifecycleConfiguration>"#;
+        let rules = parse_lifecycle(transition).unwrap();
         assert_eq!(
-            parse_lifecycle(transition).unwrap_err().code,
+            (
+                rules[0].transition_days,
+                rules[0].transition_class.as_deref()
+            ),
+            (Some(30), Some("GLACIER"))
+        );
+        assert_eq!(parse_lifecycle(&render_lifecycle(&rules)).unwrap(), rules);
+        let bad = transition.replace("GLACIER", "PLATINUM");
+        assert_eq!(
+            parse_lifecycle(&bad).unwrap_err().code,
+            "InvalidStorageClass"
+        );
+        let noncurrent = transition
+            .replace("<Transition>", "<NoncurrentVersionTransition>")
+            .replace("</Transition>", "</NoncurrentVersionTransition>");
+        assert_eq!(
+            parse_lifecycle(&noncurrent).unwrap_err().code,
             "NotImplemented"
         );
     }

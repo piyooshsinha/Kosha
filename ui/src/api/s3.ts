@@ -35,6 +35,9 @@ export interface Stats {
   unique_bytes: number;
   physical_bytes: number;
   chunks: number;
+  /** Bytes and chunks held by the cold tier (absent on older servers). */
+  cold_bytes?: number;
+  cold_chunks?: number;
   dedup_ratio: number;
   compression_ratio: number;
   overall_ratio: number;

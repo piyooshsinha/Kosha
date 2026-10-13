@@ -116,6 +116,7 @@ struct Inner {
     cfg: EngineConfig,
     consensus: OnceLock<Arc<dyn Consensus>>,
     placement: OnceLock<Arc<dyn ChunkPlacement>>,
+    cold: OnceLock<Arc<dyn crate::tier::ColdStore>>,
 }
 
 /// The storage engine. Cheap to clone; all clones share state.
@@ -198,6 +199,7 @@ impl Engine {
                 cfg,
                 consensus: OnceLock::new(),
                 placement: OnceLock::new(),
+                cold: OnceLock::new(),
             }),
         })
     }
@@ -353,6 +355,18 @@ impl Engine {
 
     pub(crate) fn meta(&self) -> &MetaStore {
         &self.inner.meta
+    }
+
+    pub(crate) fn meta_arc(&self) -> Arc<MetaStore> {
+        self.inner.meta.clone()
+    }
+
+    pub(crate) fn cold_cell(&self) -> &OnceLock<Arc<dyn crate::tier::ColdStore>> {
+        &self.inner.cold
+    }
+
+    pub(crate) fn placement_cell(&self) -> &OnceLock<Arc<dyn ChunkPlacement>> {
+        &self.inner.placement
     }
 
     pub(crate) async fn query_meta<T: Send + 'static>(
@@ -524,7 +538,25 @@ impl Engine {
         cond: WriteCondition,
         lock: ObjectLockState,
     ) -> Result<ObjectMeta> {
+        self.put_object_as(bucket, key, data, attrs, cond, lock, None)
+            .await
+    }
+
+    /// PutObject with Object Lock settings and a storage class. A cold class
+    /// moves the new object to the cold tier in the same commit.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn put_object_as(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: WrittenData,
+        attrs: ObjectAttrs,
+        cond: WriteCondition,
+        lock: ObjectLockState,
+        storage_class: Option<String>,
+    ) -> Result<ObjectMeta> {
         validate_key(key)?;
+        self.check_class(storage_class.as_deref())?;
         let meta = ObjectMeta {
             size: data.size,
             etag: data.md5_hex(),
@@ -533,6 +565,7 @@ impl Engine {
             segments: data.segments.clone(),
             version_id: None,
             lock,
+            storage_class,
         };
         let out = self
             .propose(Command::PutObject {
@@ -598,21 +631,15 @@ impl Engine {
             }
             offset = seg_end;
         }
-        let store = self.inner.store.clone();
-        let placement = self.inner.placement.get().cloned();
+        let engine = self.clone();
         stream::iter(pieces)
             .map(move |(seg, from, to)| {
-                let store = store.clone();
-                let placement = placement.clone();
+                let engine = engine.clone();
                 async move {
                     match seg {
                         Segment::Inline(d) => Ok(Bytes::from(d).slice(from..to)),
                         Segment::Chunk { id, len } => {
-                            let b = match placement {
-                                Some(p) => p.get(id, len).await?,
-                                None => store.get(&id, len).await?,
-                            };
-                            Ok(b.slice(from..to))
+                            Ok(engine.fetch_chunk(id, len).await?.slice(from..to))
                         }
                     }
                 }
@@ -707,11 +734,13 @@ impl Engine {
             new_attrs,
             cond,
             ObjectLockState::default(),
+            None,
         )
         .await
     }
 
     /// Copy a specific source version, with Object Lock settings for the copy.
+    #[allow(clippy::too_many_arguments)]
     pub async fn copy_object_with(
         &self,
         src: CopySource,
@@ -720,8 +749,10 @@ impl Engine {
         new_attrs: Option<ObjectAttrs>,
         cond: WriteCondition,
         lock: ObjectLockState,
+        storage_class: Option<String>,
     ) -> Result<ObjectMeta> {
         validate_key(dst_key)?;
+        self.check_class(storage_class.as_deref())?;
         expect_object(
             self.propose(Command::CopyObject {
                 src_bucket: src.bucket,
@@ -733,9 +764,25 @@ impl Engine {
                 attrs: new_attrs,
                 now: Utc::now(),
                 cond,
+                storage_class,
             })
             .await?,
         )
+    }
+
+    /// A requested storage class must be a known cold class, with a cold
+    /// tier to put it in.
+    fn check_class(&self, class: Option<&str>) -> Result<()> {
+        match class {
+            None => Ok(()),
+            Some(c) if !crate::tier::is_cold_class(c) => Err(Error::InvalidRequest(format!(
+                "{c} is not a supported storage class"
+            ))),
+            Some(_) if !self.has_cold_store() => Err(Error::InvalidRequest(
+                "no cold tier is configured on this server".into(),
+            )),
+            Some(_) => Ok(()),
+        }
     }
 
     pub async fn list_objects(&self, bucket: &str, q: ListQuery) -> Result<ListPage> {
@@ -751,7 +798,8 @@ impl Engine {
         key: &str,
         attrs: ObjectAttrs,
     ) -> Result<UploadInfo> {
-        self.create_upload_with(bucket, key, attrs, None).await
+        self.create_upload_with(bucket, key, attrs, None, None)
+            .await
     }
 
     /// CreateMultipartUpload with Object Lock settings for the final object.
@@ -761,8 +809,10 @@ impl Engine {
         key: &str,
         attrs: ObjectAttrs,
         lock: Option<ObjectLockState>,
+        storage_class: Option<String>,
     ) -> Result<UploadInfo> {
         validate_key(key)?;
+        self.check_class(storage_class.as_deref())?;
         let info = UploadInfo {
             upload_id: uuid::Uuid::new_v4().simple().to_string(),
             bucket: bucket.to_string(),
@@ -770,6 +820,7 @@ impl Engine {
             attrs,
             initiated: Utc::now(),
             lock,
+            storage_class,
         };
         self.propose(Command::CreateUpload { info: info.clone() })
             .await?;

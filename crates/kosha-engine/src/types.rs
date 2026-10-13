@@ -92,6 +92,10 @@ pub struct ObjectMeta {
     pub version_id: Option<String>,
     #[serde(default)]
     pub lock: ObjectLockState,
+    /// `None` for STANDARD. A cold class (set by a lifecycle transition or
+    /// on upload) means the object's data lives in the cold tier.
+    #[serde(default)]
+    pub storage_class: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -225,6 +229,15 @@ pub struct LifecycleRule {
     pub expired_object_delete_marker: bool,
     pub noncurrent_days: Option<u32>,
     pub abort_incomplete_days: Option<u32>,
+    /// Move current versions to the cold tier after this many days...
+    #[serde(default)]
+    pub transition_days: Option<u32>,
+    /// ...or from this date...
+    #[serde(default)]
+    pub transition_date: Option<DateTime<Utc>>,
+    /// ...as this storage class (e.g. `GLACIER_IR`).
+    #[serde(default)]
+    pub transition_class: Option<String>,
 }
 
 /// One version of an object, as returned by version listings and lookups.
@@ -326,6 +339,8 @@ pub struct ObjectSummary {
     pub size: u64,
     pub etag: String,
     pub last_modified: DateTime<Utc>,
+    /// `None` for STANDARD.
+    pub storage_class: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -365,6 +380,9 @@ pub struct UploadInfo {
     /// Explicit Object Lock settings requested at upload creation.
     #[serde(default)]
     pub lock: Option<ObjectLockState>,
+    /// Cold storage class requested at upload creation.
+    #[serde(default)]
+    pub storage_class: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -392,4 +410,10 @@ pub struct Stats {
     /// Notifications discarded because a target's queue was full.
     #[serde(default)]
     pub events_dropped: u64,
+    /// Chunks whose data lives in the cold tier, and their stored bytes
+    /// there (not included in `physical_bytes`).
+    #[serde(default)]
+    pub cold_chunks: u64,
+    #[serde(default)]
+    pub cold_bytes: u64,
 }

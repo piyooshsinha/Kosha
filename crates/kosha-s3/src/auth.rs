@@ -155,7 +155,7 @@ impl ChunkSigner {
     }
 }
 
-fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
+pub(crate) fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut m = Hmac::<Sha256>::new_from_slice(key).expect("hmac accepts any key length");
     m.update(data);
     m.finalize().into_bytes().into()
@@ -165,7 +165,7 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> [u8; 32] {
+pub(crate) fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> [u8; 32] {
     let k = hmac(format!("AWS4{secret}").as_bytes(), date.as_bytes());
     let k = hmac(&k, region.as_bytes());
     let k = hmac(&k, service.as_bytes());

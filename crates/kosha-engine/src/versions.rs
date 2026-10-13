@@ -231,7 +231,7 @@ impl Tx<'_> {
             .remove(version_key(bucket, key, seq).as_slice())?;
         if let Some(meta) = &v.meta {
             self.stats.logical_bytes -= meta.size;
-            self.drop_refs(&meta.segments)?;
+            self.drop_object_refs(meta)?;
         }
         Ok(())
     }

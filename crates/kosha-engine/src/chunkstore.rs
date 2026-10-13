@@ -60,6 +60,8 @@ pub struct ChunkStore {
     opts: StoreOptions,
     group_sync: Option<GroupSync>,
     pins: Mutex<HashMap<ChunkId, usize>>,
+    /// Cold-tier keys to delete (released by committed changes).
+    remote_garbage: Mutex<Vec<String>>,
 }
 
 /// Result of storing one chunk.
@@ -108,6 +110,7 @@ impl ChunkStore {
             opts,
             group_sync,
             pins: Mutex::new(HashMap::new()),
+            remote_garbage: Mutex::new(Vec::new()),
         })
     }
 
@@ -298,6 +301,48 @@ impl ChunkStore {
         v.push(CODEC_ZSTD);
         v.extend_from_slice(&full);
         Ok(v)
+    }
+
+    /// The stored form of a chunk (compressed, and encrypted if enabled), for
+    /// copying to the cold tier.
+    pub fn encode_external(&self, id: &ChunkId, data: &[u8]) -> Result<Vec<u8>> {
+        self.encode(id, data)
+    }
+
+    /// Decode and verify a chunk in its stored form (from the cold tier).
+    pub fn decode_external(&self, id: ChunkId, len: u32, raw: Vec<u8>) -> Result<Bytes> {
+        decode(id, len, raw, self.opts.keys.as_deref())
+    }
+
+    pub fn defer_remote_delete(&self, keys: Vec<String>) {
+        self.remote_garbage.lock().extend(keys);
+    }
+
+    pub fn take_remote_garbage(&self) -> Vec<String> {
+        std::mem::take(&mut *self.remote_garbage.lock())
+    }
+
+    /// Drop local copies of chunks now served from the cold tier, unless an
+    /// upload has them pinned or `still_evicted` says otherwise.
+    pub fn evict(
+        &self,
+        ids: &[ChunkId],
+        still_evicted: impl Fn(&ChunkId) -> Result<bool>,
+    ) -> Result<usize> {
+        let mut removed = 0;
+        for id in ids {
+            let pins = self.pins.lock();
+            if pins.contains_key(id) || !still_evicted(id)? {
+                continue;
+            }
+            match fs::remove_file(self.path_of(id)) {
+                Ok(()) => removed += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            drop(pins);
+        }
+        Ok(removed)
     }
 
     /// Read a chunk and verify it against its content address.

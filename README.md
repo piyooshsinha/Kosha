@@ -27,6 +27,7 @@ with io_uring.
 | Retried writes | may apply twice | **exactly-once**: request ids make a re-delivered write return its original result |
 | Data durability cost | fsync per file | **group sync**: concurrent chunk writes share one `syncfs`, including the directory entry |
 | Encryption at rest | breaks dedup, or none | **dedup-preserving**: keyed chunk addresses + deterministic AES-256-GCM-SIV |
+| Cold data | separate archive product | **built-in cold tier**: chunks move to any S3 bucket, reads stay transparent, dedup preserved |
 | Versions | full copies per version | **versions share chunks**: a new version stores only the chunks that changed |
 | Admin UI | separate product | **built-in web console**, compiled into the binary |
 
@@ -125,6 +126,42 @@ s3api put-bucket-lifecycle-configuration --bucket docs --lifecycle-configuration
 Lifecycle runs every `--lifecycle-interval-secs` (default one hour). Its
 deletions go through the same replicated command path as client deletes, so
 Object Lock still protects locked versions.
+
+### Cold tier
+
+Kosha can move cold data to any S3-compatible bucket (AWS S3, MinIO, or
+another Kosha) and keep serving it transparently:
+
+```sh
+kosha --cold-tier-endpoint https://s3.eu-west-1.amazonaws.com --cold-tier-bucket my-archive \
+      --cold-tier-region eu-west-1 --cold-tier-access-key AKIA… --cold-tier-secret-key … ...
+
+# move objects after 30 days...
+s3api put-bucket-lifecycle-configuration --bucket logs --lifecycle-configuration '{"Rules": [
+  {"ID": "archive", "Status": "Enabled", "Filter": {"Prefix": "2025/"},
+   "Transitions": [{"Days": 30, "StorageClass": "GLACIER_IR"}]}]}'
+# ...or write straight to the cold tier
+aws --endpoint-url http://localhost:9000 s3 cp backup.tar s3://logs/backup.tar --storage-class GLACIER_IR
+```
+
+- **Classes:** `STANDARD_IA`, `ONEZONE_IA`, `INTELLIGENT_TIERING`,
+  `GLACIER_IR`, `GLACIER` and `DEEP_ARCHIVE` all mean "cold tier". GETs read
+  through directly; there is no restore step. The class is reported by
+  HEAD/GET and in listings.
+- **Chunks, not objects, move.** A chunk leaves local disks only when every
+  object using it is cold. Data shared with a STANDARD object stays local, and
+  identical cold data is uploaded once.
+- **What gets uploaded** is the chunk's stored bytes: compressed, and
+  encrypted when encryption at rest is on. The cold provider never sees
+  plaintext.
+- **Reads** are verified against the content address, like every other read.
+- **Deletes:** deleting the last object that uses a chunk deletes its remote
+  copy.
+- **Clusters:** the leader uploads, every node drops its local copies, and
+  background repair leaves offloaded chunks alone.
+- **Startup check:** Kosha writes and deletes a probe object, so a
+  misconfigured tier fails immediately.
+- `/_kosha/stats` and the console's Overview show the bytes in the cold tier.
 
 ### Event notifications
 
@@ -667,6 +704,9 @@ io_uring. `--io auto` (the default) detects this and falls back to threads;
 | `--tls-cert` / `--tls-key` | `KOSHA_TLS_CERT` / `KOSHA_TLS_KEY` | none | serve S3 and the console over HTTPS |
 | `--encryption-key-file` | `KOSHA_ENCRYPTION_KEY_FILE` | none | encrypt object data at rest (64 hex chars); fixed per data directory |
 | `--cluster-tls-cert` / `--cluster-tls-key` / `--cluster-tls-ca` | `KOSHA_CLUSTER_TLS_*` | none | mutual TLS for all internal cluster traffic |
+| `--cold-tier-endpoint` / `--cold-tier-bucket` / `--cold-tier-access-key` / `--cold-tier-secret-key` | `KOSHA_COLD_TIER_*` | none | S3-compatible cold tier (see [Cold tier](#cold-tier)) |
+| `--cold-tier-prefix` / `--cold-tier-region` | | `kosha-cold/` / `us-east-1` | key prefix and signing region in the cold bucket |
+| `--offload-interval-secs` | `KOSHA_OFFLOAD_INTERVAL_SECS` | `60` | how often newly cold chunks are copied to the cold tier |
 | `--notify-webhook name=url` | `KOSHA_NOTIFY_WEBHOOKS` (comma-separated) | none | event notification target (repeatable; same list on every node) |
 | `--lifecycle-interval-secs` | `KOSHA_LIFECYCLE_INTERVAL_SECS` | `3600` | how often lifecycle rules run (leader only in a cluster; `0` disables) |
 
@@ -687,7 +727,8 @@ Tested against the **AWS SDK for Rust** (in CI), **boto3**, the **AWS CLI**,
 | CORS | Get/Put/DeleteBucketCors, unauthenticated `OPTIONS` preflight, CORS headers on matching responses (origin wildcards, credentials, exposed headers, max-age) |
 | Versioning | Get/PutBucketVersioning (Enabled, Suspended), `versionId` on Get/Head/Delete/Copy source/tagging, delete markers, null versions, ListObjectVersions (prefix, delimiter, key/version markers), versioned DeleteObjects |
 | Object Lock | buckets created with `x-amz-bucket-object-lock-enabled`, Get/PutObjectLockConfiguration (default retention), Get/PutObjectRetention (GOVERNANCE with `x-amz-bypass-governance-retention`, COMPLIANCE), Get/PutObjectLegalHold, `x-amz-object-lock-*` headers on Put/Copy/CreateMultipartUpload |
-| Lifecycle | Get/Put/DeleteBucketLifecycleConfiguration: expiration (days or date), noncurrent version expiration, expired delete marker cleanup, AbortIncompleteMultipartUpload; filters by prefix and tags |
+| Lifecycle | Get/Put/DeleteBucketLifecycleConfiguration: expiration (days or date), transition to a cold class (days or date), noncurrent version expiration, expired delete marker cleanup, AbortIncompleteMultipartUpload; filters by prefix and tags |
+| Storage classes | `x-amz-storage-class` on Put/Copy/CreateMultipartUpload, reported on Get/Head and in listings; cold classes need a [cold tier](#cold-tier) |
 | Notifications | Get/PutBucketNotificationConfiguration (Queue/Topic/CloudFunction configurations, prefix/suffix filters) delivered to webhooks |
 | Listing | ListObjectsV2 (prefix, delimiter, continuation, start-after, `encoding-type=url`), ListObjects v1 |
 | Multipart | Create, UploadPart, UploadPartCopy (with range), Complete, Abort, ListParts, ListMultipartUploads (paginated) |
@@ -695,8 +736,8 @@ Tested against the **AWS SDK for Rust** (in CI), **boto3**, the **AWS CLI**,
 
 Not implemented: ACL changes (ACLs are reported as owner-only; use
 policies), SSE-KMS and SSE-C, the AWS IAM API itself (users are managed
-through `/_kosha/admin/users` and the console), and lifecycle transitions to
-other storage classes. Unsupported operations return `501 NotImplemented`.
+through `/_kosha/admin/users` and the console), transitions of noncurrent
+versions, and RestoreObject (cold data reads through directly). Unsupported operations return `501 NotImplemented`.
 
 ## Layout
 

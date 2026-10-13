@@ -448,6 +448,9 @@ async fn lifecycle_rules() {
         tags: [("tier".to_string(), "tmp".to_string())].into(),
         expiration_days: Some(1),
         abort_incomplete_days: Some(2),
+        transition_days: None,
+        transition_date: None,
+        transition_class: None,
         ..Default::default()
     };
     e.set_bucket_config("logs", BucketConfigUpdate::Lifecycle(Some(vec![rule])))

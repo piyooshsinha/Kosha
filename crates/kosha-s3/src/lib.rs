@@ -3,6 +3,7 @@
 mod admin;
 mod auth;
 mod body;
+pub mod coldtier;
 mod config;
 mod error;
 mod handlers;
