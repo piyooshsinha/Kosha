@@ -8,7 +8,7 @@ use axum::serve::ListenerExt;
 use clap::Parser;
 use kosha_cluster::tls::{TlsFiles, TlsListener};
 use kosha_cluster::{Cluster, ClusterConfig};
-use kosha_engine::{Engine, EngineConfig, IoMode, SyncMode};
+use kosha_engine::{ChunkKeys, Engine, EngineConfig, IoMode, SyncMode};
 use kosha_s3::{ClusterHooks, Credentials, S3Config};
 use tracing_subscriber::EnvFilter;
 
@@ -63,6 +63,13 @@ struct Args {
     /// Serve /_kosha/metrics without authentication (for Prometheus scrapers).
     #[arg(long, env = "KOSHA_METRICS_PUBLIC")]
     metrics_public: bool,
+
+    /// Encrypt object data at rest with this 32-byte key (64 hex characters,
+    /// e.g. from `openssl rand -hex 32`). Chosen when a data directory is
+    /// created; every cluster node needs the same key. Keep a backup: data
+    /// cannot be read without it.
+    #[arg(long, env = "KOSHA_ENCRYPTION_KEY_FILE")]
+    encryption_key_file: Option<PathBuf>,
 
     /// PEM certificate (chain) for serving the S3 API and console over HTTPS.
     #[arg(long, env = "KOSHA_TLS_CERT", requires = "tls_key")]
@@ -193,6 +200,12 @@ async fn main() -> anyhow::Result<()> {
         args.sync
     };
     cfg.io_mode = args.io;
+    if let Some(path) = &args.encryption_key_file {
+        cfg.encryption =
+            Some(Arc::new(ChunkKeys::load(path).with_context(|| {
+                format!("loading encryption key {}", path.display())
+            })?));
+    }
     // A single node protects in-flight uploads with pins alone; a cluster also
     // needs the grace period for uploads coordinated by other nodes.
     cfg.gc_grace = if clustered {
@@ -202,7 +215,12 @@ async fn main() -> anyhow::Result<()> {
     };
     let engine = Engine::open(cfg)
         .with_context(|| format!("opening data directory {}", args.data_dir.display()))?;
-    tracing::info!(io = engine.io_backend(), sync = ?engine.config().sync, "storage engine ready");
+    tracing::info!(
+        io = engine.io_backend(),
+        sync = ?engine.config().sync,
+        encryption = engine.encryption_fingerprint().unwrap_or("off"),
+        "storage engine ready"
+    );
 
     let mut s3 = S3Config {
         region: args.region.clone(),
@@ -319,6 +337,12 @@ async fn main() -> anyhow::Result<()> {
                 .await?
         }
         _ => {
+            // Small responses are written as headers plus a body frame;
+            // without TCP_NODELAY, Nagle holds the second write until the
+            // client's delayed ACK (~40 ms).
+            let listener = listener.tap_io(|tcp| {
+                let _ = tcp.set_nodelay(true);
+            });
             axum::serve(listener, app)
                 .with_graceful_shutdown(shutdown)
                 .await?

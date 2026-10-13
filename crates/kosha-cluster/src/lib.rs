@@ -221,6 +221,11 @@ impl Cluster {
                 })
             }
             None => tokio::spawn(async move {
+                use axum::serve::ListenerExt;
+                // Small chunk transfers would otherwise wait on Nagle.
+                let listener = listener.tap_io(|tcp| {
+                    let _ = tcp.set_nodelay(true);
+                });
                 if let Err(e) = axum::serve(listener, app).await {
                     tracing::error!(error = %e, "cluster endpoint stopped");
                 }
@@ -275,6 +280,11 @@ impl Cluster {
         let req = JoinRequest {
             id: self.node_id(),
             node: self.self_node(),
+            encryption: self
+                .inner
+                .engine
+                .encryption_fingerprint()
+                .map(str::to_string),
         };
         let mut target = seed.to_string();
         let mut last_err = String::new();
@@ -282,13 +292,19 @@ impl Cluster {
             match self
                 .inner
                 .client
-                .call::<_, LeaderReply<()>>(&target, "/cluster/join", &req, FORWARD_TIMEOUT)
+                .call::<_, LeaderReply<Result<(), String>>>(
+                    &target,
+                    "/cluster/join",
+                    &req,
+                    FORWARD_TIMEOUT,
+                )
                 .await
             {
-                Ok(LeaderReply::Ok(())) => {
+                Ok(LeaderReply::Ok(Ok(()))) => {
                     tracing::info!(node = self.node_id(), "joined cluster");
                     return Ok(());
                 }
+                Ok(LeaderReply::Ok(Err(refused))) => return Err(ClusterError::Join(refused)),
                 Ok(LeaderReply::NotLeader(Some((_, leader)))) => target = leader.addr,
                 Ok(LeaderReply::NotLeader(None)) => last_err = "no leader elected yet".into(),
                 Err(e) => last_err = e.to_string(),
@@ -904,7 +920,7 @@ impl Inner {
             .any(|(n, _)| *n == self.cfg.node_id);
         for (n, node) in ranked.iter().filter(|(n, _)| *n != self.cfg.node_id) {
             match self.client.get_chunk(&node.addr, &id.to_hex(), len).await {
-                Ok(data) if data.len() == len as usize && ChunkId::of(&data) == id => {
+                Ok(data) if data.len() == len as usize && store.id_of(&data) == id => {
                     if should_hold {
                         // Read-repair: this node is a designated replica.
                         let (store, data) = (store.clone(), data.clone());

@@ -37,6 +37,10 @@ pub struct Proposed {
 pub struct JoinRequest {
     pub id: NodeId,
     pub node: KoshaNode,
+    /// Fingerprint of the joiner's encryption key (`None`: unencrypted).
+    /// Every member must store chunks under the same key.
+    #[serde(default)]
+    pub encryption: Option<String>,
 }
 
 #[derive(Clone)]

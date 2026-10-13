@@ -1,7 +1,7 @@
 //! Content-addressed chunk files on local disk.
 //!
 //! Layout: `<root>/ab/cd/<64 hex chars>`. Each file is one codec byte
-//! followed by the (possibly compressed) payload. Writes go to a temp file
+//! followed by the (possibly compressed, possibly encrypted) payload. Writes go to a temp file
 //! and are renamed into place, so a chunk file is either absent or complete.
 //! File I/O runs on the configured [`IoBackend`] (io_uring or threads);
 //! hashing and compression run on the blocking pool.
@@ -30,6 +30,7 @@ use std::time::{Duration, SystemTime};
 use bytes::Bytes;
 use parking_lot::Mutex;
 
+use crate::crypt::{ChunkKeys, check_marker};
 use crate::durability::{GroupSync, SyncMode, sync_dir};
 use crate::error::{Error, Result};
 use crate::io::IoBackend;
@@ -37,6 +38,8 @@ use crate::types::ChunkId;
 
 const CODEC_RAW: u8 = 0;
 const CODEC_ZSTD: u8 = 1;
+/// Set on the codec byte when the payload is encrypted.
+const ENCRYPTED: u8 = 0x80;
 
 /// Probe size used to decide whether a chunk is worth compressing.
 const PROBE: usize = 64 * 1024;
@@ -47,6 +50,8 @@ pub struct StoreOptions {
     pub compression_level: i32,
     pub io: IoBackend,
     pub gc_grace: Duration,
+    /// Encrypt chunks at rest (and address them with a keyed hash).
+    pub keys: Option<Arc<ChunkKeys>>,
 }
 
 pub struct ChunkStore {
@@ -80,6 +85,7 @@ impl ChunkStore {
     pub fn open(root: &Path, opts: StoreOptions) -> Result<Self> {
         let tmp = root.join("tmp");
         fs::create_dir_all(&tmp)?;
+        check_marker(root, opts.keys.as_deref())?;
         // Leftover temp files are from writes that never completed.
         for entry in fs::read_dir(&tmp)? {
             let _ = fs::remove_file(entry?.path());
@@ -111,6 +117,14 @@ impl ChunkStore {
         match &self.group_sync {
             Some(g) => (g.stats.requests.load(Relaxed), g.stats.syncs.load(Relaxed)),
             None => (0, 0),
+        }
+    }
+
+    /// The content address of `data`: BLAKE3, keyed when encrypting.
+    pub fn id_of(&self, data: &[u8]) -> ChunkId {
+        match &self.opts.keys {
+            Some(k) => k.chunk_id(data),
+            None => ChunkId::of(data),
         }
     }
 
@@ -147,7 +161,7 @@ impl ChunkStore {
     pub async fn put(self: &Arc<Self>, data: Bytes) -> Result<StoredChunk> {
         let this = self.clone();
         let prepared = tokio::task::spawn_blocking(move || {
-            let id = ChunkId::of(&data);
+            let id = this.id_of(&data);
             this.pin(id);
             this.prepare(id, &data).inspect_err(|_| this.unpin(&id))
         })
@@ -161,7 +175,7 @@ impl ChunkStore {
     pub async fn put_replica(self: &Arc<Self>, id: ChunkId, data: Bytes) -> Result<StoredChunk> {
         let this = self.clone();
         let prepared = tokio::task::spawn_blocking(move || {
-            if ChunkId::of(&data) != id {
+            if this.id_of(&data) != id {
                 return Err(Error::Corrupt(format!(
                     "replica for {} does not match its address",
                     id.to_hex()
@@ -227,7 +241,7 @@ impl ChunkStore {
                 stored_len: md.len(),
             }));
         }
-        let buf = self.encode(data)?;
+        let buf = self.encode(&id, data)?;
         fs::create_dir_all(path.parent().expect("chunk path has parent"))?;
         Ok(Prepared::Write {
             chunk: StoredChunk {
@@ -247,7 +261,20 @@ impl ChunkStore {
     /// with a fast level and skip compression entirely for incompressible
     /// data (media, archives, encrypted blobs), which is most of what object
     /// stores hold.
-    fn encode(&self, data: &[u8]) -> Result<Vec<u8>> {
+    fn encode(&self, id: &ChunkId, data: &[u8]) -> Result<Vec<u8>> {
+        let plain = self.compress(data)?;
+        let Some(keys) = &self.opts.keys else {
+            return Ok(plain);
+        };
+        let codec = plain[0] | ENCRYPTED;
+        let sealed = keys.seal(id, codec, &plain[1..]);
+        let mut v = Vec::with_capacity(sealed.len() + 1);
+        v.push(codec);
+        v.extend_from_slice(&sealed);
+        Ok(v)
+    }
+
+    fn compress(&self, data: &[u8]) -> Result<Vec<u8>> {
         let raw = || {
             let mut v = Vec::with_capacity(data.len() + 1);
             v.push(CODEC_RAW);
@@ -278,7 +305,7 @@ impl ChunkStore {
         let raw = self
             .opts
             .io
-            .read_file(self.path_of(id), len as usize + 1)
+            .read_file(self.path_of(id), len as usize + 1 + TAG_LEN)
             .await
             .map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
@@ -288,7 +315,8 @@ impl ChunkStore {
                 }
             })?;
         let id = *id;
-        tokio::task::spawn_blocking(move || decode(id, len, raw)).await?
+        let keys = self.opts.keys.clone();
+        tokio::task::spawn_blocking(move || decode(id, len, raw, keys.as_deref())).await?
     }
 
     fn old_enough(&self, path: &Path) -> bool {
@@ -380,10 +408,27 @@ fn touch(path: &Path) {
         .and_then(|f| f.set_modified(SystemTime::now()));
 }
 
-fn decode(id: ChunkId, len: u32, raw: Vec<u8>) -> Result<Bytes> {
+/// Authentication tag added by encryption.
+const TAG_LEN: usize = 16;
+
+fn decode(id: ChunkId, len: u32, raw: Vec<u8>, keys: Option<&ChunkKeys>) -> Result<Bytes> {
     let (&codec, payload) = raw
         .split_first()
         .ok_or_else(|| Error::Corrupt(format!("chunk {} is empty", id.to_hex())))?;
+    let (codec, raw) = if codec & ENCRYPTED != 0 {
+        let keys = keys.ok_or_else(|| {
+            Error::Corrupt(format!(
+                "chunk {} is encrypted and no key is configured",
+                id.to_hex()
+            ))
+        })?;
+        let mut plain = keys.open(&id, codec, payload)?;
+        plain.insert(0, codec & !ENCRYPTED);
+        (codec & !ENCRYPTED, plain)
+    } else {
+        (codec, raw)
+    };
+    let payload = &raw[1..];
     let data = match codec {
         CODEC_RAW => {
             let mut raw = raw;
@@ -398,7 +443,11 @@ fn decode(id: ChunkId, len: u32, raw: Vec<u8>) -> Result<Bytes> {
             )));
         }
     };
-    if data.len() != len as usize || ChunkId::of(&data) != id {
+    let actual = match keys {
+        Some(k) => k.chunk_id(&data),
+        None => ChunkId::of(&data),
+    };
+    if data.len() != len as usize || actual != id {
         return Err(Error::Corrupt(format!(
             "chunk {} failed integrity check",
             id.to_hex()
@@ -449,6 +498,7 @@ mod tests {
                     compression_level: level,
                     io: IoBackend::new(IoMode::Auto, 1).unwrap(),
                     gc_grace: grace,
+                    keys: None,
                 },
             )
             .unwrap(),
@@ -482,6 +532,7 @@ mod tests {
                         compression_level: 0,
                         io: IoBackend::new(IoMode::Auto, 1).unwrap(),
                         gc_grace: Duration::ZERO,
+                        keys: None,
                     },
                 )
                 .unwrap(),

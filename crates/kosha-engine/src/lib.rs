@@ -16,6 +16,7 @@
 mod chunker;
 mod chunkstore;
 mod commit;
+mod crypt;
 mod durability;
 mod engine;
 mod error;
@@ -30,6 +31,7 @@ mod writer;
 
 pub use chunker::ChunkerConfig;
 pub use chunkstore::{ChunkStore, StoredChunk};
+pub use crypt::ChunkKeys;
 pub use durability::SyncMode;
 pub use engine::{
     ChunkPlacement, Consensus, CopySource, Engine, EngineConfig, WriteStats, validate_bucket_name,

@@ -26,6 +26,7 @@ with io_uring.
 | Durability after node loss | manual rebuild | **self-healing**: background re-replication restores every chunk's replica count |
 | Retried writes | may apply twice | **exactly-once**: request ids make a re-delivered write return its original result |
 | Data durability cost | fsync per file | **group sync**: concurrent chunk writes share one `syncfs`, including the directory entry |
+| Encryption at rest | breaks dedup, or none | **dedup-preserving**: keyed chunk addresses + deterministic AES-256-GCM-SIV |
 | Versions | full copies per version | **versions share chunks**: a new version stores only the chunks that changed |
 | Admin UI | separate product | **built-in web console**, compiled into the binary |
 
@@ -36,6 +37,7 @@ with io_uring.
 [Web console](#4-web-console) ·
 [Cluster](#5-run-a-cluster) ·
 [Monitoring](#6-monitoring) ·
+[Security](#7-security) ·
 [Performance](#performance) ·
 [Configuration](#configuration) ·
 [S3 compatibility](#s3-compatibility) ·
@@ -176,14 +178,17 @@ curl --aws-sigv4 "aws:amz:us-east-1:s3" --user admin:change-me-please \
 
 Open **`http://<server>:9000/_kosha/ui/`** and sign in with the access key and
 secret. The console talks to the ordinary S3 API: requests are SigV4-signed in
-your browser, so there are no extra admin endpoints and no server-side
-sessions. It works over plain HTTP too.
+your browser, so there are no server-side sessions. It works over plain HTTP
+too.
 
 - **Overview**: object counts, logical vs on-disk size, and how much dedup and
   compression saved. Also shows the I/O backend and cluster role.
-- **Buckets and object browser**: create and delete buckets, browse folders,
-  drag-and-drop uploads with progress, object details, downloads, expiring
-  share links (1 hour / 1 day / 7 days), and bulk delete.
+- **Buckets and object browser**: create and delete buckets, edit bucket
+  policies, browse folders, drag-and-drop uploads with progress, object
+  details, downloads, expiring share links (1 hour / 1 day / 7 days), and
+  bulk delete.
+- **Users** (root keys only): create users with a starting policy, show their
+  keys once, edit policies, disable, rotate secrets, delete.
 - **Cluster**: leader, Raft term, log and applied indexes, per-node
   replication progress, lease-read hit rate and background-repair counters,
   refreshed every 2 seconds. Nodes can be removed from here.
@@ -191,6 +196,8 @@ sessions. It works over plain HTTP too.
 | Object browser | Cluster (dark mode) |
 |---|---|
 | ![](docs/images/console-browser.png) | ![](docs/images/console-cluster-dark.png) |
+
+![Users page](docs/images/console-users.png)
 
 ## 5. Run a cluster
 
@@ -246,8 +253,9 @@ Things to know:
 - **Removing a node**: click **Remove** in the console's Cluster page, or
   call `DELETE /_kosha/cluster/nodes/<id>` (SigV4-signed) on any node. Then
   stop that node's process. Its data is re-replicated in the background.
-- Internal traffic (port 9100) is plain HTTP authenticated by the shared
-  secret. **Keep it on a private network.**
+- Internal traffic (port 9100) is authenticated by the shared secret. Without
+  `--cluster-tls-*` it is plain HTTP, so **either enable mutual TLS
+  ([Security](#cluster-mutual-tls)) or keep it on a private network.**
 
 ### Try a cluster on one machine
 
@@ -271,6 +279,10 @@ curl -X DELETE --aws-sigv4 "aws:amz:us-east-1:s3" --user admin:admin-secret-key 
 | `GET /_kosha/metrics` | SigV4, or none with `--metrics-public` | Prometheus: requests and latency histograms per S3 operation, bytes in/out, storage gauges, group commit/sync batching, Raft state, follower lag, lease/quorum reads, repair counters |
 | `GET /_kosha/cluster` | SigV4 | role, term, leader, log/applied indexes, members, replication progress, lease vs quorum reads, background repair counters |
 | `DELETE /_kosha/cluster/nodes/{id}` | SigV4 | removes a voter (refuses non-voters and the last voter) |
+| `/_kosha/admin/users[/{key}]` | SigV4 | user management (see [Security](#users-and-policies)) |
+
+Every `/_kosha/` endpoint except `health` (and `metrics` with
+`--metrics-public`) requires a **root** key; user keys get `403`.
 
 ```sh
 curl -s --aws-sigv4 "aws:amz:us-east-1:s3" --user admin:change-me-please http://localhost:9000/_kosha/stats
@@ -291,6 +303,132 @@ scrape_configs:
 filtered with `RUST_LOG`. Per-request lines are at debug level, for example
 `RUST_LOG=kosha_s3=debug`; at the default level the metrics are the
 per-request record.
+
+## 7. Security
+
+### Users and policies
+
+The keys from `KOSHA_ACCESS_KEY` / `KOSHA_SECRET_KEY` are **root** keys: they
+bypass policies. Everyone else gets a **user** with its own access key, whose
+permissions come from IAM-style policies. Users are stored in the replicated
+metadata, so every node authenticates them.
+
+```sh
+alias kadmin='curl -s --aws-sigv4 "aws:amz:us-east-1:s3" --user admin:change-me-please'
+
+# create a user with an identity policy; the response carries its keys (shown once)
+kadmin -X POST http://localhost:9000/_kosha/admin/users -H 'content-type: application/json' -d '{
+  "name": "analytics",
+  "policy": {"Version": "2012-10-17", "Statement": [
+    {"Effect": "Allow", "Action": ["s3:GetObject", "s3:ListBucket"],
+     "Resource": ["arn:aws:s3:::reports", "arn:aws:s3:::reports/*"]}]}}'
+# {"access_key":"KS4VUIBFMF75WK64R7EL","secret_key":"…","name":"analytics",…}
+
+kadmin http://localhost:9000/_kosha/admin/users                          # list (no secrets)
+kadmin -X PUT http://localhost:9000/_kosha/admin/users/KS4V… -d '{"enabled": false}'
+kadmin -X PUT http://localhost:9000/_kosha/admin/users/KS4V… -d '{"rotate_secret": true}'
+kadmin -X DELETE http://localhost:9000/_kosha/admin/users/KS4V…
+```
+
+**Bucket policies** use the same language plus `Principal`. `"Principal": "*"`
+grants anonymous (unsigned) access, which is how you publish a static site or
+a download area:
+
+```sh
+aws --endpoint-url http://localhost:9000 s3api put-bucket-policy --bucket site --policy '{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::site/*"},
+    {"Effect": "Allow", "Principal": {"AWS": ["arn:aws:iam:::user/analytics"]},
+     "Action": "s3:PutObject", "Resource": "arn:aws:s3:::site/uploads/*",
+     "Condition": {"IpAddress": {"aws:SourceIp": "10.0.0.0/8"}}}]}'
+curl http://localhost:9000/site/index.html        # no signature needed now
+```
+
+What the policy language supports:
+
+| | |
+|---|---|
+| Statements | `Effect`, `Action`/`NotAction`, `Resource`/`NotResource` with `*` and `?`, `Principal` (`"*"`, user names, `arn:…:user/NAME`, access keys) |
+| Variables | `${aws:username}`, `${aws:userid}` and any condition key, e.g. `arn:aws:s3:::home/${aws:username}/*` |
+| Conditions | `String(Not)Equals(IgnoreCase)`, `String(Not)Like`, `Numeric*`, `(Not)IpAddress`, `Bool`, `Null`, `…IfExists`, `ForAnyValue:`/`ForAllValues:` |
+| Condition keys | `aws:SourceIp`, `aws:SecureTransport`, `aws:username`, `aws:userid`, `aws:PrincipalType`, `aws:UserAgent`, `aws:Referer`, `aws:CurrentTime`, `aws:EpochTime`, `s3:prefix`, `s3:delimiter`, `s3:max-keys`, `s3:VersionId`, `s3:x-amz-server-side-encryption`, `s3:signatureversion`, `s3:authType`, … |
+| Evaluation | an explicit `Deny` anywhere wins; otherwise an `Allow` in the identity **or** the bucket policy grants access; otherwise `AccessDenied` |
+
+Every S3 operation maps to its IAM action (`s3:GetObject`,
+`s3:ListBucket`, `s3:PutBucketPolicy`, …). `DeleteObjects` is checked key by
+key, copies also need `s3:GetObject` on the source, and without
+`s3:ListBucket` a missing key reads as `AccessDenied`, so callers cannot probe
+which keys exist. Invalid policies are rejected with `MalformedPolicy` when
+you set them.
+
+### HTTPS
+
+```sh
+kosha --tls-cert server.pem --tls-key server.key ...   # serves S3 and the console over HTTPS
+aws --endpoint-url https://s3.example.internal:9000 s3 ls
+```
+
+`aws:SecureTransport` is `true` for requests that arrive over TLS.
+
+### Cluster mutual TLS
+
+Give every node a certificate from your own CA. The certificate's SANs must
+cover the address peers dial (`--cluster-advertise`, an IP or a DNS name):
+
+```sh
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
+  -keyout ca.key -out ca.pem -subj "/CN=Kosha CA"
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -keyout node1.key -out node1.csr -subj "/CN=node1"
+openssl x509 -req -in node1.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 825 -out node1.pem \
+  -extfile <(printf "subjectAltName=IP:10.0.0.1\nextendedKeyUsage=serverAuth,clientAuth")
+
+kosha --node-id 1 ... --cluster-tls-cert node1.pem --cluster-tls-key node1.key --cluster-tls-ca ca.pem
+```
+
+All internal traffic (Raft, chunk replication, repair) then runs over TLS,
+and each side verifies the other: a peer without a certificate from that CA
+is refused before it can send anything, even if it knows the cluster
+secret.
+
+### Encryption at rest
+
+```sh
+openssl rand -hex 32 > /etc/kosha/kosha.key && chmod 600 /etc/kosha/kosha.key
+kosha --encryption-key-file /etc/kosha/kosha.key ...
+```
+
+Object data is encrypted on disk **without giving up dedup**:
+
+- **Chunk addresses** are a *keyed* BLAKE3 hash. Identical content still maps
+  to one chunk, but someone with the disks cannot check whether a known file
+  is stored by hashing it.
+- **Chunk contents** are compressed, then encrypted with AES-256-GCM-SIV. The
+  nonce is derived from the chunk address, so encryption is deterministic:
+  replicas stay byte-identical and repair can compare them. GCM-SIV is
+  designed to stay secure when the same plaintext meets the same nonce.
+- **Every read is authenticated**: a modified chunk fails decryption.
+- **Small objects are encrypted too.** They are stored as chunks instead of
+  inline in the metadata.
+
+Other things to know:
+
+- **Choose encryption when you create a data directory.** Kosha records the
+  key's fingerprint in it and refuses to start with a different key, without
+  one, or with a key on a directory that already holds unencrypted data.
+- **Every cluster node needs the same key.** A node with another key, or none,
+  is refused when it joins.
+- **Back up the key.** Without it the data cannot be read.
+- `x-amz-server-side-encryption: AES256` is returned on object responses, and
+  GetBucketEncryption reports SSE-S3.
+- **Refused, not ignored:** on a server without a key, a request for SSE is
+  refused rather than stored in plaintext. SSE-KMS and SSE-C (customer keys)
+  return `NotImplemented`.
+- **Not encrypted:** metadata (bucket and key names, sizes, tags, user
+  metadata, users' secret keys) stays readable in `meta.redb` and the Raft
+  log. Treat the data directory as sensitive.
+- **Cost:** see [Performance](#cost-of-encryption-at-rest).
 
 ---
 
@@ -407,6 +545,24 @@ large objects in the cluster.
 - **Small writes** now run at about the same rate as small reads, so the
   client, the HTTP stack and SigV4 verification share the remaining cost.
 
+### Cost of encryption at rest
+
+Same VM, single node, back-to-back runs with and without
+`--encryption-key-file`:
+
+| Workload | Plain | Encrypted | |
+|---|---|---|---|
+| 4 KiB PUT, 32 concurrent | 3,260 req/s | 1,300 req/s | small objects become chunk files instead of inline metadata |
+| 4 KiB GET, 32 concurrent | 4,450 req/s | 3,860 req/s | |
+| 64 KiB PUT / GET | 940 / 3,210 req/s | 1,064 / 3,180 req/s | within noise |
+| 16 MiB PUT / GET, 4 concurrent | 139 / 875 MiB/s | 146 / 667 MiB/s | decryption costs ~24% on large reads |
+
+These runs also found a bug that affected unencrypted servers too. The S3
+listener did not set `TCP_NODELAY`, so objects stored as chunks but smaller
+than a few TCP segments waited ~40 ms on Nagle's algorithm and delayed ACKs.
+Encrypted 4 KiB GETs went from 714 to 3,860 req/s with the fix. Every
+listener now sets it.
+
 ### Reproduce
 
 ```sh
@@ -475,6 +631,9 @@ io_uring. `--io auto` (the default) detects this and falls back to threads;
 | `--gc-grace-secs` | `KOSHA_GC_GRACE_SECS` | `900` | cluster: keep unreferenced chunks this long |
 | `--repair-interval-secs` | `KOSHA_REPAIR_INTERVAL_SECS` | `60` | cluster: background re-replication/rebalancing pass (`0` disables) |
 | `--no-lease-reads` | `KOSHA_NO_LEASE_READS` | off | cluster: prove leadership with a quorum round-trip on every read |
+| `--tls-cert` / `--tls-key` | `KOSHA_TLS_CERT` / `KOSHA_TLS_KEY` | none | serve S3 and the console over HTTPS |
+| `--encryption-key-file` | `KOSHA_ENCRYPTION_KEY_FILE` | none | encrypt object data at rest (64 hex chars); fixed per data directory |
+| `--cluster-tls-cert` / `--cluster-tls-key` / `--cluster-tls-ca` | `KOSHA_CLUSTER_TLS_*` | none | mutual TLS for all internal cluster traffic |
 | `--lifecycle-interval-secs` | `KOSHA_LIFECYCLE_INTERVAL_SECS` | `3600` | how often lifecycle rules run (leader only in a cluster; `0` disables) |
 
 ## S3 compatibility
@@ -484,9 +643,11 @@ Tested against the **AWS SDK for Rust** (in CI), **boto3**, the **AWS CLI**,
 
 | Area | Supported |
 |---|---|
-| Auth | SigV4 headers, SigV4 presigned URLs, streaming `aws-chunked` with per-chunk signature verification, unsigned-payload trailers, SigV2 presigned URLs (boto3's default) |
+| Auth | SigV4 headers, SigV4 presigned URLs, streaming `aws-chunked` with per-chunk signature verification, unsigned-payload trailers, SigV2 headers and presigned URLs, anonymous requests (when a bucket policy allows them) |
+| Access control | users with identity policies, Get/Put/DeleteBucketPolicy, GetBucketPolicyStatus, IAM conditions (see [Security](#users-and-policies)) |
+| Encryption | SSE-S3 semantics server-wide (`x-amz-server-side-encryption: AES256`, Get/Put/DeleteBucketEncryption) |
 | Integrity | `x-amz-content-sha256` verified, `Content-MD5`, `x-amz-checksum-crc32` (header or trailer) |
-| Buckets | Create, Delete, Head, List, GetBucketLocation, GetBucketAcl; "not configured" responses for policy/encryption/... |
+| Buckets | Create, Delete, Head, List, GetBucketLocation, GetBucketAcl; "not configured" responses for website/replication/... |
 | Objects | Put, Get (single range, conditional, `response-*` overrides), Head, Delete, DeleteObjects, CopyObject (COPY/REPLACE metadata and tagging directives, copy-source conditions), user metadata and standard headers |
 | Tagging | `x-amz-tagging` on Put/Copy/CreateMultipartUpload, Get/Put/DeleteObjectTagging, `x-amz-tagging-count`, Get/Put/DeleteBucketTagging |
 | CORS | Get/Put/DeleteBucketCors, unauthenticated `OPTIONS` preflight, CORS headers on matching responses (origin wildcards, credentials, exposed headers, max-age) |
@@ -497,16 +658,18 @@ Tested against the **AWS SDK for Rust** (in CI), **boto3**, the **AWS CLI**,
 | Multipart | Create, UploadPart, UploadPartCopy (with range), Complete, Abort, ListParts, ListMultipartUploads (paginated) |
 | Writes | Conditional `If-None-Match: *` / `If-Match` on Put, Copy and Complete |
 
-Not implemented yet: bucket policies/IAM, SSE, SigV2 header auth, lifecycle
-transitions to other storage classes. Unsupported operations return `501 NotImplemented`.
+Not implemented: ACL changes (ACLs are reported as owner-only; use
+policies), SSE-KMS and SSE-C, the AWS IAM API itself (users are managed
+through `/_kosha/admin/users` and the console), and lifecycle transitions to
+other storage classes. Unsupported operations return `501 NotImplemented`.
 
 ## Layout
 
 ```
 crates/
-  kosha-engine    storage engine: chunking, chunk store, io_uring, metadata state machine, GC
-  kosha-s3        S3 protocol: routing, SigV4/SigV2, aws-chunked, XML (+ s3bench example)
-  kosha-cluster   Raft (openraft): log store, state machine, network, placement
+  kosha-engine    storage engine: chunking, chunk store, encryption, io_uring, metadata state machine, GC
+  kosha-s3        S3 protocol: routing, SigV4/SigV2, IAM policies, aws-chunked, XML (+ s3bench example)
+  kosha-cluster   Raft (openraft): log store, state machine, network, placement, TLS
   kosha-server    the `kosha` binary (embeds the console)
 ui/               web console (React + TypeScript + Vite)
 scripts/          dev-cluster.sh

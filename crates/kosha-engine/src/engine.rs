@@ -44,6 +44,9 @@ pub struct EngineConfig {
     /// Unreferenced chunk files younger than this are never deleted. Zero is
     /// safe on a single node; clusters need time for remote uploads to commit.
     pub gc_grace: Duration,
+    /// Encrypt object data at rest. Small objects are then stored as
+    /// (encrypted) chunks instead of inline in their manifests.
+    pub encryption: Option<Arc<crate::crypt::ChunkKeys>>,
 }
 
 impl EngineConfig {
@@ -63,6 +66,7 @@ impl EngineConfig {
             io_mode: IoMode::Auto,
             io_rings: cpus.min(8),
             gc_grace: Duration::ZERO,
+            encryption: None,
         }
     }
 }
@@ -166,8 +170,12 @@ fn expect_object(out: CommandOutput) -> Result<ObjectMeta> {
 }
 
 impl Engine {
-    pub fn open(cfg: EngineConfig) -> Result<Engine> {
+    pub fn open(mut cfg: EngineConfig) -> Result<Engine> {
         std::fs::create_dir_all(&cfg.data_dir)?;
+        if cfg.encryption.is_some() {
+            // Inline data would sit unencrypted in the metadata.
+            cfg.inline_max = 0;
+        }
         let io = IoBackend::new(cfg.io_mode, cfg.io_rings)?;
         let store = ChunkStore::open(
             &cfg.data_dir.join("chunks"),
@@ -176,6 +184,7 @@ impl Engine {
                 compression_level: cfg.compression_level,
                 io,
                 gc_grace: cfg.gc_grace,
+                keys: cfg.encryption.clone(),
             },
         )?;
         let meta = Arc::new(MetaStore::open(&cfg.data_dir.join("meta.redb"))?);
@@ -191,6 +200,20 @@ impl Engine {
                 placement: OnceLock::new(),
             }),
         })
+    }
+
+    /// The content address of a chunk (keyed BLAKE3 when encrypting).
+    pub fn chunk_id(&self, data: &[u8]) -> ChunkId {
+        self.inner.store.id_of(data)
+    }
+
+    /// Fingerprint of the encryption key, if data is encrypted at rest.
+    pub fn encryption_fingerprint(&self) -> Option<&str> {
+        self.inner
+            .cfg
+            .encryption
+            .as_deref()
+            .map(|k| k.fingerprint())
     }
 
     pub fn config(&self) -> &EngineConfig {

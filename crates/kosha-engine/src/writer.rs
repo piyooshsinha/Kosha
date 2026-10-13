@@ -34,6 +34,8 @@ pub struct ObjectWriter {
     segments: Vec<Segment>,
     stored: HashMap<ChunkId, u64>,
     pins: Arc<PinSet>,
+    /// Computes chunk ids (keyed when encrypting).
+    store: Arc<ChunkStore>,
 }
 
 /// Everything needed to commit an ingested body to the metadata store.
@@ -74,6 +76,7 @@ impl ObjectWriter {
             segments: Vec::new(),
             stored: HashMap::new(),
             pins,
+            store,
         }
     }
 
@@ -130,9 +133,10 @@ impl ObjectWriter {
             }
             ChunkSink::Placed(placement) => {
                 let placement = placement.clone();
+                let store = self.store.clone();
                 tokio::spawn(async move {
                     let (id, chunk) =
-                        tokio::task::spawn_blocking(move || (ChunkId::of(&chunk), chunk)).await?;
+                        tokio::task::spawn_blocking(move || (store.id_of(&chunk), chunk)).await?;
                     let len = chunk.len() as u32;
                     let stored_len = placement.put(id, chunk).await?;
                     Ok(StoredChunk {

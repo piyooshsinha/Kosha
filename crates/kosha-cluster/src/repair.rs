@@ -112,7 +112,7 @@ impl Inner {
         if mine_live && !have {
             for (n, node) in ranked.iter().filter(|(n, _)| *n != me && live.contains(n)) {
                 match self.client.get_chunk(&node.addr, &id.to_hex(), len).await {
-                    Ok(data) if data.len() == len as usize && ChunkId::of(&data) == id => {
+                    Ok(data) if data.len() == len as usize && store.id_of(&data) == id => {
                         return match store.put_replica(id, data).await {
                             Ok(_) => Action::Repaired,
                             Err(e) => {

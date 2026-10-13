@@ -119,17 +119,25 @@ async fn read_index(State(inner): St) -> Response {
 }
 
 async fn join(State(inner): St, body: Bytes) -> Response {
+    type Reply = LeaderReply<Result<(), String>>;
     let req: JoinRequest = match decode(&body) {
         Ok(r) => r,
         Err(e) => return bad_request(e),
     };
+    let ours = inner.engine.encryption_fingerprint();
+    if req.encryption.as_deref() != ours {
+        let show = |k: Option<&str>| k.map_or("none".to_string(), |k| format!("key {k}"));
+        return msgpack(&Reply::Ok(Err(format!(
+            "encryption mismatch: the cluster uses {}, the joining node {}",
+            show(ours),
+            show(req.encryption.as_deref())
+        ))));
+    }
     // Catch the new node up as a learner first, then promote it.
     match inner.raft.add_learner(req.id, req.node.clone(), true).await {
         Ok(_) => {}
         Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) => {
-            return msgpack(&LeaderReply::<()>::NotLeader(
-                f.leader_id.zip(f.leader_node),
-            ));
+            return msgpack(&Reply::NotLeader(f.leader_id.zip(f.leader_node)));
         }
         Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
     }
@@ -140,11 +148,11 @@ async fn join(State(inner): St, body: Bytes) -> Response {
     {
         Ok(_) => {
             tracing::info!(node = req.id, addr = %req.node.addr, "node joined as voter");
-            msgpack(&LeaderReply::Ok(()))
+            msgpack(&Reply::Ok(Ok(())))
         }
-        Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) => msgpack(
-            &LeaderReply::<()>::NotLeader(f.leader_id.zip(f.leader_node)),
-        ),
+        Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) => {
+            msgpack(&Reply::NotLeader(f.leader_id.zip(f.leader_node)))
+        }
         Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
     }
 }

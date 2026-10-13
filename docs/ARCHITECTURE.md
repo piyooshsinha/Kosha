@@ -279,6 +279,63 @@ replication, ordering and Object Lock checks for free; locked versions are
 reported as refused and left in place. A version counts as noncurrent from
 the moment its successor was written.
 
+## Authentication and authorization
+
+Every request is authenticated first (SigV4 header, presigned or streaming;
+SigV2 header or presigned; or unsigned), which yields a principal: a root
+key, a user, or anonymous. Root keys come from the command line and skip
+authorization. Users live in the replicated `users` table, so any node can
+look up a secret locally on every request; `PutUser`/`DeleteUser` are
+ordinary state-machine commands.
+
+Authorization maps the request to IAM actions and resources (`iam::required`)
+and evaluates the user's identity policy and the bucket's policy together:
+an explicit `Deny` in either wins, an `Allow` in either grants, and nothing
+matching denies. Two checks need the handler's help, because they depend on
+the request body or a second resource: `DeleteObjects` checks
+`s3:DeleteObject` per key, and copies check `s3:GetObject` on the source.
+Policies are validated when stored and parsed again when evaluated (they are
+small; parsing is microseconds). Root and development-mode requests skip
+building the condition context entirely.
+
+## Encryption at rest
+
+Encryption has to coexist with content addressing: chunk ids are the dedup
+key, the replication unit, and the integrity check. Kosha keeps all three
+roles by making encryption *deterministic per content*:
+
+- `id = BLAKE3-keyed(K_id, plaintext)`. Equal content gets equal ids, so dedup
+  works across objects, buckets and users. Unlike a plain hash, the id does
+  not let anyone without the key test for known content.
+- `stored = AES-256-GCM-SIV(K_enc, nonce = id[..12], aad = codec byte,
+  zstd(plaintext))`. GCM-SIV is misuse-resistant: repeating a nonce with the
+  same plaintext only repeats the ciphertext, which the id already reveals.
+  Replicas are therefore byte-identical.
+- `K_id` and `K_enc` are derived from one master key with BLAKE3's KDF, and a
+  short fingerprint (a third derivation) is written to `chunks/ENCRYPTION`.
+  Opening a store with a different key, without a key, or adding a key to an
+  unencrypted store fails at startup. Joining a cluster compares
+  fingerprints.
+- Reads decrypt (authenticating the bytes), decompress, and re-derive the
+  keyed id, so corruption and tampering are both caught.
+- Inline objects would put plaintext into the metadata, so encrypted engines
+  set `inline_max = 0`.
+
+Metadata is not encrypted: names, sizes, tags, user metadata and user
+secrets are readable in redb and in the Raft log.
+
+## Transport security
+
+The S3 listener and the cluster listener share `tls::TlsListener`. It
+accepts TCP connections and runs each TLS handshake on its own task with a
+timeout, so a slow or malicious client cannot stall the accept loop. It
+implements `axum::serve::Listener`, so graceful shutdown and `ConnectInfo`
+(for `aws:SourceIp`) work as with plain TCP. With `--cluster-tls-*`, the
+cluster server requires client certificates signed by the CA, and the RPC
+client presents its own certificate and verifies the server's name against
+the CA. The shared secret is still checked on top of mTLS. Every listener
+sets `TCP_NODELAY`.
+
 ## Raft details
 
 - The log is stored in redb (`raft/raft-log.redb`). Each append is one fsynced
@@ -314,6 +371,7 @@ thread pool when io_uring is disabled.
 | `objects` | `bucket \0 key` | manifest: size, ETag, attrs, segments |
 | `chunks` | BLAKE3 id | refcount, raw length, stored length |
 | `uploads` / `upload_index` / `parts` | upload id / `bucket \0 key \0 id` / `id \0 part#` | multipart state |
+| `users` | access key | user: secret, name, identity policy, enabled |
 | `versions` | `bucket \0 key \0 (MAX - seq)` | version: manifest or delete marker, lock state |
 | `requests` / `request_seq` | request id / sequence | results of recent writes, for exactly-once retries |
 | `meta` | `stats`, `sm_state` | counters, consensus state |
@@ -331,8 +389,14 @@ O(entries returned) rather than O(keys under the prefix).
   margin). Turn them off with `--no-lease-reads` where that does not hold.
 - **Snapshots are built in memory** and sent whole. This is fine for
   millions of objects. Very large namespaces need streaming snapshots.
-- **Internal traffic is not encrypted.** Use a private network until mTLS
-  lands.
+- **Internal traffic is encrypted only with `--cluster-tls-*`.** Without it,
+  keep port 9100 on a private network.
+- **Metadata is not encrypted at rest**, including users' secret keys (they
+  are needed in plaintext to verify signatures). Protect the data directory.
+- **Policies cover S3 actions only.** There is no IAM API, no groups or roles,
+  and no STS session credentials; ACLs are read-only.
+- **Encryption cannot be turned on for an existing data directory.** Migrate
+  by copying the data to a new encrypted node or cluster.
 - **`--sync group` flushes the whole chunk filesystem.** Put the data
   directory on a filesystem Kosha does not share with write-heavy neighbours,
   or use `--sync file`.
@@ -348,13 +412,16 @@ reads, background re-replication and rebalancing, node removal from the
 console and API, ListMultipartUploads pagination.
 
 Also done: exactly-once retried writes (request ids), group sync for chunk
-data, Prometheus metrics, object and bucket tagging, bucket CORS. Versioning, Object Lock (retention and legal hold) and lifecycle
-rules.
+data, Prometheus metrics, object and bucket tagging, bucket CORS.
+Versioning, Object Lock (retention and legal hold) and lifecycle rules.
+Users, identity and bucket policies (with anonymous access), SigV2 header
+auth, HTTPS, mutual TLS between nodes, and dedup-preserving encryption at
+rest.
 
 **Next**
-- mTLS between nodes.
-- Users, access keys and bucket policies stored in the replicated state machine.
 - io_uring with registered buffers and `O_DIRECT` for large chunks.
+- Key rotation for encryption at rest (re-encrypting chunks in the
+  background under a new key).
 
 **Later**
 - Reed–Solomon erasure coding for cold chunks (for example 8+3), with

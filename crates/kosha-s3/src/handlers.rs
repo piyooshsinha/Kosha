@@ -388,6 +388,7 @@ async fn handle(st: Arc<AppState>, req: Request) -> S3Result<Response> {
             return Err(S3Error::access_denied("Access Denied"));
         }
     }
+    check_sse_request(&st, &parts.headers)?;
     let ctx = Ctx {
         st,
         method: parts.method,
@@ -414,6 +415,19 @@ async fn handle(st: Arc<AppState>, req: Request) -> S3Result<Response> {
         } else {
             e
         }
+    });
+    // Object data is encrypted server-wide when a key is configured.
+    let result = result.map(|mut r| {
+        if ctx.key.is_some()
+            && r.status().is_success()
+            && ctx.engine().encryption_fingerprint().is_some()
+        {
+            r.headers_mut().insert(
+                "x-amz-server-side-encryption",
+                HeaderValue::from_static("AES256"),
+            );
+        }
+        r
     });
     let origin = ctx.header("origin").map(str::to_string);
     match (origin, ctx.bucket.as_deref()) {
@@ -501,6 +515,80 @@ fn request_facts(
                 "REST-QUERY-STRING"
             },
         );
+    }
+}
+
+/// Server-side encryption requested by a client. Kosha encrypts server-wide
+/// (SSE-S3 semantics) when started with a key; a request for encryption
+/// that cannot be honoured is refused rather than stored in plaintext.
+fn check_sse_request(st: &AppState, headers: &HeaderMap) -> S3Result<()> {
+    if headers.contains_key("x-amz-server-side-encryption-customer-algorithm")
+        || headers.contains_key("x-amz-copy-source-server-side-encryption-customer-algorithm")
+    {
+        return Err(S3Error::not_implemented("SSE-C (customer-provided keys)"));
+    }
+    let Some(v) = headers
+        .get("x-amz-server-side-encryption")
+        .and_then(|v| v.to_str().ok())
+    else {
+        return Ok(());
+    };
+    match v {
+        "AES256" if st.engine.encryption_fingerprint().is_some() => Ok(()),
+        "AES256" => Err(S3Error::invalid_argument(
+            "Server-side encryption was requested, but this server stores data unencrypted (start it with --encryption-key-file)",
+        )),
+        "aws:kms" | "aws:kms:dsse" => Err(S3Error::not_implemented("SSE-KMS")),
+        other => Err(S3Error::invalid_argument(format!(
+            "unsupported x-amz-server-side-encryption: {other}"
+        ))),
+    }
+}
+
+/// Get/Put/DeleteBucketEncryption. Encryption is a server-wide setting, so
+/// buckets report it and accept only a configuration that matches it.
+async fn bucket_encryption(ctx: &Ctx, bucket: &str, body: Body) -> S3Result<Response> {
+    let engine = ctx.engine();
+    let enabled = engine.encryption_fingerprint().is_some();
+    match ctx.method {
+        Method::GET => {
+            engine.bucket(bucket).await?;
+            if !enabled {
+                return Err(S3Error::new(
+                    StatusCode::NOT_FOUND,
+                    "ServerSideEncryptionConfigurationNotFoundError",
+                    "The server side encryption configuration was not found",
+                ));
+            }
+            let mut x = Xml::new("ServerSideEncryptionConfiguration");
+            x.open("Rule")
+                .open("ApplyServerSideEncryptionByDefault")
+                .elem("SSEAlgorithm", "AES256")
+                .close("ApplyServerSideEncryptionByDefault")
+                .elem("BucketKeyEnabled", "false")
+                .close("Rule");
+            Ok(xml_response(x.finish("ServerSideEncryptionConfiguration")))
+        }
+        Method::PUT => {
+            let doc = read_text(ctx, body).await?;
+            engine.bucket(bucket).await?;
+            if !enabled {
+                return Err(S3Error::not_implemented(
+                    "per-bucket encryption (start the server with --encryption-key-file to encrypt all data)",
+                ));
+            }
+            if !doc.contains("AES256") || doc.contains("aws:kms") {
+                return Err(S3Error::not_implemented("SSE-KMS"));
+            }
+            Ok(StatusCode::OK.into_response())
+        }
+        Method::DELETE => {
+            // Like S3 since 2023: removing the configuration leaves the
+            // default (SSE-S3) in place.
+            engine.bucket(bucket).await?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+        _ => Err(S3Error::not_implemented("this bucket encryption operation")),
     }
 }
 
@@ -767,6 +855,9 @@ async fn route(ctx: &Ctx, body: Body) -> S3Result<Response> {
             if ctx.has("policy") || ctx.has("policyStatus") {
                 return bucket_policy(ctx, bucket, body).await;
             }
+            if ctx.has("encryption") {
+                return bucket_encryption(ctx, bucket, body).await;
+            }
             if ["tagging", "cors", "versioning", "object-lock", "lifecycle"]
                 .iter()
                 .any(|s| ctx.has(s))
@@ -780,7 +871,6 @@ async fn route(ctx: &Ctx, body: Body) -> S3Result<Response> {
                 Method::PUT => {
                     for sub in [
                         "acl",
-                        "encryption",
                         "object-lock",
                         "notification",
                         "website",
@@ -801,10 +891,6 @@ async fn route(ctx: &Ctx, body: Body) -> S3Result<Response> {
                         .unwrap())
                 }
                 Method::DELETE => {
-                    if ctx.has("encryption") {
-                        ctx.engine().bucket(bucket).await?;
-                        return Ok(StatusCode::NO_CONTENT.into_response());
-                    }
                     ctx.engine().delete_bucket(bucket).await?;
                     Ok(StatusCode::NO_CONTENT.into_response())
                 }
@@ -963,12 +1049,6 @@ async fn get_bucket(ctx: &Ctx, bucket: &str) -> S3Result<Response> {
             StatusCode::NOT_FOUND,
             "NoSuchWebsiteConfiguration",
             "The specified bucket does not have a website configuration",
-        ),
-        (
-            "encryption",
-            StatusCode::NOT_FOUND,
-            "ServerSideEncryptionConfigurationNotFoundError",
-            "The server side encryption configuration was not found",
         ),
         (
             "replication",

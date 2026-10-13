@@ -102,6 +102,7 @@ async fn put_get_range_delete() {
 
 use md5::Digest;
 
+/// Chunk files under `p` (the store's `ENCRYPTION` marker is not one).
 fn walk(p: &std::path::Path) -> usize {
     std::fs::read_dir(p)
         .unwrap()
@@ -110,7 +111,7 @@ fn walk(p: &std::path::Path) -> usize {
             if e.file_type().unwrap().is_dir() {
                 walk(&e.path())
             } else {
-                1
+                usize::from(e.file_name() != "ENCRYPTION")
             }
         })
         .sum()
