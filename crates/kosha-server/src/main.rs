@@ -393,6 +393,8 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     if engine.has_cold_store() {
+        // Reads are recorded in batches for access-based tiering.
+        engine.spawn_access_flusher(Duration::from_secs(30));
         engine.spawn_offloader(
             Duration::from_secs(args.offload_interval_secs.max(1)),
             leader_gate.clone(),

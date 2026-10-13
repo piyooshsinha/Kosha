@@ -639,6 +639,61 @@ async fn bucket_encryption(ctx: &Ctx, bucket: &str, body: Body) -> S3Result<Resp
     }
 }
 
+/// Get/Put/Delete/ListBucketIntelligentTieringConfiguration(s).
+async fn bucket_tiering(ctx: &Ctx, bucket: &str, body: Body) -> S3Result<Response> {
+    let engine = ctx.engine();
+    let rules = engine
+        .bucket(bucket)
+        .await?
+        .config
+        .tiering
+        .unwrap_or_default();
+    let id = ctx.q("id").map(str::to_string);
+    let no_config = || {
+        S3Error::new(
+            StatusCode::NOT_FOUND,
+            "NoSuchConfiguration",
+            "The specified configuration does not exist.",
+        )
+    };
+    match (&ctx.method, id) {
+        (&Method::GET, None) => Ok(xml_response(crate::tiering::render_list(&rules))),
+        (&Method::GET, Some(id)) => rules
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| xml_response(crate::tiering::render(r)))
+            .ok_or_else(no_config),
+        (&Method::PUT, Some(id)) => {
+            let rule = crate::tiering::parse(&read_text(ctx, body).await?, &id)?;
+            if !engine.has_cold_store() {
+                return Err(S3Error::invalid_request(
+                    "Intelligent-Tiering needs a cold tier, and none is configured on this server",
+                ));
+            }
+            let mut rules: Vec<_> = rules.into_iter().filter(|r| r.id != id).collect();
+            rules.push(rule);
+            engine
+                .set_bucket_config(bucket, BucketConfigUpdate::Tiering(Some(rules)))
+                .await?;
+            Ok(StatusCode::OK.into_response())
+        }
+        (&Method::DELETE, Some(id)) => {
+            if !rules.iter().any(|r| r.id == id) {
+                return Err(no_config());
+            }
+            let rules: Vec<_> = rules.into_iter().filter(|r| r.id != id).collect();
+            engine
+                .set_bucket_config(
+                    bucket,
+                    BucketConfigUpdate::Tiering((!rules.is_empty()).then_some(rules)),
+                )
+                .await?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+        _ => Err(S3Error::invalid_argument("the id parameter is required")),
+    }
+}
+
 /// Get/PutBucketNotificationConfiguration.
 async fn bucket_notification(ctx: &Ctx, bucket: &str, body: Body) -> S3Result<Response> {
     let engine = ctx.engine();
@@ -938,6 +993,9 @@ async fn route(ctx: &Ctx, body: Body) -> S3Result<Response> {
             }
             if ctx.has("notification") {
                 return bucket_notification(ctx, bucket, body).await;
+            }
+            if ctx.has("intelligent-tiering") {
+                return bucket_tiering(ctx, bucket, body).await;
             }
             if ["tagging", "cors", "versioning", "object-lock", "lifecycle"]
                 .iter()
@@ -1984,6 +2042,28 @@ async fn get_object(ctx: &Ctx, bucket: &str, key: &str) -> S3Result<Response> {
     } else {
         false
     };
+
+    if ctx.method == Method::GET && !not_modified {
+        // Access-based tiering: record the read, and bring an auto-tiered
+        // object back to STANDARD (in the background; this read is served
+        // from the cold tier).
+        ctx.engine().note_access(bucket, key);
+        if meta.auto_tiered && meta.storage_class.is_some() {
+            let (engine, bucket, key, version) = (
+                ctx.engine().clone(),
+                bucket.to_string(),
+                key.to_string(),
+                meta.version_id
+                    .clone()
+                    .filter(|_| version_param(ctx).is_some()),
+            );
+            tokio::spawn(async move {
+                if let Err(e) = engine.promote_object(&bucket, &key, version).await {
+                    tracing::warn!(%bucket, %key, error = %e, "promoting a read object failed");
+                }
+            });
+        }
+    }
 
     let mut b = Response::builder()
         .header(header::ETAG, quoted(&meta.etag))

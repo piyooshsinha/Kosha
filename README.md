@@ -164,6 +164,31 @@ aws --endpoint-url http://localhost:9000 s3 cp backup.tar s3://logs/backup.tar -
   misconfigured tier fails immediately.
 - `/_kosha/stats` and the console's Overview show the bytes in the cold tier.
 
+**Access-based tiering.** Instead of fixed ages, let reads decide, through
+S3's Intelligent-Tiering configuration API:
+
+```sh
+s3api put-bucket-intelligent-tiering-configuration --bucket media --id auto \
+  --intelligent-tiering-configuration '{"Id": "auto", "Status": "Enabled",
+    "Filter": {"Prefix": "videos/"},
+    "Tierings": [{"Days": 90, "AccessTier": "ARCHIVE_ACCESS"}]}'
+```
+
+- **Demotion:** objects under the filter that nobody has read or written for
+  `Days` move to the cold tier. They show as `INTELLIGENT_TIERING`.
+- **Promotion:** the first GET of such an object serves it from the cold tier
+  and, in the background, copies its chunks back to local disk and returns
+  it to STANDARD.
+- **Demoting again is free:** the remote copy is kept, so a promoted object
+  that goes cold a second time is evicted again without another upload.
+- **How reads are recorded:** each node collects reads in memory and records
+  them as one replicated command every 30 seconds, so reads never wait on
+  Raft. A crash can lose the last 30 seconds of read history, which only
+  delays a demotion.
+- Unlike AWS, `Days` may be any value from 1 upwards.
+- Objects moved by lifecycle rules or uploaded with a cold class stay where
+  they were put; only auto-tiered objects are promoted.
+
 ### Event notifications
 
 Kosha posts S3-format event messages to webhooks when objects change. Name

@@ -117,6 +117,9 @@ struct Inner {
     consensus: OnceLock<Arc<dyn Consensus>>,
     placement: OnceLock<Arc<dyn ChunkPlacement>>,
     cold: OnceLock<Arc<dyn crate::tier::ColdStore>>,
+    /// Reads not yet recorded, for access-based tiering.
+    access_log:
+        parking_lot::Mutex<std::collections::HashMap<(String, String), chrono::DateTime<Utc>>>,
 }
 
 /// The storage engine. Cheap to clone; all clones share state.
@@ -200,6 +203,7 @@ impl Engine {
                 consensus: OnceLock::new(),
                 placement: OnceLock::new(),
                 cold: OnceLock::new(),
+                access_log: Default::default(),
             }),
         })
     }
@@ -363,6 +367,13 @@ impl Engine {
 
     pub(crate) fn cold_cell(&self) -> &OnceLock<Arc<dyn crate::tier::ColdStore>> {
         &self.inner.cold
+    }
+
+    pub(crate) fn access_log(
+        &self,
+    ) -> &parking_lot::Mutex<std::collections::HashMap<(String, String), chrono::DateTime<Utc>>>
+    {
+        &self.inner.access_log
     }
 
     pub(crate) fn placement_cell(&self) -> &OnceLock<Arc<dyn ChunkPlacement>> {
@@ -566,6 +577,7 @@ impl Engine {
             version_id: None,
             lock,
             storage_class,
+            auto_tiered: false,
         };
         let out = self
             .propose(Command::PutObject {

@@ -628,6 +628,13 @@ pub fn required(
                 }
             }
             _ if has("location") => "s3:GetBucketLocation",
+            _ if has("intelligent-tiering") => {
+                if get {
+                    "s3:GetIntelligentTieringConfiguration"
+                } else {
+                    "s3:PutIntelligentTieringConfiguration"
+                }
+            }
             _ if has("notification") => {
                 if get {
                     "s3:GetBucketNotification"

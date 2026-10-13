@@ -96,6 +96,10 @@ pub struct ObjectMeta {
     /// on upload) means the object's data lives in the cold tier.
     #[serde(default)]
     pub storage_class: Option<String>,
+    /// Moved to the cold tier by access-based tiering; reading it brings it
+    /// back to STANDARD.
+    #[serde(default)]
+    pub auto_tiered: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -126,6 +130,22 @@ pub struct BucketConfig {
     pub policy: Option<String>,
     #[serde(default)]
     pub notifications: Option<Vec<NotificationRule>>,
+    /// Access-based tiering (S3 Intelligent-Tiering configurations).
+    #[serde(default)]
+    pub tiering: Option<Vec<TieringRule>>,
+}
+
+/// Move objects nobody has read for `days` to the cold tier; reading one
+/// brings it back.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TieringRule {
+    pub id: String,
+    pub enabled: bool,
+    pub prefix: String,
+    pub tags: BTreeMap<String, String>,
+    pub days: u32,
+    /// The S3 access tier as configured (`ARCHIVE_ACCESS`, ...).
+    pub access_tier: String,
 }
 
 /// Send matching events of a bucket to a named target.
@@ -316,6 +336,7 @@ pub enum BucketConfigUpdate {
     Lifecycle(Option<Vec<LifecycleRule>>),
     Policy(Option<String>),
     Notifications(Option<Vec<NotificationRule>>),
+    Tiering(Option<Vec<TieringRule>>),
 }
 
 /// An access key that is not a root key. Its permissions come from its

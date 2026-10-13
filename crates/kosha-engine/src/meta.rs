@@ -42,6 +42,8 @@ const REQUEST_SEQ: TableDefinition<&[u8], &[u8]> = TableDefinition::new("request
 /// Every version of every key in versioned buckets (see `versions.rs`).
 /// `target \0 seq` (big-endian) -> `Event`: undelivered notifications.
 pub(crate) const EVENTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("events");
+/// `bucket \0 key` -> last read time, for access-based tiering.
+pub(crate) const ACCESS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("access");
 /// chunk id -> length: chunks waiting to be copied to the cold tier.
 pub(crate) const TIER_QUEUE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("tier_queue");
 /// access key -> `User`.
@@ -50,8 +52,15 @@ pub(crate) const VERSIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new(
 
 /// Byte-keyed tables included in snapshots generically. New tables only need
 /// to be listed here.
-const BYTE_TABLES: &[TableDefinition<&[u8], &[u8]>] =
-    &[REQUESTS, REQUEST_SEQ, VERSIONS, USERS, EVENTS, TIER_QUEUE];
+const BYTE_TABLES: &[TableDefinition<&[u8], &[u8]>] = &[
+    REQUESTS,
+    REQUEST_SEQ,
+    VERSIONS,
+    USERS,
+    EVENTS,
+    TIER_QUEUE,
+    ACCESS,
+];
 
 /// How many request ids are remembered for deduplication.
 const REMEMBERED_REQUESTS: u64 = 100_000;
@@ -166,6 +175,20 @@ pub enum Command {
         bucket: String,
         targets: Vec<DeleteTarget>,
         class: String,
+        /// Issued by access-based tiering (the object returns to STANDARD
+        /// when it is read again).
+        #[serde(default)]
+        auto: bool,
+    },
+    /// Last-read times observed by a node, batched.
+    RecordAccess {
+        entries: Vec<(String, String, DateTime<Utc>)>,
+    },
+    /// Bring auto-tiered objects back to STANDARD (their chunks have been
+    /// copied back to local storage).
+    PromoteObjects {
+        bucket: String,
+        targets: Vec<DeleteTarget>,
     },
     /// A chunk was copied to the cold tier under `key`.
     ChunkOffloaded {
@@ -406,7 +429,12 @@ impl Tx<'_> {
             let info = match existing {
                 Some(info) => {
                     let mut info = info?;
+                    let was_evicted = info.evicted();
                     info.refs += 1;
+                    if was_evicted {
+                        // Needed locally again (the writer stored a copy).
+                        self.stats.physical_bytes += info.stored;
+                    }
                     info
                 }
                 None => {
@@ -450,6 +478,7 @@ impl Tx<'_> {
                 continue;
             };
             let mut info: ChunkInfo = dec(&raw)?;
+            let was_evicted = info.evicted();
             info.refs -= 1;
             if cold {
                 info.cold_refs = info.cold_refs.saturating_sub(1);
@@ -458,13 +487,13 @@ impl Tx<'_> {
                 chunks.remove(id.0.as_slice())?;
                 self.stats.chunks -= 1;
                 self.stats.unique_bytes -= info.len as u64;
-                match info.remote {
-                    Some(key) => {
-                        self.stats.cold_chunks -= 1;
-                        self.stats.cold_bytes -= info.stored;
-                        self.remote_garbage.push(key);
-                    }
-                    None => self.stats.physical_bytes -= info.stored,
+                if !was_evicted {
+                    self.stats.physical_bytes -= info.stored;
+                }
+                if let Some(key) = info.remote {
+                    self.stats.cold_chunks -= 1;
+                    self.stats.cold_bytes -= info.stored;
+                    self.remote_garbage.push(key);
                 }
                 self.freed.push(*id);
                 self.txn.open_table(TIER_QUEUE)?.remove(id.0.as_slice())?;
@@ -473,7 +502,12 @@ impl Tx<'_> {
                 // tier (or, if it is already there, local copies can go).
                 if !cold && info.cold_refs == info.refs {
                     match info.remote {
-                        Some(_) => self.evicted.push(*id),
+                        Some(_) => {
+                            if !was_evicted {
+                                self.stats.physical_bytes -= info.stored;
+                            }
+                            self.evicted.push(*id)
+                        }
                         None => {
                             self.txn
                                 .open_table(TIER_QUEUE)?
@@ -520,6 +554,9 @@ impl Tx<'_> {
             .transpose()?;
         drop(t);
         let Some(old) = old else { return Ok(false) };
+        self.txn
+            .open_table(ACCESS)?
+            .remove(keys::object_key(bucket, key).as_slice())?;
         self.stats.objects -= 1;
         self.stats.logical_bytes -= old.size;
         self.drop_object_refs(&old)?;
@@ -724,6 +761,7 @@ impl Tx<'_> {
                     // A copy takes new (hot) references; its data is
                     // served locally again where it is stored.
                     storage_class: None,
+                    auto_tiered: false,
                     ..src
                 };
                 self.add_refs(&meta.segments, &HashMap::new())?;
@@ -828,6 +866,7 @@ impl Tx<'_> {
                     version_id: None,
                     lock: info.lock.clone().unwrap_or_default(),
                     storage_class: None,
+                    auto_tiered: false,
                 };
                 // Reference the chunks from the object before the parts release them.
                 self.add_refs(&meta.segments, &HashMap::new())?;
@@ -862,6 +901,7 @@ impl Tx<'_> {
                     BucketConfigUpdate::Lifecycle(rules) => info.config.lifecycle = rules,
                     BucketConfigUpdate::Policy(policy) => info.config.policy = policy,
                     BucketConfigUpdate::Notifications(rules) => info.config.notifications = rules,
+                    BucketConfigUpdate::Tiering(rules) => info.config.tiering = rules,
                     BucketConfigUpdate::Versioning(v) => {
                         if v == Versioning::Unversioned {
                             return reject(Rejection::InvalidRequest(
@@ -940,9 +980,17 @@ impl Tx<'_> {
                 bucket,
                 targets,
                 class,
+                auto,
             } => Ok(CommandOutput::Transitioned(
-                self.transition(&bucket, targets, &class)?,
+                self.transition(&bucket, targets, &class, auto)?,
             )),
+            Command::RecordAccess { entries } => {
+                self.record_access(entries)?;
+                Ok(CommandOutput::Done)
+            }
+            Command::PromoteObjects { bucket, targets } => {
+                Ok(CommandOutput::Transitioned(self.promote(&bucket, targets)?))
+            }
             Command::ChunkOffloaded { id, key } => {
                 self.chunk_offloaded(id, key)?;
                 Ok(CommandOutput::Done)

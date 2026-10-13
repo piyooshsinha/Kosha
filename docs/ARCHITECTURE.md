@@ -347,6 +347,22 @@ class, next to `refs`. The rules:
   content. If an upload finishes after its chunk was freed, or twice across
   a leader change, the extra key is garbage too.
 
+**Access-based tiering** reuses the same machinery:
+
+- **Reads:** nodes note reads of objects in buckets with Intelligent-Tiering
+  rules. Every 30 s they record them with one `RecordAccess` command into the
+  `access` table, which stores the latest read time per object.
+- **Demotion:** the lifecycle pass transitions STANDARD objects whose last
+  read or write is older than the rule's `Days` (`auto: true`, so
+  `auto_tiered` is set).
+- **Promotion:** a GET of an auto-tiered object, after being served, copies
+  each chunk back to its local replicas (verified on the way). It then
+  commits `PromoteObjects`, which decrements `cold_refs`. The chunk is no
+  longer evicted, and the remote copy stays for the next demotion.
+- **Accounting invariant:** `physical_bytes` sums the chunks that are not
+  evicted, and `cold_bytes` sums the chunks that have a remote copy. Every
+  transition between those states adjusts exactly one of them.
+
 The cold store is a small trait (`put`/`get`/`delete`). The server
 implements it with a minimal SigV4 client, so any S3-compatible service
 works, including another Kosha.
@@ -468,6 +484,7 @@ thread pool when io_uring is disabled.
 | `chunks` | BLAKE3 id | refcount, cold refcount, raw length, stored length, cold-tier key |
 | `uploads` / `upload_index` / `parts` | upload id / `bucket \0 key \0 id` / `id \0 part#` | multipart state |
 | `tier_queue` | chunk id | chunks waiting to be offloaded |
+| `access` | `bucket \0 key` | last read time, for access-based tiering |
 | `events` | `target \0 seq` | undelivered notifications |
 | `users` | access key | user: secret, name, identity policy, enabled |
 | `versions` | `bucket \0 key \0 (MAX - seq)` | version: manifest or delete marker, lock state |
@@ -515,7 +532,8 @@ Versioning, Object Lock (retention and legal hold) and lifecycle rules.
 Users, identity and bucket policies (with anonymous access), SigV2 header
 auth, HTTPS, mutual TLS between nodes, and dedup-preserving encryption at
 rest. Event notifications to webhooks from the replicated metadata log.
-A chunk-level cold tier on any S3-compatible service. Reed–Solomon erasure
+A chunk-level cold tier on any S3-compatible service, with access-based
+tiering (demote unread objects, promote on read). Reed–Solomon erasure
 coding across nodes.
 
 **Next**
@@ -526,8 +544,6 @@ coding across nodes.
 **Later**
 - Erasure-coding chunks in the background once they turn cold, instead of
   choosing the layout at write time.
-- Access-driven tiering: demote chunks by read frequency rather than by
-  lifecycle rules, and promote hot chunks back on read.
 
 **Deliberately not built (yet)**
 

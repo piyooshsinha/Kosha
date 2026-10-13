@@ -24,8 +24,8 @@ use redb::{ReadableDatabase, ReadableTable};
 use crate::engine::Engine;
 use crate::error::{Error, Result};
 use crate::meta::{
-    CHUNKS, ChunkInfo, Command, CommandOutput, Fail, MetaStore, Rejection, Step, TIER_QUEUE, Tx,
-    dec, enc,
+    ACCESS, CHUNKS, ChunkInfo, Command, CommandOutput, Fail, MetaStore, Rejection, Step,
+    TIER_QUEUE, Tx, dec, enc,
 };
 use crate::types::*;
 
@@ -60,6 +60,7 @@ impl Tx<'_> {
         bucket: &str,
         targets: Vec<DeleteTarget>,
         class: &str,
+        auto: bool,
     ) -> Step<u64> {
         if !is_cold_class(class) {
             return Err(Fail::Reject(Rejection::InvalidRequest(format!(
@@ -76,6 +77,7 @@ impl Tx<'_> {
                     )));
                 }
                 m.storage_class = Some(class.to_string());
+                m.auto_tiered = auto;
                 Ok(())
             });
             let meta = match r {
@@ -93,9 +95,13 @@ impl Tx<'_> {
                     continue;
                 };
                 let mut c: ChunkInfo = dec(&raw)?;
+                let was_evicted = c.evicted();
                 c.cold_refs = (c.cold_refs + 1).min(c.refs);
                 if c.cold_refs == c.refs {
                     if c.remote.is_some() {
+                        if !was_evicted {
+                            self.stats.physical_bytes -= c.stored;
+                        }
                         self.evicted.push(*id);
                     } else {
                         self.txn
@@ -125,10 +131,79 @@ impl Tx<'_> {
             key: key.to_string(),
             version_id: meta.version_id.clone(),
         };
-        if self.transition(bucket, vec![target], &class)? == 1 {
+        if self.transition(bucket, vec![target], &class, false)? == 1 {
             meta.storage_class = Some(class);
         }
         Ok(meta)
+    }
+
+    /// Return auto-tiered objects to STANDARD. Their chunks count as hot
+    /// again (the caller copied them back to local storage first).
+    pub(crate) fn promote(&mut self, bucket: &str, targets: Vec<DeleteTarget>) -> Step<u64> {
+        let info = self.bucket_info(bucket)?;
+        let mut moved = 0;
+        for t in targets {
+            let r = self.update_version(&info, &t.key, t.version_id.as_deref(), |m| {
+                if m.storage_class.is_none() || !m.auto_tiered {
+                    return Err(Fail::Reject(Rejection::InvalidRequest(
+                        "not auto-tiered".into(),
+                    )));
+                }
+                m.storage_class = None;
+                m.auto_tiered = false;
+                Ok(())
+            });
+            let meta = match r {
+                Ok(m) => m,
+                Err(Fail::Reject(_)) => continue,
+                Err(e) => return Err(e),
+            };
+            moved += 1;
+            let mut chunks = self.txn.open_table(CHUNKS)?;
+            for seg in &meta.segments {
+                let Segment::Chunk { id, .. } = seg else {
+                    continue;
+                };
+                let Some(raw) = chunks.get(id.0.as_slice())?.map(|v| v.value().to_vec()) else {
+                    continue;
+                };
+                let mut c: ChunkInfo = dec(&raw)?;
+                let was_evicted = c.evicted();
+                c.cold_refs = c.cold_refs.saturating_sub(1);
+                if was_evicted && !c.evicted() {
+                    self.stats.physical_bytes += c.stored;
+                }
+                chunks.insert(id.0.as_slice(), enc(&c)?.as_slice())?;
+                drop(chunks);
+                // No longer cold-only: nothing to offload.
+                self.txn.open_table(TIER_QUEUE)?.remove(id.0.as_slice())?;
+                chunks = self.txn.open_table(CHUNKS)?;
+            }
+        }
+        Ok(moved)
+    }
+
+    pub(crate) fn record_access(
+        &mut self,
+        entries: Vec<(String, String, chrono::DateTime<chrono::Utc>)>,
+    ) -> Step<()> {
+        let mut t = self.txn.open_table(ACCESS)?;
+        let objects = self.txn.open_table(crate::meta::OBJECTS)?;
+        for (bucket, key, at) in entries {
+            let k = crate::keys::object_key(&bucket, &key);
+            // Only for objects that still exist, and never backwards.
+            if objects.get(k.as_slice())?.is_none() {
+                continue;
+            }
+            let newer = match t.get(k.as_slice())? {
+                Some(v) => dec::<chrono::DateTime<chrono::Utc>>(v.value())? < at,
+                None => true,
+            };
+            if newer {
+                t.insert(k.as_slice(), enc(&at)?.as_slice())?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn chunk_offloaded(&mut self, id: ChunkId, key: String) -> Step<()> {
@@ -146,10 +221,10 @@ impl Tx<'_> {
             return Ok(());
         }
         c.remote = Some(key);
-        self.stats.physical_bytes = self.stats.physical_bytes.saturating_sub(c.stored);
         self.stats.cold_chunks += 1;
         self.stats.cold_bytes += c.stored;
         if c.evicted() {
+            self.stats.physical_bytes -= c.stored;
             self.evicted.push(id);
         }
         chunks.insert(id.0.as_slice(), enc(&c)?.as_slice())?;
@@ -172,6 +247,19 @@ impl MetaStore {
     /// The cold-tier key of a chunk, if it was offloaded.
     pub fn remote_key(&self, id: &ChunkId) -> Result<Option<String>> {
         Ok(self.chunk_info(id)?.and_then(|c| c.remote))
+    }
+
+    /// When `bucket/key` was last read, as recorded by access tracking.
+    pub fn last_access(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(ACCESS)?;
+        t.get(crate::keys::object_key(bucket, key).as_slice())?
+            .map(|v| dec(v.value()))
+            .transpose()
     }
 
     /// Chunks waiting to be offloaded.
@@ -215,6 +303,17 @@ impl Engine {
         targets: Vec<DeleteTarget>,
         class: &str,
     ) -> Result<u64> {
+        self.transition_objects_as(bucket, targets, class, false)
+            .await
+    }
+
+    pub(crate) async fn transition_objects_as(
+        &self,
+        bucket: &str,
+        targets: Vec<DeleteTarget>,
+        class: &str,
+        auto: bool,
+    ) -> Result<u64> {
         if !self.has_cold_store() {
             return Err(Error::InvalidRequest(
                 "no cold tier is configured on this server".into(),
@@ -225,6 +324,7 @@ impl Engine {
                 bucket: bucket.into(),
                 targets,
                 class: class.into(),
+                auto,
             })
             .await?
         {
@@ -233,6 +333,105 @@ impl Engine {
                 "unexpected command output {other:?}"
             ))),
         }
+    }
+
+    /// Note a read of `bucket/key` for access-based tiering. Cheap: reads
+    /// are collected in memory and recorded in batches.
+    pub fn note_access(&self, bucket: &str, key: &str) {
+        self.note_access_at(bucket, key, chrono::Utc::now());
+    }
+
+    /// [`note_access`](Self::note_access) with an explicit time.
+    pub fn note_access_at(&self, bucket: &str, key: &str, at: chrono::DateTime<chrono::Utc>) {
+        let tracked = self
+            .bucket_local(bucket)
+            .ok()
+            .is_some_and(|b| b.config.tiering.as_ref().is_some_and(|r| !r.is_empty()));
+        if tracked {
+            self.access_log()
+                .lock()
+                .insert((bucket.to_string(), key.to_string()), at);
+        }
+    }
+
+    /// Record the reads collected since the last flush (one replicated
+    /// command for all of them).
+    pub async fn flush_access(&self) -> Result<usize> {
+        let entries: Vec<_> = std::mem::take(&mut *self.access_log().lock())
+            .into_iter()
+            .map(|((b, k), t)| (b, k, t))
+            .collect();
+        let n = entries.len();
+        for batch in entries.chunks(5_000) {
+            self.propose_cmd(Command::RecordAccess {
+                entries: batch.to_vec(),
+            })
+            .await?;
+        }
+        Ok(n)
+    }
+
+    pub fn spawn_access_flusher(&self, every: Duration) -> tokio::task::JoinHandle<()> {
+        let this = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                if let Err(e) = this.flush_access().await {
+                    tracing::warn!(error = %e, "recording object reads failed");
+                }
+            }
+        })
+    }
+
+    /// Bring an auto-tiered object back to STANDARD: copy its chunks back
+    /// to local storage, then commit the change. Returns whether it moved.
+    pub async fn promote_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<String>,
+    ) -> Result<bool> {
+        let meta = match &version_id {
+            Some(v) => self.head_version(bucket, key, v).await?.meta,
+            None => Some(self.head_object(bucket, key).await?),
+        };
+        let Some(meta) = meta.filter(|m| m.auto_tiered && m.storage_class.is_some()) else {
+            return Ok(false);
+        };
+        for seg in &meta.segments {
+            let Segment::Chunk { id, len } = seg else {
+                continue;
+            };
+            let data = self.fetch_chunk(*id, *len).await?;
+            match self.placement_cell().get() {
+                Some(p) => {
+                    p.put(*id, data).await?;
+                }
+                None => {
+                    self.chunk_store().put_replica(*id, data).await?;
+                }
+            }
+        }
+        let n = match self
+            .propose_cmd(Command::PromoteObjects {
+                bucket: bucket.into(),
+                targets: vec![DeleteTarget {
+                    key: key.into(),
+                    version_id,
+                }],
+            })
+            .await?
+        {
+            CommandOutput::Transitioned(n) => n,
+            other => {
+                return Err(Error::Internal(format!(
+                    "unexpected command output {other:?}"
+                )));
+            }
+        };
+        Ok(n == 1)
     }
 
     /// Read a chunk from this node, a replica, or the cold tier.

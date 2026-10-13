@@ -394,3 +394,126 @@ async fn noncurrent_versions_move_to_the_cold_tier() {
     assert_eq!(parts.concat(), v1);
     assert_eq!(get(&e, "docs", "report").await, v2);
 }
+
+#[tokio::test]
+async fn access_based_tiering_demotes_unread_objects_and_promotes_on_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let (e, cold) = engine(dir.path(), None);
+    e.create_bucket("media").await.unwrap();
+    let unread = data(120_000, 11);
+    let popular = data(120_000, 12);
+    put(&e, "media", "unread.bin", &unread).await;
+    put(&e, "media", "popular.bin", &popular).await;
+    e.set_bucket_config(
+        "media",
+        BucketConfigUpdate::Tiering(Some(vec![TieringRule {
+            id: "auto".into(),
+            enabled: true,
+            prefix: String::new(),
+            tags: Default::default(),
+            days: 30,
+            access_tier: "ARCHIVE_ACCESS".into(),
+        }])),
+    )
+    .await
+    .unwrap();
+
+    // popular.bin was read 25 days into the future we simulate.
+    let now = chrono::Utc::now();
+    e.note_access_at("media", "popular.bin", now + chrono::Duration::days(25));
+    assert_eq!(e.flush_access().await.unwrap(), 1);
+
+    let r = e
+        .run_lifecycle(now + chrono::Duration::days(40))
+        .await
+        .unwrap();
+    assert_eq!(r.auto_tiered, 1);
+    let m = e.head_object("media", "unread.bin").await.unwrap();
+    assert_eq!(
+        (m.storage_class.as_deref(), m.auto_tiered),
+        (Some("INTELLIGENT_TIERING"), true)
+    );
+    assert_eq!(
+        e.head_object("media", "popular.bin")
+            .await
+            .unwrap()
+            .storage_class,
+        None
+    );
+
+    let local_before = chunk_files(dir.path());
+    let offloaded = e.run_offloader().await.unwrap();
+    assert!(offloaded > 0);
+    assert_eq!(chunk_files(dir.path()), local_before - offloaded);
+    let s = e.stats().await.unwrap();
+    // Random data is stored raw: one codec byte per chunk on top.
+    let stored = s.unique_bytes + s.chunks;
+    assert_eq!(s.physical_bytes + s.cold_bytes, stored, "{s:?}");
+
+    // Reading it brings it back: local copies again, STANDARD class.
+    assert_eq!(get(&e, "media", "unread.bin").await, unread);
+    assert!(e.promote_object("media", "unread.bin", None).await.unwrap());
+    let m = e.head_object("media", "unread.bin").await.unwrap();
+    assert_eq!((m.storage_class, m.auto_tiered), (None, false));
+    assert_eq!(chunk_files(dir.path()), local_before);
+    let s = e.stats().await.unwrap();
+    assert_eq!(
+        s.physical_bytes,
+        s.unique_bytes + s.chunks,
+        "every chunk is local again: {s:?}"
+    );
+    // The remote copy is kept, so demoting again needs no upload.
+    assert_eq!(s.cold_chunks as usize, offloaded);
+    assert!(
+        !e.promote_object("media", "unread.bin", None).await.unwrap(),
+        "already STANDARD"
+    );
+
+    // Explicitly cold objects are not promoted by reads.
+    // (Seeds are OR-ed with 1, so 13 would repeat popular.bin's data.)
+    put(&e, "media", "archive.bin", &data(50_000, 20)).await;
+    e.transition_objects(
+        "media",
+        vec![DeleteTarget {
+            key: "archive.bin".into(),
+            version_id: None,
+        }],
+        "GLACIER",
+    )
+    .await
+    .unwrap();
+    assert!(
+        !e.promote_object("media", "archive.bin", None)
+            .await
+            .unwrap()
+    );
+    assert!(e.run_offloader().await.unwrap() > 0);
+
+    // Demoting the promoted object again evicts it without re-uploading:
+    // only popular.bin's chunks are new in the cold store.
+    let r = e
+        .run_lifecycle(now + chrono::Duration::days(80))
+        .await
+        .unwrap();
+    assert_eq!(r.auto_tiered, 2, "unread.bin and popular.bin");
+    let popular_chunks = e
+        .head_object("media", "popular.bin")
+        .await
+        .unwrap()
+        .segments
+        .iter()
+        .filter(|s| matches!(s, Segment::Chunk { .. }))
+        .count();
+    let uploaded_before = cold.objects.lock().len();
+    assert_eq!(e.run_offloader().await.unwrap(), popular_chunks);
+    assert_eq!(cold.objects.lock().len(), uploaded_before + popular_chunks);
+    assert_eq!(chunk_files(dir.path()), 0, "everything is cold now");
+    assert_eq!(get(&e, "media", "unread.bin").await, unread);
+    assert_eq!(get(&e, "media", "popular.bin").await, popular);
+    let s = e.stats().await.unwrap();
+    assert_eq!(
+        (s.physical_bytes, s.cold_bytes),
+        (0, s.unique_bytes + s.chunks),
+        "{s:?}"
+    );
+}

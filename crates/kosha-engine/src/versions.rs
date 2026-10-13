@@ -208,7 +208,12 @@ impl Tx<'_> {
         let k = keys::object_key(bucket, key);
         let had = match latest {
             Some(m) => t.insert(k.as_slice(), enc(m)?.as_slice())?.is_some(),
-            None => t.remove(k.as_slice())?.is_some(),
+            None => {
+                self.txn
+                    .open_table(crate::meta::ACCESS)?
+                    .remove(k.as_slice())?;
+                t.remove(k.as_slice())?.is_some()
+            }
         };
         match (had, latest.is_some()) {
             (false, true) => self.stats.objects += 1,

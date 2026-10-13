@@ -11,6 +11,7 @@ pub mod iam;
 mod metrics;
 pub mod notify;
 mod protection;
+mod tiering;
 mod xml;
 
 use std::sync::Arc;

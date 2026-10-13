@@ -18,6 +18,8 @@ use crate::error::Result;
 use crate::types::*;
 
 const BATCH: usize = 1000;
+/// The storage class auto-tiered objects carry while they are cold.
+pub const AUTO_TIER_CLASS: &str = "INTELLIGENT_TIERING";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LifecycleReport {
@@ -32,6 +34,8 @@ pub struct LifecycleReport {
     pub transitioned: u64,
     /// Noncurrent versions moved to the cold tier.
     pub noncurrent_transitioned: u64,
+    /// Objects moved to the cold tier because nobody read them.
+    pub auto_tiered: u64,
     /// Actions refused by Object Lock.
     pub refused: u64,
 }
@@ -72,14 +76,92 @@ impl Engine {
     pub async fn run_lifecycle(&self, now: DateTime<Utc>) -> Result<LifecycleReport> {
         let mut report = LifecycleReport::default();
         for info in self.list_buckets().await? {
-            let Some(rules) = info.config.lifecycle.clone() else {
-                continue;
-            };
-            for rule in rules.iter().filter(|r| r.enabled) {
-                self.apply_rule(&info, rule, now, &mut report).await?;
+            if let Some(rules) = info.config.lifecycle.clone() {
+                for rule in rules.iter().filter(|r| r.enabled) {
+                    self.apply_rule(&info, rule, now, &mut report).await?;
+                }
+            }
+            if let Some(rules) = info.config.tiering.clone()
+                && self.has_cold_store()
+            {
+                for rule in rules.iter().filter(|r| r.enabled) {
+                    self.apply_tiering(&info, rule, now, &mut report).await?;
+                }
             }
         }
         Ok(report)
+    }
+
+    /// Access-based tiering: STANDARD objects under the rule that nobody
+    /// has read (or written) for `days` move to the cold tier, marked so a
+    /// later read brings them back.
+    async fn apply_tiering(
+        &self,
+        info: &BucketInfo,
+        rule: &TieringRule,
+        now: DateTime<Utc>,
+        report: &mut LifecycleReport,
+    ) -> Result<()> {
+        let bucket = info.name.as_str();
+        let mut targets = Vec::new();
+        let mut after = None;
+        loop {
+            let page = self
+                .list_objects(
+                    bucket,
+                    ListQuery {
+                        prefix: rule.prefix.clone(),
+                        delimiter: None,
+                        start_after: after.clone(),
+                        max_keys: BATCH,
+                    },
+                )
+                .await?;
+            for o in &page.objects {
+                if o.storage_class.is_some() {
+                    continue;
+                }
+                let last_read = self.meta().last_access(bucket, &o.key)?;
+                let last_use = last_read.map_or(o.last_modified, |r| r.max(o.last_modified));
+                if !older_than(last_use, rule.days, now) {
+                    continue;
+                }
+                if !rule.tags.is_empty() {
+                    match self.head_object(bucket, &o.key).await {
+                        Ok(m)
+                            if rule
+                                .tags
+                                .iter()
+                                .all(|(k, v)| m.attrs.tags.get(k) == Some(v)) => {}
+                        _ => continue,
+                    }
+                }
+                targets.push(DeleteTarget {
+                    key: o.key.clone(),
+                    version_id: None,
+                });
+                if targets.len() >= BATCH {
+                    report.auto_tiered += self
+                        .transition_objects_as(
+                            bucket,
+                            std::mem::take(&mut targets),
+                            AUTO_TIER_CLASS,
+                            true,
+                        )
+                        .await?;
+                }
+            }
+            if !page.is_truncated {
+                break;
+            }
+            after = page.next_marker;
+        }
+        if !targets.is_empty() {
+            report.auto_tiered += self
+                .transition_objects_as(bucket, targets, AUTO_TIER_CLASS, true)
+                .await?;
+        }
+        Ok(())
     }
 
     async fn apply_rule(

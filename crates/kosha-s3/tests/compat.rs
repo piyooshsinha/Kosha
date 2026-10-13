@@ -6,7 +6,11 @@ use std::sync::Arc;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials as AwsCreds, Region};
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{BucketCannedAcl, ObjectCannedAcl, RestoreRequest, StorageClass};
+use aws_sdk_s3::types::{
+    BucketCannedAcl, IntelligentTieringAccessTier, IntelligentTieringConfiguration,
+    IntelligentTieringFilter, IntelligentTieringStatus, ObjectCannedAcl, RestoreRequest,
+    StorageClass, Tiering,
+};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use kosha_engine::{ColdStore, Engine, EngineConfig, SyncMode};
@@ -194,6 +198,114 @@ async fn acls_restore_and_storage_classes() {
         .send()
         .await
         .unwrap();
+
+    // Intelligent-Tiering: configure, demote an unread object, read it back.
+    let config = IntelligentTieringConfiguration::builder()
+        .id("auto")
+        .filter(IntelligentTieringFilter::builder().prefix("media/").build())
+        .status(IntelligentTieringStatus::Enabled)
+        .tierings(
+            Tiering::builder()
+                .days(30)
+                .access_tier(IntelligentTieringAccessTier::ArchiveAccess)
+                .build()
+                .unwrap(),
+        )
+        .build()
+        .unwrap();
+    c.put_bucket_intelligent_tiering_configuration()
+        .bucket("compat")
+        .id("auto")
+        .intelligent_tiering_configuration(config)
+        .send()
+        .await
+        .unwrap();
+    let got = c
+        .get_bucket_intelligent_tiering_configuration()
+        .bucket("compat")
+        .id("auto")
+        .send()
+        .await
+        .unwrap();
+    let got = got.intelligent_tiering_configuration().unwrap();
+    assert_eq!(got.tierings()[0].days(), 30);
+    let listed = c
+        .list_bucket_intelligent_tiering_configurations()
+        .bucket("compat")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listed.intelligent_tiering_configuration_list().len(), 1);
+
+    let clip = vec![3u8; 200_000];
+    c.put_object()
+        .bucket("compat")
+        .key("media/clip.mp4")
+        .body(ByteStream::from(clip.clone()))
+        .send()
+        .await
+        .unwrap();
+    let report = engine
+        .run_lifecycle(chrono::Utc::now() + chrono::Duration::days(31))
+        .await
+        .unwrap();
+    assert_eq!(report.auto_tiered, 1, "doc.txt is outside the prefix");
+    engine.run_offloader().await.unwrap();
+    let head = c
+        .head_object()
+        .bucket("compat")
+        .key("media/clip.mp4")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        head.storage_class(),
+        Some(&StorageClass::IntelligentTiering)
+    );
+    // A GET serves it and brings it back to STANDARD.
+    let got = c
+        .get_object()
+        .bucket("compat")
+        .key("media/clip.mp4")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        got.body.collect().await.unwrap().into_bytes().as_ref(),
+        clip.as_slice()
+    );
+    let mut class = None;
+    for _ in 0..50 {
+        let h = c
+            .head_object()
+            .bucket("compat")
+            .key("media/clip.mp4")
+            .send()
+            .await
+            .unwrap();
+        class = h.storage_class().cloned();
+        if class.is_none() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(class, None, "promoted back to STANDARD");
+    c.delete_bucket_intelligent_tiering_configuration()
+        .bucket("compat")
+        .id("auto")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        code(
+            c.get_bucket_intelligent_tiering_configuration()
+                .bucket("compat")
+                .id("auto")
+                .send()
+                .await
+        ),
+        "NoSuchConfiguration"
+    );
 
     // Unknown storage classes are refused.
     assert_eq!(
