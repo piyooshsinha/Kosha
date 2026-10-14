@@ -31,3 +31,8 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - name: Crash test (SIGKILL under load, single node and 3-node cluster)
+        run: |
+          cargo build --bins --examples
+          target/debug/examples/crashtest --kosha target/debug/kosha --rounds 8 --dir "$RUNNER_TEMP/crash1"
+          target/debug/examples/crashtest --kosha target/debug/kosha --cluster --chaos --rounds 5 --dir "$RUNNER_TEMP/crash2"

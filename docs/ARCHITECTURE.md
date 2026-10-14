@@ -133,6 +133,21 @@ the chunk store.
    came from. A node that *should* hold a chunk but does not (for example, it
    was down during the write) stores the copy it fetched: **read-repair**.
 
+### Without a majority
+
+A node that cannot reach a majority cannot commit writes or prove a read
+index. Rather than wait indefinitely (a leader that lost its followers
+would otherwise hold requests forever), every write proposal and read
+barrier has a 10-second deadline (`QUORUM_DEADLINE`). After that the
+request fails with `ServiceUnavailable` (HTTP 503), which S3 clients
+retry. As with any timeout, a write that fails this way may still have
+been applied, if its log entry reached a majority before the cluster lost
+it. A request that needs several round-trips (for example a PUT, which
+checks the bucket and then commits) can take up to one deadline per
+round-trip. The crash test measured 18–20 s for requests in flight while
+two of three nodes were down, and at most 5 s after a restart for all
+nodes to serve again.
+
 ## Leader leases
 
 `ensure_linearizable` proves leadership by heartbeating every voter and
@@ -544,6 +559,12 @@ O(entries returned) rather than O(keys under the prefix).
 
 ## Known limitations
 
+- **Power loss is not tested.** `crashtest` (see the README) kills the
+  process under load and checks every acknowledged write, but the kernel
+  survives a `SIGKILL`, so unsynced data still reaches the disk. The
+  rules in *Chunk durability* are what protect data across a power cut,
+  and they have no fault-injection test yet (it needs a block layer that
+  can drop unsynced writes, such as dm-log-writes).
 - **Repair scans all chunk metadata every pass.** This is O(chunks) per
   node per interval. That is fine up to millions of chunks; beyond that it
   needs an incremental, membership-change-driven scan.

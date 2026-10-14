@@ -459,3 +459,52 @@ async fn retried_batches_apply_exactly_once() {
         assert_eq!(n.engine.stats().await.unwrap().buckets, 1);
     }
 }
+
+/// With two of three nodes gone, the survivor cannot reach a quorum. Writes
+/// and linearizable reads must fail with `Unavailable` (HTTP 503) within a
+/// bounded time instead of hanging, and work again once a majority is back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lost_majority_fails_fast_with_unavailable() {
+    let nodes = three_nodes().await;
+    nodes[0].engine.create_bucket("quorum").await.unwrap();
+    put(&nodes[0].engine, "quorum", "before", b"kept").await;
+    nodes[1].cluster.shutdown().await;
+    nodes[2].cluster.shutdown().await;
+
+    let survivor = &nodes[0].engine;
+    let t = std::time::Instant::now();
+    let mut w = survivor.writer();
+    w.write(b"lost").await.unwrap();
+    let written = w.finish().await;
+    let result = match written {
+        Ok(data) => survivor
+            .put_object(
+                "quorum",
+                "after",
+                data,
+                ObjectAttrs::default(),
+                WriteCondition::default(),
+            )
+            .await
+            .map(drop),
+        Err(e) => Err(e),
+    };
+    let took = t.elapsed();
+    assert!(
+        matches!(result, Err(Error::Unavailable(_))),
+        "write without a quorum: {result:?}"
+    );
+    assert!(took < Duration::from_secs(25), "write took {took:?}");
+
+    let t = std::time::Instant::now();
+    let read = survivor.head_object("quorum", "before").await;
+    assert!(
+        matches!(read, Err(Error::Unavailable(_))),
+        "read without a quorum: {read:?}"
+    );
+    assert!(
+        t.elapsed() < Duration::from_secs(15),
+        "read took {:?}",
+        t.elapsed()
+    );
+}

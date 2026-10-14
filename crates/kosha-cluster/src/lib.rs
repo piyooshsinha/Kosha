@@ -150,6 +150,10 @@ pub struct Cluster {
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(30);
 const APPLY_WAIT: Duration = Duration::from_secs(30);
 const RETRIES: u32 = 50;
+/// How long a write or linearizable read waits for a leader and a quorum
+/// before failing with `Unavailable` (HTTP 503), so clients are not left
+/// hanging while the cluster has lost its majority.
+const QUORUM_DEADLINE: Duration = Duration::from_secs(10);
 
 fn backoff(attempt: u32) -> Duration {
     Duration::from_millis((50 * (attempt as u64 + 1)).min(500))
@@ -669,8 +673,19 @@ impl Inner {
                 .collect(),
         );
         let mut last = String::from("no leader");
+        let deadline = tokio::time::Instant::now() + QUORUM_DEADLINE;
         for attempt in 0..RETRIES {
-            match self.raft.client_write(batch.clone()).await {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            let Ok(written) =
+                tokio::time::timeout(left, self.raft.client_write(batch.clone())).await
+            else {
+                last = "timed out waiting for a quorum".into();
+                break;
+            };
+            match written {
                 Ok(resp) => return Ok(resp.data.0),
                 Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) => {
                     if let Some(leader) = f.leader_node {
@@ -680,7 +695,7 @@ impl Inner {
                                 &leader.addr,
                                 "/raft/propose",
                                 &batch,
-                                FORWARD_TIMEOUT,
+                                FORWARD_TIMEOUT.min(left),
                             )
                             .await
                         {
@@ -697,15 +712,24 @@ impl Inner {
             }
             tokio::time::sleep(backoff(attempt)).await;
         }
-        Err(kosha_engine::Error::Internal(format!(
+        Err(kosha_engine::Error::Unavailable(format!(
             "cluster unavailable for writes: {last}"
         )))
     }
 
     async fn read_barrier(&self) -> kosha_engine::Result<()> {
         let mut last = String::from("no leader");
+        let deadline = tokio::time::Instant::now() + QUORUM_DEADLINE;
         for attempt in 0..RETRIES {
-            match self.leader_read_index().await {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            let Ok(index) = tokio::time::timeout(left, self.leader_read_index()).await else {
+                last = "timed out waiting for a quorum".into();
+                break;
+            };
+            match index {
                 Ok(index) => {
                     if let Some(i) = index {
                         self.wait_applied(i).await?;
@@ -720,7 +744,7 @@ impl Inner {
                                 &leader.addr,
                                 "/raft/read-index",
                                 &(),
-                                FORWARD_TIMEOUT,
+                                FORWARD_TIMEOUT.min(left),
                             )
                             .await
                         {
@@ -739,7 +763,7 @@ impl Inner {
             }
             tokio::time::sleep(backoff(attempt)).await;
         }
-        Err(kosha_engine::Error::Internal(format!(
+        Err(kosha_engine::Error::Unavailable(format!(
             "cluster unavailable for reads: {last}"
         )))
     }
@@ -790,9 +814,13 @@ impl Proposer {
                         }
                     }
                     Err(e) => {
-                        let msg = e.to_string();
                         for reply in replies {
-                            let _ = reply.send(Err(kosha_engine::Error::Internal(msg.clone())));
+                            let _ = reply.send(Err(match &e {
+                                kosha_engine::Error::Unavailable(m) => {
+                                    kosha_engine::Error::Unavailable(m.clone())
+                                }
+                                e => kosha_engine::Error::Internal(e.to_string()),
+                            }));
                         }
                     }
                 }

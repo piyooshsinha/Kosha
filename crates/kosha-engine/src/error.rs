@@ -52,6 +52,10 @@ pub enum Error {
     Meta(String),
     #[error("internal error: {0}")]
     Internal(String),
+    /// The cluster cannot serve the request right now (no quorum or no
+    /// leader). A write that fails this way may or may not have been applied.
+    #[error("service unavailable: {0}")]
+    Unavailable(String),
 }
 
 macro_rules! from_meta_err {

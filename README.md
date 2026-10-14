@@ -193,6 +193,7 @@ Garage [S3 compatibility](https://garagehq.deuxfleurs.fr/documentation/reference
 [Monitoring](#6-monitoring) ·
 [Security](#7-security) ·
 [Performance](#performance) ·
+[Crash testing](#crash-testing) ·
 [Configuration](#configuration) ·
 [S3 compatibility](#s3-compatibility) ·
 [Architecture](docs/ARCHITECTURE.md)
@@ -949,7 +950,7 @@ What the numbers show, and what they don't:
 Reproduce (RustFS and MinIO binaries are not included):
 
 ```sh
-cargo build --release -p kosha-server -p kosha-s3 --examples
+cargo build --release --bins --examples
 GOBIN=$PWD/bin go install github.com/minio/minio@latest   # MinIO is source-only
 # RustFS: download a release binary from github.com/rustfs/rustfs/releases
 BENCH_DIR=/path/on/the/disk/to/test scripts/compare-bench.sh \
@@ -977,7 +978,7 @@ listener now sets it.
 ### Reproduce
 
 ```sh
-cargo build --release -p kosha-server -p kosha-s3 --examples
+cargo build --release --bins --examples
 AWS_ACCESS_KEY_ID=admin AWS_SECRET_ACCESS_KEY=change-me-please \
   ./target/release/examples/s3bench --endpoint http://127.0.0.1:9000 \
   --size 64KiB --count 3000 --concurrency 32
@@ -1046,6 +1047,66 @@ io_uring. `--io auto` (the default) detects this and falls back to threads;
 `/_kosha/stats` and the console report which backend is active.
 
 ---
+
+## Crash testing
+
+`crashtest` kills Kosha with `SIGKILL` in the middle of mixed traffic,
+restarts it, and checks that nothing acknowledged was lost:
+
+```sh
+cargo build --release --bins --examples
+target/release/examples/crashtest --kosha target/release/kosha --rounds 50
+target/release/examples/crashtest --kosha target/release/kosha --cluster --chaos --rounds 30
+# pass server flags after --, e.g. -- --erasure 2+1 or -- --encryption-key-file key.hex
+```
+
+Twelve writers each own 16 keys and change them one operation at a time:
+PUTs from 0 bytes to 12 MiB (inline objects, chunk boundaries, multipart
+uploads, partly shared content so deduplicated chunks are exercised),
+DELETEs and server-side COPYs. Every round kills a server at a random
+moment, restarts it, and then checks every key on every node:
+
+- an acknowledged operation must be visible, byte for byte;
+- an operation that failed or was cut off may be visible or not, but never
+  half-applied;
+- all nodes must agree, and listings must show exactly the keys that exist;
+- nothing may change after it has been checked.
+
+In a cluster, writers keep writing to the surviving nodes while one is
+down. With `--chaos`, a third of the rounds kill two of the three nodes
+(losing the majority), and a third crash a node again while it recovers.
+`--sabotage` deletes a chunk file after each crash, to show that the test
+does catch lost data.
+
+Results on the 4-core development VM (server code at this commit):
+
+| Setup | Crashes | Acknowledged operations | Errors |
+|---|---|---|---|
+| Single node, default | 50 | 50,625 | **0** |
+| Single node, `--sync file` | 30 | 23,932 | **0** |
+| Single node, encrypted | 30 | 22,601 | **0** |
+| 3-node cluster, 2 replicas | 30 | 20,444 | **0** |
+| 3-node cluster, erasure coding 2+1 | 30 | 16,859 | **0** |
+| 3-node cluster, encrypted | 20 | 9,382 | **0** |
+| 3-node cluster, `--chaos` (9 majority losses, 5 crashes during recovery) | 30 | 15,709 | **0** |
+| Single node, `--sabotage` (one chunk file deleted per crash) | 3 | 3,366 | 6 (expected: reads of the deleted chunks fail) |
+
+**What the test found.** No acknowledged write was lost or damaged in any
+run. It did find an availability bug: a node cut off from the majority
+held requests until the client gave up, 44–59 s in the test and forever
+for clients without a timeout. Writes and linearizable reads now fail
+with `503 ServiceUnavailable` after 10 seconds without a quorum (see
+[ARCHITECTURE.md](docs/ARCHITECTURE.md#without-a-majority)). After a
+restart, all nodes served requests again within 5 seconds in every round.
+
+**What this does not test.** `SIGKILL` stops the process, but the
+operating system survives, so data that Kosha wrote but had not yet synced
+still reaches the disk. A power cut or kernel crash would lose it. This
+test does not simulate that, because this VM has no device-mapper or
+similar way to drop unsynced writes. Durability across power loss rests on
+the sync rules in [Chunk durability](docs/ARCHITECTURE.md#chunk-durability):
+chunks are synced before the metadata that references them is committed.
+A short version of this test runs in CI on every push.
 
 ## Configuration
 
@@ -1135,6 +1196,8 @@ scripts/          dev-cluster.sh
 ```sh
 (cd ui && npm ci && npm test && npm run build)
 cargo test --workspace     # engine, S3 + AWS SDK, and 3-node cluster tests
+cargo build --bins --examples && \
+  target/debug/examples/crashtest --kosha target/debug/kosha --rounds 8   # see Crash testing
 cargo clippy --workspace --all-targets -- -D warnings
 (cd ui && npm run dev)     # console with hot reload, proxied to a server on :9000
 ```
