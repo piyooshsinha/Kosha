@@ -107,23 +107,23 @@ Most of the differences below follow from those choices.
 
 This comparison is about architecture. Kosha has **not** been benchmarked
 against these projects, and the facts about them come from their public
-documentation and press coverage as of October 2026.
+documentation (README files and reference manuals) as of October 2026.
 
 | | MinIO | RustFS | Garage | Kosha |
 |---|---|---|---|---|
 | Language, license | Go, AGPLv3 | Rust, Apache-2.0 | Rust, AGPLv3 | Rust, Apache-2.0 |
-| Status | community edition in maintenance mode, source only, repository archived in 2026 | 1.0 released September 2026 | active (v2.x), in production since 2020 | new; tested on a single VM, not yet run in production |
-| Data layout | whole object, erasure coded across a drive set | same model as MinIO | fixed-size blocks, replicated | content-defined chunks (FastCDC), addressed by BLAKE3 |
+| Status | community edition no longer maintained; source only, no binaries | 1.0 released September 2026 | active (v2.4), in production since 2020 | new; tested on a single VM, not yet run in production |
+| Data layout | whole object, erasure coded across a drive set | same model as MinIO | fixed-size blocks, replicated, optional zstd | content-defined chunks (FastCDC), addressed by BLAKE3 |
 | Deduplication | none | none | identical blocks only; an insert shifts every later block | **global**, across objects, buckets, versions and parts, even at shifted offsets |
 | Metadata | stored with each object, coordinated with distributed locks | same model as MinIO | CRDT tables with quorum reads and writes, no leader | **one Raft-replicated database** (openraft + redb) |
 | Consistency | strong, per object | strong, per object | quorum-based; prefers availability across sites | **linearizable** on any node; conditional writes checked in the Raft log; exactly-once retries |
 | Copy, multipart complete | copies data | copies data | copies data | metadata only |
 | New version of an object | stored in full | stored in full | no versioning | stores only the changed chunks |
 | Redundancy | erasure coding | erasure coding | replication | replication or erasure coding, or replicated while hot and erasure coded once cold |
-| Encryption at rest | SSE with KMS (KES) | SSE with KMS | SSE-C (client-supplied keys) only | dedup-preserving encryption with your own key, online rotation |
-| Tiering | lifecycle transition to remote tiers | data tiering | none | chunk-level cold tier on any S3 bucket, access-based demotion and promotion |
+| Encryption at rest | SSE with KMS (KES) | SSE with KMS (Vault, AWS KMS) | SSE-C (client-supplied keys) only | dedup-preserving encryption with your own key, online rotation |
+| Tiering | lifecycle transition to remote tiers | lifecycle transition to remote S3 | none | chunk-level cold tier on any S3 bucket, access-based demotion and promotion |
 | Disk I/O | standard syscalls | standard syscalls | standard syscalls | io_uring (optional `O_DIRECT`) |
-| Web console | removed from the community edition | included | none (CLI and admin API) | built into the binary |
+| Web console | object browser only (admin screens removed in 2025) | included | none (CLI and admin API) | built into the binary |
 
 **Where they are ahead of Kosha**
 
@@ -136,11 +136,14 @@ documentation and press coverage as of October 2026.
 - **Raw throughput on unique data.** MinIO's erasure-coding path is heavily
   optimized, while Kosha hashes and compresses every chunk. On unique,
   incompressible data MinIO is probably faster. Kosha gains when data repeats.
-- **Enterprise features.** RustFS has KMS integration, OIDC, STS
-  credentials, site and bucket replication, WebDAV, Swift and FTP access,
-  and S3 Tables with an Iceberg catalog. Kosha has none of these.
+- **Enterprise features.** RustFS has KMS integration (Vault, AWS KMS),
+  OIDC single sign-on, site and bucket replication, S3 Select, bucket quotas,
+  audit logging, Swift, WebDAV, FTPS and SFTP access, and S3 Tables with an
+  Iceberg catalog (preview). Kosha has none of these.
 - **Spread-out clusters.** Garage is designed for small clusters spread over
-  several sites, and it serves static websites.
+  several sites, has no single leader, and serves static websites. Garage
+  does lack versioning, Object Lock, bucket policies and notifications,
+  which Kosha has.
 
 **Which one to pick**
 
@@ -153,10 +156,14 @@ documentation and press coverage as of October 2026.
 - **MinIO:** existing deployments. The community edition no longer receives
   updates, so a new installation means building and patching it yourself.
 
-Sources: [MinIO CE in 2026](https://glukhov.org/data-infrastructure/object-storage/minio-dead/),
+Sources (checked October 2026):
+[MinIO README](https://github.com/minio/minio#readme),
+[MinIO CE in 2026](https://glukhov.org/data-infrastructure/object-storage/minio-dead/),
+[RustFS README](https://github.com/rustfs/rustfs#readme),
 [RustFS 1.0 GA](https://linuxiac.com/rustfs-1-0-s3-compatible-object-storage-reaches-ga/),
-[RustFS docs](https://docs.rustfs.com/concepts/introduction),
-[Garage](https://garagehq.deuxfleurs.fr/).
+[Garage S3 compatibility](https://garagehq.deuxfleurs.fr/documentation/reference-manual/s3-compatibility/),
+[Garage features](https://garagehq.deuxfleurs.fr/documentation/reference-manual/features/),
+[Garage internals](https://garagehq.deuxfleurs.fr/documentation/design/internals/).
 
 **Contents:**
 [Kosha vs S3](#kosha-vs-amazon-s3) ·
