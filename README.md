@@ -120,8 +120,8 @@ documentation and press coverage as of October 2026.
 | Copy, multipart complete | copies data | copies data | copies data | metadata only |
 | New version of an object | stored in full | stored in full | no versioning | stores only the changed chunks |
 | Redundancy | erasure coding | erasure coding | replication | replication or erasure coding, or replicated while hot and erasure coded once cold |
-| Encryption at rest | SSE with KMS (KES) | SSE with KMS | none built in | dedup-preserving encryption with your own key, online rotation |
-| Tiering | to remote tiers (enterprise edition) | data tiering | none | chunk-level cold tier on any S3 bucket, access-based demotion and promotion |
+| Encryption at rest | SSE with KMS (KES) | SSE with KMS | SSE-C (client-supplied keys) only | dedup-preserving encryption with your own key, online rotation |
+| Tiering | lifecycle transition to remote tiers | data tiering | none | chunk-level cold tier on any S3 bucket, access-based demotion and promotion |
 | Disk I/O | standard syscalls | standard syscalls | standard syscalls | io_uring (optional `O_DIRECT`) |
 | Web console | removed from the community edition | included | none (CLI and admin API) | built into the binary |
 
