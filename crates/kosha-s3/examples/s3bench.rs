@@ -7,7 +7,8 @@
 //!
 //! Writes `count` objects of `size` bytes, then reads them all back, and
 //! reports throughput and latency percentiles for each phase. Pass
-//! `--read-endpoint` to read from a different node than the one written to.
+//! `--read-endpoint` to read from a different node than the one written to,
+//! and `--copy` to add a phase that server-side copies every object.
 //! Credentials come from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`.
 
 use std::sync::Arc;
@@ -27,6 +28,7 @@ struct Args {
     count: usize,
     concurrency: usize,
     unique: bool,
+    copy: bool,
 }
 
 fn parse_size(s: &str) -> usize {
@@ -52,6 +54,7 @@ fn args() -> Args {
         count: 1000,
         concurrency: 32,
         unique: true,
+        copy: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -64,6 +67,7 @@ fn args() -> Args {
             "--count" => a.count = val().parse().expect("count"),
             "--concurrency" => a.concurrency = val().parse().expect("concurrency"),
             "--duplicate" => a.unique = false,
+            "--copy" => a.copy = true,
             other => panic!("unknown flag {other}"),
         }
     }
@@ -167,7 +171,12 @@ async fn main() {
     };
     let bodies: Vec<Bytes> = (0..a.count).map(body_for).collect();
 
-    for phase in ["PUT", "GET"] {
+    let phases: &[&str] = if a.copy {
+        &["PUT", "GET", "COPY"]
+    } else {
+        &["PUT", "GET"]
+    };
+    for &phase in phases {
         let start = Instant::now();
         let results: Vec<Result<Duration, String>> = futures::stream::iter(0..a.count)
             .map(|i| {
@@ -181,7 +190,15 @@ async fn main() {
                 async move {
                     let key = format!("{run}/{i:08}");
                     let t = Instant::now();
-                    if phase == "PUT" {
+                    if phase == "COPY" {
+                        w.copy_object()
+                            .bucket(&a.bucket)
+                            .key(format!("{key}.copy"))
+                            .copy_source(format!("{}/{key}", a.bucket))
+                            .send()
+                            .await
+                            .map_err(|e| format!("{e:?}"))?;
+                    } else if phase == "PUT" {
                         w.put_object()
                             .bucket(&a.bucket)
                             .key(&key)

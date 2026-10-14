@@ -110,10 +110,11 @@ and Garage (Rust). In one sentence each:
 - **Kosha** splits data into content-defined chunks, stores each unique chunk
   once, and keeps all metadata in one Raft-replicated database.
 
-This comparison is about design, not speed: Kosha has **not** been
-benchmarked against these projects. Every statement about them was checked
-in October 2026 against their own documentation or source code (linked
-below).
+Every statement about them was checked in October 2026 against their own
+documentation or source code (linked below). For measured speed, see
+[Compared with RustFS and MinIO](#compared-with-rustfs-and-minio): that
+benchmark covers single-node, single-drive setups only. Garage was not
+benchmarked.
 
 | | MinIO | RustFS | Garage | Kosha |
 |---|---|---|---|---|
@@ -141,11 +142,11 @@ below).
   shared 4-core VM. MinIO and RustFS keep metadata with each object instead
   of in a central database, and Garage has no leader, so none of them
   funnels metadata through one node.
-- **Raw throughput on unique data.** MinIO erasure codes with the
-  `klauspost/reedsolomon` library and writes large files with `O_DIRECT`, while Kosha
-  also hashes and probes every chunk for compression. We have not measured
-  it, but on unique, incompressible data MinIO is likely faster. Kosha gains
-  when data repeats.
+- **Large uploads.** In our single-node benchmark MinIO uploaded 32 MiB
+  objects faster than Kosha (161 vs 139 MiB/s median) and matched it on
+  1 MiB uploads. Kosha also hashes every chunk and probes it for
+  compression. Multi-drive erasure-coded setups, which MinIO and RustFS are
+  built for, were not benchmarked.
 - **Enterprise features.** RustFS has KMS integration (Vault, AWS KMS),
   OIDC single sign-on, site and bucket replication, S3 Select, bucket quotas,
   audit logging, Swift, WebDAV and FTPS access, opt-in SFTP, and S3 Tables
@@ -884,6 +885,77 @@ large objects in the cluster.
 - **Small writes** now run at about the same rate as small reads, so the
   client, the HTTP stack and SigV4 verification share the remaining cost.
 
+### Compared with RustFS and MinIO
+
+All three servers ran on the same VM (4 cores shared with the client, 15 GB
+RAM, ext4 on a virtio disk), one at a time, each with a fresh data
+directory on the same disk and the same client: `s3bench` (AWS SDK for
+Rust, which signs every payload with SHA-256), writing random objects and
+checking every GET byte for byte (the same client as in the sections
+above). There were three rounds: the first in the order Kosha, RustFS,
+MinIO, the other two in reverse. The table shows the median and, in
+brackets, the range. Every run finished with **0 errors**.
+
+- **Versions:** Kosha built from this repository (server code as of commit
+  `31df1b3`); RustFS 1.0.1 (official release
+  binary); MinIO built from its final community commit (February 2026).
+- **Setup:** single node, single drive, default settings. In single-drive
+  mode MinIO and RustFS do not erasure code, and Kosha does not replicate,
+  so none of the three has redundancy here. Multi-drive and multi-node
+  setups were not measured.
+- **Durability as configured by default** (read from each project's
+  source): Kosha syncs chunk data, directory entries and metadata before
+  acknowledging (`--sync group`). RustFS's default `strict` mode does the
+  same. MinIO `fdatasync`s each data file but not directory entries.
+
+| Workload | Kosha | RustFS | MinIO |
+|---|---|---|---|
+| PUT 4 KiB, 32 concurrent | **2,770** req/s [2,711–2,892] · p50 6.8 ms | 657 req/s [595–669] · p50 46 ms | 923 req/s [915–1,087] · p50 30 ms |
+| GET 4 KiB, 32 concurrent | **3,810** req/s [3,768–4,122] | 3,210 req/s [3,120–3,428] | 3,171 req/s [2,936–3,303] |
+| PUT 64 KiB, 32 concurrent | **1,104** req/s [1,084–1,111] | 508 req/s [484–537] | 765 req/s [763–873] |
+| GET 64 KiB, 32 concurrent | **3,222** req/s [3,164–3,552] | 1,941 req/s [1,877–2,084] | 2,664 req/s [2,598–2,737] |
+| PUT 1 MiB, 16 concurrent | 132 MiB/s [131–139] | 108 MiB/s [106–108] | 135 MiB/s [127–136] |
+| GET 1 MiB, 16 concurrent | **959** MiB/s [872–1,058] | 792 MiB/s [753–804] | 795 MiB/s [764–806] |
+| Server-side COPY 1 MiB, 16 concurrent | **3,207** copies/s [3,019–3,796] · p50 4.0 ms | 159 copies/s [148–163] · p50 102 ms | 199 copies/s [196–210] · p50 74 ms |
+| PUT 32 MiB, 4 concurrent | 139 MiB/s [138–145] | 135 MiB/s [132–142] | **161** MiB/s [159–162] |
+| GET 32 MiB, 4 concurrent | 556 MiB/s [535–568] | 516 MiB/s [464–549] | 531 MiB/s [522–545] |
+| Disk used by 1,000 identical 1 MiB objects | **0 MiB** (already stored) | 1,000 MiB | 1,000 MiB |
+| Data directory after every workload | **2.8 GiB** | 4.6 GiB | 4.6 GiB |
+| Peak server memory (RSS) | **345–365 MiB** | 720–769 MiB | 627–630 MiB |
+
+What the numbers show, and what they don't:
+
+- **Small writes** are where Kosha leads most: at 4 KiB, 4–4.9× RustFS
+  and 2.5–3.2× MinIO; at 64 KiB, about 2.2× and 1.4×. Group commit lets concurrent writes share one durable
+  transaction and one `syncfs`. Under `strace`, 500 4 KiB PUTs plus
+  100 1 MiB PUTs cost Kosha 343 sync calls and MinIO 600.
+- **RustFS's durability mode is not the main cost.** With
+  `RUSTFS_DURABILITY_MODE=relaxed`, which RustFS documents as matching
+  MinIO's default (we confirmed it cut sync calls 7× for 500 PUTs), RustFS
+  reached 761 req/s at 4 KiB and 622 req/s at 64 KiB in one round.
+- **Large uploads** are limited by CPU: the client's SHA-256 signing and
+  the servers' own hashing share the same 4 cores. MinIO is fastest at
+  32 MiB and level with Kosha at 1 MiB.
+- **Copies** in Kosha are metadata only. RustFS and MinIO rewrite the data
+  when copying to a new key.
+- **Deduplication** is the best case here: identical objects. Real data
+  deduplicates less, and random data (every other row) not at all.
+- **GETs** read data written moments earlier, so they mostly come from the
+  page cache.
+- **ext4.** MinIO's documentation recommends XFS and warns that ext4 does
+  not honour all of its consistency assumptions. These results are for
+  ext4 only.
+
+Reproduce (RustFS and MinIO binaries are not included):
+
+```sh
+cargo build --release -p kosha-server -p kosha-s3 --examples
+GOBIN=$PWD/bin go install github.com/minio/minio@latest   # MinIO is source-only
+# RustFS: download a release binary from github.com/rustfs/rustfs/releases
+BENCH_DIR=/path/on/the/disk/to/test scripts/compare-bench.sh \
+  target/release/kosha ./rustfs ./bin/minio 3
+```
+
 ### Cost of encryption at rest
 
 Same VM, single node, back-to-back runs with and without
@@ -911,6 +983,7 @@ AWS_ACCESS_KEY_ID=admin AWS_SECRET_ACCESS_KEY=change-me-please \
   --size 64KiB --count 3000 --concurrency 32
 # cluster: --endpoint http://127.0.0.1:9001 --read-endpoint http://127.0.0.1:9003
 # dedup:   add --duplicate to upload identical content
+# copy:    add --copy for a phase that server-side copies every object
 ```
 
 `s3bench` writes `count` objects, reads them all back, verifies the content,
