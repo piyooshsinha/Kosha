@@ -30,9 +30,70 @@ with io_uring.
 | Encryption at rest | breaks dedup, or none | **dedup-preserving**: keyed chunk addresses + deterministic AES-256-GCM-SIV |
 | Cold data | separate archive product | **built-in cold tier**: chunks move to any S3 bucket, reads stay transparent, dedup preserved |
 | Versions | full copies per version | **versions share chunks**: a new version stores only the chunks that changed |
+| Hot vs cold | fixed per storage class | **access-based tiering**: unread objects move to the cold tier, the first read brings them back |
+| Cold redundancy | same as hot | **replicated while hot, erasure coded once cold**, in the background |
+| Key rotation | re-encrypt by copying everything | **online rotation**: data is re-encrypted in the background, chunk ids and dedup unchanged |
 | Admin UI | separate product | **built-in web console**, compiled into the binary |
 
+## Kosha vs Amazon S3
+
+Kosha speaks the S3 API, so the AWS CLI, boto3, the AWS SDKs and other
+S3 tools work against it unchanged. It is not a copy of Amazon S3, though:
+S3 is a managed service you rent, and Kosha is software you run.
+
+**Where Kosha differs by design**
+
+| | Amazon S3 | Kosha |
+|---|---|---|
+| Where it runs | AWS regions only | anywhere: a laptop, your servers, any cloud, air-gapped sites |
+| What you pay | per GB-month, per request, and per GB transferred out | your own disks and network; no request or egress fees |
+| Deduplication | none: identical data is billed again | content-defined chunks are stored once, across all objects and buckets |
+| Compression | none (you compress before upload) | adaptive zstd per chunk, transparent to clients |
+| Server-side copy, multipart complete | moves or rewrites data | metadata only, whatever the object size |
+| Versions | each version stored and billed in full | versions share chunks; a new version costs only its changed bytes |
+| Encryption at rest | SSE-S3 / SSE-KMS / SSE-C; dedup is not a concern | dedup-preserving AES-256-GCM-SIV, with your own key and online rotation |
+| Consistency | strong read-after-write | linearizable through Raft, plus conditional writes evaluated in the log |
+| Retried writes | may apply twice | exactly-once with request ids |
+| Cold storage | separate classes (Glacier); restores take minutes to hours | a cold tier on *any* S3-compatible bucket; reads are transparent and `RestoreObject` completes at once |
+| Intelligent-Tiering | per-object monitoring fee | built in and free; access is tracked in the replicated metadata |
+| Redundancy | fixed by AWS (multiple AZs) | your choice per cluster: N replicas, or Reed–Solomon K+M (for example 4+2 = 1.5× storage) |
+| Visibility | CloudWatch, billed | Prometheus metrics, `/_kosha/stats` and a built-in web console |
+| Lock-in | AWS-only features and pricing | one open-source binary (Apache-2.0); data stays on your hardware |
+
+**What Amazon S3 has that Kosha does not**
+
+- **Scale and durability as a service.** S3 is designed for 99.999999999%
+  durability across several data centres, scales without limits, and someone
+  else runs it around the clock. A Kosha cluster is as durable and as
+  available as the nodes, disks and sites you give it, and you operate it.
+- **One metadata group.** Kosha's metadata lives in a single Raft group,
+  which handled about 1,400 small writes per second on the shared 4-core
+  test VM. That is plenty for most private deployments, but it is not S3's
+  scale (see the [roadmap](docs/ARCHITECTURE.md#roadmap)).
+- **The wider AWS ecosystem.** Kosha has no AWS IAM API, roles or STS
+  credentials (users are managed in the console or `/_kosha/admin/users`),
+  no SSE-KMS or SSE-C, no ACLs that grant access to others (use policies),
+  no cross-region replication, no static website hosting, and no S3 Select,
+  Object Lambda, Inventory or Storage Lens. Notifications go to webhooks, not
+  SQS, SNS or Lambda. Unsupported operations return `501 NotImplemented`.
+
+**When to choose which**
+
+- **Choose Kosha** to keep data on your own hardware or on-premises, to stop
+  paying per request and per GB of egress, for data with many duplicates
+  (backups, VM images, datasets, build artifacts, versioned documents), or
+  for edge and air-gapped sites.
+- **Choose S3** when you want zero operations, global scale, AWS-managed
+  durability, or deep integration with other AWS services.
+- **Use both:** point Kosha's [cold tier](#cold-tier) at an S3 bucket.
+  Hot data stays local and fast, and cold chunks go to S3 already
+  deduplicated, compressed and encrypted.
+
+See [S3 compatibility](#s3-compatibility) for the exact list of supported
+operations.
+
 **Contents:**
+[Kosha vs S3](#kosha-vs-amazon-s3) ·
 [Install](#1-install) ·
 [Run a server](#2-run-a-single-node) ·
 [Read and write data](#3-read-and-write-data) ·
@@ -884,6 +945,7 @@ Tested against the **AWS SDK for Rust** (in CI), **boto3**, the **AWS CLI**,
 | Lifecycle | Get/Put/DeleteBucketLifecycleConfiguration: expiration (days or date), transition to a cold class (days or date), noncurrent version transition and expiration, expired delete marker cleanup, AbortIncompleteMultipartUpload; filters by prefix and tags |
 | Storage classes | `x-amz-storage-class` on Put/Copy/CreateMultipartUpload, reported on Get/Head and in listings, RestoreObject (succeeds at once: cold data reads directly); cold classes need a [cold tier](#cold-tier) |
 | ACLs | Get/PutBucketAcl and Get/PutObjectAcl with the owner-only (`private`) ACL; anything granting more returns `NotImplemented` (use policies) |
+| Intelligent-Tiering | Get/Put/Delete/ListBucketIntelligentTieringConfiguration (prefix and tag filters, `ARCHIVE_ACCESS` / `DEEP_ARCHIVE_ACCESS` days); objects report `INTELLIGENT_TIERING` while cold |
 | Notifications | Get/PutBucketNotificationConfiguration (Queue/Topic/CloudFunction configurations, prefix/suffix filters) delivered to webhooks |
 | Listing | ListObjectsV2 (prefix, delimiter, continuation, start-after, `encoding-type=url`), ListObjects v1 |
 | Multipart | Create, UploadPart, UploadPartCopy (with range), Complete, Abort, ListParts, ListMultipartUploads (paginated) |
