@@ -9,161 +9,177 @@ with io_uring.
 
 ![Kosha console](docs/images/console-overview.png)
 
-| | Classic object store | Kosha |
-|---|---|---|
-| Unit of storage | whole object / fixed blocks | **content-defined chunks** (FastCDC) |
-| Identity | key → file | key → manifest of **BLAKE3**-addressed chunks |
-| Duplicate data | stored again | **stored once, globally** (across objects, buckets, multipart parts) |
-| Server-side copy | re-reads and re-writes bytes | **metadata only** (a 256 MiB copy takes ~3 ms) |
-| Multipart complete | concatenates part files | **concatenates manifests**, no data moved |
-| Compression | none or always | **adaptive** zstd: probes each chunk, skips incompressible data |
-| Integrity | optional checksums | **every chunk verified on every read**, including reads from other nodes |
-| Disk I/O | blocking syscalls on a thread pool | **io_uring** (falls back to threads where it's unavailable) |
-| Metadata | files / ad-hoc database | **Raft-replicated ACID state machine** (openraft + redb) |
-| Consistency | eventually consistent or proprietary | **linearizable** reads and writes on any node (ReadIndex) |
-| Concurrency control | last writer wins | adds **conditional writes** (`If-None-Match: *`, `If-Match`) evaluated in the Raft log |
-| Write path | one commit per request | **group commit**: concurrent writes share one durable transaction / one Raft entry |
-| Redundancy | full copies (2–3×) | **replication or Reed–Solomon erasure coding** (e.g. 4+2: 1.5× storage, survives 2 failures) |
-| Durability after node loss | manual rebuild | **self-healing**: background re-replication restores every chunk's replica count |
-| Retried writes | may apply twice | **exactly-once**: request ids make a re-delivered write return its original result |
-| Data durability cost | fsync per file | **group sync**: concurrent chunk writes share one `syncfs`, including the directory entry |
-| Encryption at rest | breaks dedup, or none | **dedup-preserving**: keyed chunk addresses + deterministic AES-256-GCM-SIV |
-| Cold data | separate archive product | **built-in cold tier**: chunks move to any S3 bucket, reads stay transparent, dedup preserved |
-| Versions | full copies per version | **versions share chunks**: a new version stores only the chunks that changed |
-| Hot vs cold | fixed per storage class | **access-based tiering**: unread objects move to the cold tier, the first read brings them back |
-| Cold redundancy | same as hot | **replicated while hot, erasure coded once cold**, in the background |
-| Key rotation | re-encrypt by copying everything | **online rotation**: data is re-encrypted in the background, chunk ids and dedup unchanged |
-| Admin UI | separate product | **built-in web console**, compiled into the binary |
+| Area | How Kosha does it |
+|---|---|
+| Unit of storage | **content-defined chunks** (FastCDC) |
+| Identity | key → manifest of **BLAKE3**-addressed chunks |
+| Duplicate data | **stored once, globally** (across objects, buckets, versions and multipart parts) |
+| Server-side copy | **metadata only** (a 256 MiB copy took 2.9 ms in our benchmark) |
+| Multipart complete | **concatenates manifests**, no data moved |
+| Compression | **adaptive** zstd: probes each chunk, skips incompressible data |
+| Integrity | **every chunk verified on every read**, including reads from other nodes |
+| Disk I/O | **io_uring** for chunk reads and writes (falls back to a thread pool where it's unavailable), optional `O_DIRECT` |
+| Metadata | **Raft-replicated ACID state machine** (openraft + redb) |
+| Consistency | **linearizable** reads and writes on any node (leader lease, ReadIndex from followers) |
+| Concurrency control | **conditional writes** (`If-None-Match: *`, `If-Match`) evaluated in the Raft log |
+| Write path | **group commit**: concurrent writes share one durable transaction / one Raft entry |
+| Redundancy | **replication or Reed–Solomon erasure coding** (e.g. 4+2: 1.5× storage, survives 2 failures) |
+| Durability after node loss | **self-healing**: background re-replication restores every chunk's replica count |
+| Internal retries | **applied once**: a write that one node retries to another (say, after a lost reply) returns its original result |
+| Chunk durability | **group sync**: concurrent chunk writes share one `syncfs`, including the directory entry |
+| Encryption at rest | **dedup-preserving**: keyed chunk addresses + deterministic AES-256-GCM-SIV |
+| Cold data | **built-in cold tier**: chunks move to any S3 bucket, reads stay transparent, dedup preserved |
+| Versions | **versions share chunks**: a new version stores only the chunks that changed |
+| Hot vs cold | **access-based tiering**: unread objects move to the cold tier, the first read brings them back |
+| Cold redundancy | **replicated while hot, erasure coded once cold**, in the background |
+| Key rotation | **online**: data is re-encrypted in the background, chunk ids and dedup unchanged |
+| Admin UI | **built-in web console**, compiled into the binary |
 
 ## Kosha vs Amazon S3
 
-Kosha speaks the S3 API, so the AWS CLI, boto3, the AWS SDKs and other
-S3 tools work against it unchanged. It is not a copy of Amazon S3, though:
-S3 is a managed service you rent, and Kosha is software you run.
+Kosha speaks the S3 API, so the AWS CLI, boto3 and the AWS SDKs work against
+it unchanged (see [S3 compatibility](#s3-compatibility) for what is tested).
+It is not a copy of Amazon S3, though: S3 is a managed service you rent, and
+Kosha is software you run.
 
-**Where Kosha differs by design**
+**Where Kosha differs**
 
 | | Amazon S3 | Kosha |
 |---|---|---|
-| Where it runs | AWS regions only | anywhere: a laptop, your servers, any cloud, air-gapped sites |
-| What you pay | per GB-month, per request, and per GB transferred out | your own disks and network; no request or egress fees |
-| Deduplication | none: identical data is billed again | content-defined chunks are stored once, across all objects and buckets |
-| Compression | none (you compress before upload) | adaptive zstd per chunk, transparent to clients |
-| Server-side copy, multipart complete | moves or rewrites data | metadata only, whatever the object size |
-| Versions | each version stored and billed in full | versions share chunks; a new version costs only its changed bytes |
-| Encryption at rest | SSE-S3 / SSE-KMS / SSE-C; dedup is not a concern | dedup-preserving AES-256-GCM-SIV, with your own key and online rotation |
-| Consistency | strong read-after-write | linearizable through Raft, plus conditional writes evaluated in the log |
-| Retried writes | may apply twice | exactly-once with request ids |
-| Cold storage | separate classes (Glacier); restores take minutes to hours | a cold tier on *any* S3-compatible bucket; reads are transparent and `RestoreObject` completes at once |
-| Intelligent-Tiering | per-object monitoring fee | built in and free; access is tracked in the replicated metadata |
-| Redundancy | fixed by AWS (multiple AZs) | your choice per cluster: N replicas, or Reed–Solomon K+M (for example 4+2 = 1.5× storage) |
-| Visibility | CloudWatch, billed | Prometheus metrics, `/_kosha/stats` and a built-in web console |
-| Lock-in | AWS-only features and pricing | one open-source binary (Apache-2.0); data stays on your hardware |
+| Where it runs | AWS Regions | your own machines or any cloud (Linux recommended) |
+| What you pay | storage per GB-month, requests, and data transferred out | the hardware and network you provide; no per-request charges |
+| Duplicate data | no deduplication: every object is stored and billed at its full size | each unique chunk is stored once, across all objects and buckets |
+| Compression | none on the server: you are billed for the bytes you upload | adaptive zstd per chunk, transparent to clients |
+| Server-side copy | the copy is a separate object, stored and billed at its full size | metadata only: the copy shares its chunks with the source |
+| Versions | every retained version is billed | versions share chunks; a new version costs only its changed bytes |
+| Encryption at rest | SSE-S3 (the default), SSE-KMS, DSSE-KMS, SSE-C | your own key file; encryption keeps deduplication; online key rotation; no KMS integration |
+| Consistency | strong read-after-write; conditional writes with `If-None-Match` and `If-Match` | linearizable through Raft; the same conditional writes, evaluated in the Raft log |
+| Cold storage | Glacier Instant Retrieval reads in milliseconds; Glacier Flexible Retrieval needs a restore that takes minutes to hours, Deep Archive up to 12 hours (48 for bulk) | a cold tier on *any* S3-compatible bucket; reads are transparent and `RestoreObject` completes at once |
+| Intelligent-Tiering | a monthly monitoring fee for each object of 128 KB or more | built in, no fee; access is tracked in the replicated metadata |
+| Redundancy | set by the storage class: at least three Availability Zones, or one for the One Zone classes | your choice per cluster: N replicas, or Reed–Solomon K+M (for example 4+2 = 1.5× storage) |
+| Monitoring | CloudWatch: daily storage metrics free, request metrics billed | Prometheus metrics, `/_kosha/stats` and a built-in web console |
+| Source | proprietary service | open source (Apache-2.0), one binary |
 
 **What Amazon S3 has that Kosha does not**
 
 - **Scale and durability as a service.** S3 is designed for 99.999999999%
-  durability across several data centres, scales without limits, and someone
-  else runs it around the clock. A Kosha cluster is as durable and as
-  available as the nodes, disks and sites you give it, and you operate it.
-- **One metadata group.** Kosha's metadata lives in a single Raft group,
-  which handled about 1,400 small writes per second on the shared 4-core
-  test VM. That is plenty for most private deployments, but it is not S3's
-  scale (see the [roadmap](docs/ARCHITECTURE.md#roadmap)).
+  (11 nines) durability and is operated for you. A Kosha cluster is as
+  durable and as available as the nodes, disks and sites you give it, and
+  you operate it.
+- **Metadata scale.** All Kosha metadata goes through one Raft group. In our
+  benchmarks on a shared 4-core VM, a 3-node cluster sustained 1,180–1,430
+  4 KiB PUTs per second. That is far below S3's scale (see the
+  [roadmap](docs/ARCHITECTURE.md#roadmap)).
 - **The wider AWS ecosystem.** Kosha has no AWS IAM API, roles or STS
   credentials (users are managed in the console or `/_kosha/admin/users`),
   no SSE-KMS or SSE-C, no ACLs that grant access to others (use policies),
-  no cross-region replication, no static website hosting, and no S3 Select,
-  Object Lambda, Inventory or Storage Lens. Notifications go to webhooks, not
-  SQS, SNS or Lambda. Unsupported operations return `501 NotImplemented`.
+  no cross-region replication, no static website hosting, and no S3
+  Inventory or Storage Lens. Notifications go to webhooks, not SQS, SNS,
+  Lambda or EventBridge. Unsupported operations return `501 NotImplemented`.
 
 **When to choose which**
 
-- **Choose Kosha** to keep data on your own hardware or on-premises, to stop
-  paying per request and per GB of egress, for data with many duplicates
-  (backups, VM images, datasets, build artifacts, versioned documents), or
-  for edge and air-gapped sites.
-- **Choose S3** when you want zero operations, global scale, AWS-managed
-  durability, or deep integration with other AWS services.
+- **Choose Kosha** to keep data on your own hardware, to avoid per-request
+  and egress charges, for data with many duplicates (backups, VM images,
+  datasets, build artifacts, versioned documents), or for sites without
+  cloud access.
+- **Choose S3** when you want no operations work, AWS-managed durability at
+  any scale, or integration with other AWS services.
 - **Use both:** point Kosha's [cold tier](#cold-tier) at an S3 bucket.
-  Hot data stays local and fast, and cold chunks go to S3 already
-  deduplicated, compressed and encrypted.
+  Hot data stays local, and cold chunks go to S3 already deduplicated,
+  compressed and encrypted.
 
-See [S3 compatibility](#s3-compatibility) for the exact list of supported
-operations.
+Sources (checked October 2026):
+[S3 storage classes](https://aws.amazon.com/s3/storage-classes/),
+[Glacier storage classes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/glacier-storage-classes.html),
+[S3 pricing](https://aws.amazon.com/s3/pricing/),
+[conditional writes (If-None-Match)](https://aws.amazon.com/about-aws/whats-new/2024/08/amazon-s3-conditional-writes),
+[conditional writes (If-Match)](https://aws.amazon.com/about-aws/whats-new/2024/11/amazon-s3-functionality-conditional-writes),
+[billing for versions](https://docs.aws.amazon.com/AmazonS3/latest/userguide/aws-billing-reports.html),
+[CloudWatch metrics](https://docs.aws.amazon.com/AmazonS3/latest/userguide/cloudwatch-monitoring.html).
 
 ## Kosha vs MinIO, RustFS and Garage
 
 The self-hosted S3 servers closest to Kosha are MinIO (Go), RustFS (Rust)
 and Garage (Rust). In one sentence each:
 
-- **MinIO** and **RustFS** erasure code each whole object across a set of
-  drives and keep its metadata next to the data.
-- **Garage** replicates fixed-size blocks across sites, with no leader.
+- **MinIO** and **RustFS** erasure code each object across a set of drives
+  and keep its metadata (`xl.meta`) next to the data.
+- **Garage** splits objects into fixed-size blocks and replicates them
+  across sites, with no leader.
 - **Kosha** splits data into content-defined chunks, stores each unique chunk
   once, and keeps all metadata in one Raft-replicated database.
 
-Most of the differences below follow from those choices.
-
-This comparison is about architecture. Kosha has **not** been benchmarked
-against these projects, and the facts about them come from their public
-documentation (README files and reference manuals) as of October 2026.
+This comparison is about design, not speed: Kosha has **not** been
+benchmarked against these projects. Every statement about them was checked
+in October 2026 against their own documentation or source code (linked
+below).
 
 | | MinIO | RustFS | Garage | Kosha |
 |---|---|---|---|---|
 | Language, license | Go, AGPLv3 | Rust, Apache-2.0 | Rust, AGPLv3 | Rust, Apache-2.0 |
-| Status | community edition no longer maintained; source only, no binaries | 1.0 released September 2026 | active (v2.4), in production since 2020 | new; tested on a single VM, not yet run in production |
-| Data layout | whole object, erasure coded across a drive set | same model as MinIO | fixed-size blocks, replicated, optional zstd | content-defined chunks (FastCDC), addressed by BLAKE3 |
-| Deduplication | none | none | identical blocks only; an insert shifts every later block | **global**, across objects, buckets, versions and parts, even at shifted offsets |
-| Metadata | stored with each object, coordinated with distributed locks | same model as MinIO | CRDT tables with quorum reads and writes, no leader | **one Raft-replicated database** (openraft + redb) |
-| Consistency | strong, per object | strong, per object | quorum-based; prefers availability across sites | **linearizable** on any node; conditional writes checked in the Raft log; exactly-once retries |
-| Copy, multipart complete | copies data | copies data | copies data | metadata only |
+| Status | community edition marked "no longer maintained" (last commit February 2026); source only, no binaries | 1.0.0 tagged 16 September 2026 | active; v2.4.1 released September 2026; in production at Deuxfleurs since 2020 | new; tested on a single VM, not yet run in production |
+| Data layout | object erasure coded across a drive set; optional S2 compression | same model as MinIO; optional compression | fixed-size blocks, replicated; optional zstd | content-defined chunks (FastCDC), addressed by BLAKE3; adaptive zstd |
+| Deduplication | none documented | none documented | identical blocks; an insert shifts every later block, so they stop matching | **global**, across objects, buckets, versions and parts; after an insert, most chunks still match |
+| Metadata | `xl.meta` with each object; distributed locks (dsync) | same model as MinIO | CRDT tables with quorum reads and writes, no Raft | **one Raft-replicated database** (openraft + redb) |
+| Consistency | strict read-after-write and list-after-write (on xfs, zfs or btrfs, per its docs) | not stated in its docs | read-after-write by default; can be relaxed with `consistency_mode` | **linearizable** on any node; conditional writes evaluated in the Raft log |
+| Copy to a new key | data is rewritten (metadata only when copying onto itself) | data is rewritten (metadata only when copying onto itself) | metadata only in most cases: the copy references the same blocks | metadata only |
+| Multipart complete | part files are renamed into place, no copy | part files are renamed into place, no copy | the parts' blocks are linked into the object, no copy | manifests are concatenated, no copy |
 | New version of an object | stored in full | stored in full | no versioning | stores only the changed chunks |
 | Redundancy | erasure coding | erasure coding | replication | replication or erasure coding, or replicated while hot and erasure coded once cold |
-| Encryption at rest | SSE with KMS (KES) | SSE with KMS (Vault, AWS KMS) | SSE-C (client-supplied keys) only | dedup-preserving encryption with your own key, online rotation |
-| Tiering | lifecycle transition to remote tiers | lifecycle transition to remote S3 | none | chunk-level cold tier on any S3 bucket, access-based demotion and promotion |
-| Disk I/O | standard syscalls | standard syscalls | standard syscalls | io_uring (optional `O_DIRECT`) |
-| Web console | object browser only (admin screens removed in 2025) | included | none (CLI and admin API) | built into the binary |
+| Encryption at rest | SSE with a KMS through KES | SSE with a KMS (Vault, AWS KMS) | SSE-C (client-supplied keys) only | dedup-preserving encryption with your own key file, online rotation |
+| Tiering | lifecycle transition to remote tiers (cloud or another MinIO) | lifecycle transition to remote S3 | none | chunk-level cold tier on any S3 bucket, access-based demotion and promotion |
+| Disk I/O | `O_DIRECT` writes in multi-drive setups, on drives that support it | standard reads and writes; opt-in io_uring reads and `O_DIRECT` reads | standard reads and writes | io_uring for reads and writes; opt-in `O_DIRECT` |
+| Web console | object browser; admin screens removed in 2025 | included | none in the project (CLI and admin API) | built into the binary |
 
 **Where they are ahead of Kosha**
 
-- **Maturity.** MinIO has run at large scale in production for years, and
-  Garage since 2020. Kosha is new.
+- **Maturity.** MinIO has been widely deployed for years, and Garage has run
+  in production at Deuxfleurs since 2020. Kosha has no production history.
 - **Metadata scale.** Every Kosha metadata write goes through one Raft
-  leader, about 1,400 small writes per second on the shared 4-core test VM.
-  MinIO and RustFS have no central metadata database, and Garage has no
-  leader, so all three spread metadata work further.
-- **Raw throughput on unique data.** MinIO's erasure-coding path is heavily
-  optimized, while Kosha hashes and compresses every chunk. On unique,
-  incompressible data MinIO is probably faster. Kosha gains when data repeats.
+  leader: 1,180–1,430 4 KiB PUTs per second in our 3-node benchmarks on a
+  shared 4-core VM. MinIO and RustFS keep metadata with each object instead
+  of in a central database, and Garage has no leader, so none of them
+  funnels metadata through one node.
+- **Raw throughput on unique data.** MinIO erasure codes with the
+  `klauspost/reedsolomon` library and writes large files with `O_DIRECT`, while Kosha
+  also hashes and probes every chunk for compression. We have not measured
+  it, but on unique, incompressible data MinIO is likely faster. Kosha gains
+  when data repeats.
 - **Enterprise features.** RustFS has KMS integration (Vault, AWS KMS),
   OIDC single sign-on, site and bucket replication, S3 Select, bucket quotas,
-  audit logging, Swift, WebDAV, FTPS and SFTP access, and S3 Tables with an
-  Iceberg catalog (preview). Kosha has none of these.
-- **Spread-out clusters.** Garage is designed for small clusters spread over
-  several sites, has no single leader, and serves static websites. Garage
-  does lack versioning, Object Lock, bucket policies and notifications,
-  which Kosha has.
+  audit logging, Swift, WebDAV and FTPS access, opt-in SFTP, and S3 Tables
+  with an Iceberg catalog (preview). Kosha has none of these.
+- **Spread-out clusters.** Garage is designed for clusters spread over
+  several sites, has no leader, and serves static websites. It lacks
+  versioning, Object Lock, bucket policies and notifications, which Kosha
+  has.
 
 **Which one to pick**
 
 - **Kosha:** data that repeats (backups, VM images, datasets, build
-  artifacts, versioned documents). Also when you need strict consistency and
-  safe conditional writes, or encryption at rest that keeps deduplication.
-- **RustFS:** a maintained MinIO-style replacement with an enterprise
-  feature set.
+  artifacts, versioned documents). Also when you need linearizable
+  consistency, or encryption at rest that keeps deduplication.
+- **RustFS:** a maintained MinIO-style server with an enterprise feature set.
 - **Garage:** a small, low-maintenance cluster spread over homes or sites.
-- **MinIO:** existing deployments. The community edition no longer receives
-  updates, so a new installation means building and patching it yourself.
+- **MinIO:** existing deployments. The community edition is marked
+  unmaintained and ships as source only, so you build and patch it yourself.
 
 Sources (checked October 2026):
-[MinIO README](https://github.com/minio/minio#readme),
-[MinIO CE in 2026](https://glukhov.org/data-infrastructure/object-storage/minio-dead/),
-[RustFS README](https://github.com/rustfs/rustfs#readme),
-[RustFS 1.0 GA](https://linuxiac.com/rustfs-1-0-s3-compatible-object-storage-reaches-ga/),
-[Garage S3 compatibility](https://garagehq.deuxfleurs.fr/documentation/reference-manual/s3-compatibility/),
-[Garage features](https://garagehq.deuxfleurs.fr/documentation/reference-manual/features/),
-[Garage internals](https://garagehq.deuxfleurs.fr/documentation/design/internals/).
+MinIO [README](https://github.com/minio/minio#readme),
+[consistency](https://github.com/minio/minio/blob/master/docs/distributed/README.md),
+[compression](https://github.com/minio/minio/blob/master/docs/compression/README.md),
+[lifecycle transition](https://github.com/minio/minio/blob/master/docs/bucket/lifecycle/README.md),
+[KMS](https://github.com/minio/minio/blob/master/docs/kms/README.md),
+[CopyObject](https://github.com/minio/minio/blob/master/cmd/object-handlers.go),
+[console change](https://blocksandfiles.com/2025/06/19/minio-removes-management-features-from-basic-community-edition-object-storage-code/);
+RustFS [README](https://github.com/rustfs/rustfs#readme),
+[disk I/O](https://github.com/rustfs/rustfs/blob/main/crates/ecstore/src/disk/local.rs),
+[CopyObject](https://github.com/rustfs/rustfs/blob/main/rustfs/src/app/object/copy.rs);
+Garage [S3 compatibility](https://garagehq.deuxfleurs.fr/documentation/reference-manual/s3-compatibility/),
+[features](https://garagehq.deuxfleurs.fr/documentation/reference-manual/features/),
+[consistency_mode](https://garagehq.deuxfleurs.fr/documentation/reference-manual/configuration/#consistency_mode),
+[CopyObject](https://github.com/deuxfleurs-org/garage/blob/main-v2/src/api/s3/copy.rs).
 
 **Contents:**
 [Kosha vs S3](#kosha-vs-amazon-s3) ·
