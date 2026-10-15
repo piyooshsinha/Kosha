@@ -76,7 +76,17 @@ impl Client {
                 builder = builder.tls_backend_preconfigured(cfg);
                 "https"
             }
-            None => "http",
+            None => {
+                // Plain HTTP never verifies certificates. Without this,
+                // reqwest loads the platform's roots anyway and fails to
+                // build (panicking at startup) on hosts without readable
+                // CA certificates.
+                let cfg = rustls::ClientConfig::builder()
+                    .with_root_certificates(rustls::RootCertStore::empty())
+                    .with_no_client_auth();
+                builder = builder.tls_backend_preconfigured(cfg);
+                "http"
+            }
         };
         let http = builder.build().expect("http client");
         Client {

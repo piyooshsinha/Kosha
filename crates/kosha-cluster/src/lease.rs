@@ -20,11 +20,19 @@
 //!
 //! When the lease has expired, one caller renews it (single-flight) while the
 //! others wait and then reuse it.
+//!
+//! **Restarted leaders.** openraft restores a node that was leader when it
+//! stopped as leader again, in the *same* term, without a new no-op entry.
+//! Its commit index is then only what it had persisted, and a follower may
+//! already have applied later entries (found by the power-cut test). So the
+//! check "the commit index belongs to my term" proves nothing for it.
+//! Before serving its first read, a leader therefore commits an empty entry
+//! of its own; once that commits, the commit index is the cluster's.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use openraft::error::{CheckIsLeaderError, RaftError};
+use openraft::error::{CheckIsLeaderError, ClientWriteError, RaftError};
 use parking_lot::Mutex;
 use tokio::time::Instant;
 
@@ -44,6 +52,9 @@ pub(crate) struct ReadLease {
     renew: tokio::sync::Mutex<()>,
     pub lease_reads: AtomicU64,
     pub quorum_reads: AtomicU64,
+    /// Set once an entry proposed by this process has committed.
+    established: std::sync::atomic::AtomicBool,
+    establishing: tokio::sync::Mutex<()>,
 }
 
 pub(crate) type ReadIndexError = RaftError<NodeId, CheckIsLeaderError<NodeId, KoshaNode>>;
@@ -57,6 +68,8 @@ impl ReadLease {
             renew: tokio::sync::Mutex::new(()),
             lease_reads: AtomicU64::new(0),
             quorum_reads: AtomicU64::new(0),
+            established: std::sync::atomic::AtomicBool::new(false),
+            establishing: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -95,6 +108,7 @@ impl Inner {
     /// Leader-side read index: the log index a read must observe.
     /// `ForwardToLeader` if this node is not the leader.
     pub(crate) async fn leader_read_index(&self) -> Result<Option<u64>, ReadIndexError> {
+        self.establish().await?;
         if self.lease.enabled {
             if let Some(idx) = self.lease_index().await {
                 self.lease.lease_reads.fetch_add(1, Ordering::Relaxed);
@@ -120,5 +134,34 @@ impl Inner {
         let read = self.raft.ensure_linearizable().await?;
         self.lease.quorum_reads.fetch_add(1, Ordering::Relaxed);
         Ok(read.map(|l| l.index))
+    }
+
+    /// Commit an empty entry of our own before the first read (see the
+    /// module docs). Followers get `ForwardToLeader`, as for reads.
+    async fn establish(&self) -> Result<(), ReadIndexError> {
+        if self.lease.established.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let _one = self.lease.establishing.lock().await;
+        if self.lease.established.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        match self.raft.client_write(CommandBatch(Vec::new())).await {
+            Ok(_) => {
+                self.lease.established.store(true, Ordering::Release);
+                Ok(())
+            }
+            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) => {
+                Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(f)))
+            }
+            // Not expected for an empty entry; callers retry as if there
+            // were no leader yet.
+            Err(RaftError::APIError(ClientWriteError::ChangeMembershipError(_))) => {
+                Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(
+                    openraft::error::ForwardToLeader::empty(),
+                )))
+            }
+            Err(RaftError::Fatal(f)) => Err(RaftError::Fatal(f)),
+        }
     }
 }

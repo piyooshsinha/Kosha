@@ -1,0 +1,11 @@
+[package]
+name = "kosha-faultfs"
+description = "A FUSE filesystem that loses unsynced writes on a simulated power cut (test tool)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+fuser = { version = "0.18.0", default-features = false }
+libc = "0.2.190"

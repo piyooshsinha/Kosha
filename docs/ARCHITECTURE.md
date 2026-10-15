@@ -158,10 +158,21 @@ waiting for a quorum, on *every* call. Kosha keeps a lease instead
   accepted a heartbeat sent after `t0`, and openraft voters refuse to vote for
   `election_timeout_max` after hearing from a leader. So no other leader can
   exist before `t0 + election_timeout_max`.
-- Reads are served from the lease until `t0 + 0.8 × election_timeout_min`,
-  a margin for clock-rate drift between nodes. Each lease read requires that
-  this node is still the committed leader *in the lease's term*, and that the
-  commit index belongs to that term (the leader has committed its own no-op).
+- Reads are served from the lease until `t0 + 0.8 × election_timeout_min`.
+  With the default timeouts (1–2 s) this is safe while the leader's clock
+  runs at least 0.4× as fast as its followers' (0.8 s of leader time against
+  2 s of voter time). The partition test measured this with libfaketime: no
+  stale reads at 0.5× or 0.25×, stale reads at 0.1×, none at 0.1× with
+  `--no-lease-reads`. Each lease read requires that this node is still the
+  committed leader *in the lease's term*, and that the commit index belongs
+  to that term.
+- **Restarted leaders.** openraft restores a node that was leader when it
+  stopped as leader again, in the same term and without a new entry, so its
+  commit index can lag what followers have applied. Before its first read,
+  a leader commits an empty entry of its own (`establish` in `lease.rs`);
+  only then is its commit index the cluster's. The power-cut test found the
+  case this prevents (a read on the leader going back in time after a
+  whole-cluster power cut).
 - An expired lease is renewed single-flight: one caller does the quorum check
   while concurrent readers wait and reuse the result.
 
@@ -231,6 +242,13 @@ before the metadata that references the chunk commits. `--sync` picks how:
 Earlier versions fsynced the file but not the directory, so a rename could
 be lost on power failure while metadata already referenced the chunk. Both
 `group` and `file` close that gap.
+
+New directories need the same care. With `--sync file`, every directory
+Kosha creates (`chunks/ab/`, `chunks/ab/cd/`, the data directory) is made
+durable by fsyncing its parent after the `mkdir`, and the data directory is
+fsynced after the metadata database is created. The Raft snapshot is
+written to a temp file, fsynced, renamed into place, and its directory
+fsynced. The power-cut test (`kosha-faultfs`) found both gaps.
 
 ## Garbage collection
 
@@ -559,17 +577,18 @@ O(entries returned) rather than O(keys under the prefix).
 
 ## Known limitations
 
-- **Power loss is not tested.** `crashtest` (see the README) kills the
-  process under load and checks every acknowledged write, but the kernel
-  survives a `SIGKILL`, so unsynced data still reaches the disk. The
-  rules in *Chunk durability* are what protect data across a power cut,
-  and they have no fault-injection test yet (it needs a block layer that
-  can drop unsynced writes, such as dm-log-writes).
+- **Power cuts are tested only with `--sync file`.** `kosha-faultfs` (see
+  *Fault testing* in the README) drops unsynced data and undoes undurable
+  directory changes, but the kernel does not pass `syncfs` to FUSE, so the
+  default `--sync group` is not covered. Its guarantee rests on `syncfs`
+  flushing the whole filesystem, data and directories.
 - **Repair scans all chunk metadata every pass.** This is O(chunks) per
   node per interval. That is fine up to millions of chunks; beyond that it
   needs an incremental, membership-change-driven scan.
-- **Lease reads assume bounded clock-rate drift** between nodes (the 20%
-  margin). Turn them off with `--no-lease-reads` where that does not hold.
+- **Lease reads assume bounded clock-rate drift** between nodes: the leader's
+  clock must run at least 0.4× as fast as its followers' with the default
+  timeouts, and a process pause on the leader counts as a slow clock. Turn
+  leases off with `--no-lease-reads` where that does not hold.
 - **Snapshots are built in memory** and sent whole. This is fine for
   millions of objects. Very large namespaces need streaming snapshots.
 - **Internal traffic is encrypted only with `--cluster-tls-*`.** Without it,

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/kosha-cluster","crates/kosha-engine", "crates/kosha-s3", "crates/kosha-server"]
+members = ["crates/kosha-cluster", "crates/kosha-engine", "crates/kosha-faultfs", "crates/kosha-s3", "crates/kosha-server"]
 
 [workspace.package]
 version = "0.1.0"

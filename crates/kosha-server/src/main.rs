@@ -226,6 +226,14 @@ struct Args {
     #[arg(long, env = "KOSHA_REPAIR_INTERVAL_SECS", default_value_t = 60)]
     repair_interval_secs: u64,
 
+    /// Cluster: take a Raft snapshot after this many log entries.
+    #[arg(long, env = "KOSHA_SNAPSHOT_EVERY", default_value_t = 10_000)]
+    snapshot_every: u64,
+
+    /// Cluster: log entries kept behind a snapshot (for slow followers).
+    #[arg(long, env = "KOSHA_RAFT_LOGS_TO_KEEP", default_value_t = 1_000)]
+    raft_logs_to_keep: u64,
+
     /// Seconds between lifecycle passes (expiration, noncurrent versions,
     /// abandoned uploads). 0 disables lifecycle processing.
     #[arg(long, env = "KOSHA_LIFECYCLE_INTERVAL_SECS", default_value_t = 3600)]
@@ -402,6 +410,8 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(anyhow::Error::msg)?;
             ccfg.erasure_min_len = args.erasure_min_chunk;
             ccfg.erasure_cold_only = args.erasure_cold_only;
+            ccfg.snapshot_every = args.snapshot_every.max(1);
+            ccfg.logs_to_keep = args.raft_logs_to_keep;
             ccfg.tls = args.cluster_tls_cert.clone().map(|cert| TlsFiles {
                 cert,
                 key: args.cluster_tls_key.clone().expect("required by clap"),

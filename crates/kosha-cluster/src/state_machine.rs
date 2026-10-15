@@ -54,9 +54,23 @@ impl StateMachine {
     }
 
     fn save_snapshot(&self, snap: &StoredSnapshot) -> Result<(), StorageError> {
+        // The Raft log may be purged up to this snapshot, so it must reach
+        // the disk before that: fsync the file, rename, fsync the directory.
         let tmp = self.snapshot_path.with_extension("tmp");
-        std::fs::write(&tmp, rmp_serde::to_vec(snap).map_err(storage_err)?).map_err(storage_err)?;
-        std::fs::rename(&tmp, &self.snapshot_path).map_err(storage_err)?;
+        let bytes = rmp_serde::to_vec(snap).map_err(storage_err)?;
+        let write = || -> std::io::Result<()> {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, &self.snapshot_path)?;
+            let dir = self
+                .snapshot_path
+                .parent()
+                .unwrap_or(std::path::Path::new("."));
+            kosha_engine::sync_dir(dir.to_path_buf())
+        };
+        write().map_err(storage_err)?;
         *self.snapshot.lock() = Some(snap.clone());
         Ok(())
     }

@@ -199,7 +199,7 @@ fn expect_object(out: CommandOutput) -> Result<ObjectMeta> {
 
 impl Engine {
     pub fn open(mut cfg: EngineConfig) -> Result<Engine> {
-        std::fs::create_dir_all(&cfg.data_dir)?;
+        crate::durability::create_dir_all_durable(&cfg.data_dir)?;
         if cfg.encryption.is_some() {
             // Inline data would sit unencrypted in the metadata.
             cfg.inline_max = 0;
@@ -216,6 +216,8 @@ impl Engine {
             },
         )?;
         let meta = Arc::new(MetaStore::open(&cfg.data_dir.join("meta.redb"))?);
+        // Make the names of the files and directories just created durable.
+        crate::durability::sync_dir(cfg.data_dir.clone())?;
         let store = Arc::new(store);
         let committer = GroupCommitter::start(meta.clone(), store.clone())?;
         Ok(Engine {

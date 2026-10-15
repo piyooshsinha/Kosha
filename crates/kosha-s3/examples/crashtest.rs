@@ -17,12 +17,25 @@
 //! - an operation that failed or was cut off may be visible or not, but
 //!   never partially (the body must match one of the two states exactly);
 //! - listings must agree with the keys that exist;
-//! - the state must not change afterwards.
+//! - on a second check, only failed writes may still appear (Raft can
+//!   commit a cut-off entry after a restart); they are counted, and an
+//!   acknowledged write must never be undone by one.
 //!
 //! Extra arguments after `--` are passed to every Kosha process, e.g.
 //! `-- --sync file` or `-- --erasure 2+1`. With `--chaos` (cluster only),
 //! some rounds kill two of the three nodes (losing the majority) and some
-//! kill a node again while it is recovering. `--sabotage` deletes a random
+//! kill a node again while it is recovering.
+//!
+//! `--faultfs <kosha-faultfs binary>` puts every node's data directory on
+//! a `kosha-faultfs` mount and turns each crash into a **power cut**: data
+//! the node did not fsync is lost and undurable directory changes are
+//! undone (`--fs-model posix|journal` picks the rules). Use it with
+//! `-- --sync file`: the kernel does not pass `syncfs` (used by the default
+//! `--sync group`) to FUSE filesystems. `--power-all` cuts power to every
+//! node at once. The setup (bucket creation) is made durable before the
+//! first round unless `--no-settle` is given.
+//!
+//! `--sabotage` deletes a random
 //! chunk file after every crash, to check that the test catches damage.
 
 use std::collections::BTreeSet;
@@ -53,6 +66,11 @@ struct Args {
     seed: u64,
     sabotage: bool,
     chaos: bool,
+    faultfs: Option<PathBuf>,
+    fs_model: String,
+    power_all: bool,
+    settle: bool,
+    stop_on_error: bool,
     extra: Vec<String>,
 }
 
@@ -70,6 +88,11 @@ fn args() -> Args {
             .as_nanos() as u64,
         sabotage: false,
         chaos: false,
+        faultfs: None,
+        fs_model: "posix".into(),
+        power_all: false,
+        settle: true,
+        stop_on_error: false,
         extra: vec![],
     };
     let mut it = std::env::args().skip(1);
@@ -81,6 +104,11 @@ fn args() -> Args {
             "--cluster" => a.cluster = true,
             "--sabotage" => a.sabotage = true,
             "--chaos" => a.chaos = true,
+            "--faultfs" => a.faultfs = Some(val().into()),
+            "--fs-model" => a.fs_model = val(),
+            "--power-all" => a.power_all = true,
+            "--no-settle" => a.settle = false,
+            "--stop-on-error" => a.stop_on_error = true,
             "--rounds" => a.rounds = val().parse().expect("rounds"),
             "--writers" => a.writers = val().parse().expect("writers"),
             "--keys" => a.keys = val().parse().expect("keys"),
@@ -88,6 +116,9 @@ fn args() -> Args {
             "--" => a.extra = it.by_ref().collect(),
             other => panic!("unknown flag {other}"),
         }
+    }
+    if a.dir.is_relative() {
+        a.dir = std::env::current_dir().unwrap().join(&a.dir);
     }
     a
 }
@@ -162,6 +193,13 @@ struct Key {
     /// An operation that failed or was cut off: it may or may not have
     /// been applied. The key is not touched again until it is resolved.
     pending: Option<State>,
+    /// Failed writes that were not visible when checked but may still be
+    /// applied later: Raft can commit a cut-off entry after a restart (a
+    /// leader that restarts keeps its term and its log). They can no longer
+    /// appear once a later write to the key is acknowledged.
+    maybe: Vec<State>,
+    /// Every value written to the key (seed, acknowledged), for reports.
+    past: Vec<(u64, bool)>,
 }
 
 struct Worker {
@@ -197,6 +235,8 @@ struct Node {
     id: u64,
     s3: u16,
     child: Option<Child>,
+    /// The node's kosha-faultfs mount, with `--faultfs`.
+    fs: Option<Child>,
 }
 
 struct Cluster {
@@ -213,6 +253,7 @@ impl Cluster {
                 id,
                 s3: 9400 + id as u16,
                 child: None,
+                fs: None,
             })
             .collect();
         Cluster {
@@ -227,6 +268,36 @@ impl Cluster {
         let node = &mut self.nodes[i];
         let data = a.dir.join(format!("node{}", node.id));
         std::fs::create_dir_all(&data).unwrap();
+        if let Some(bin) = &a.faultfs
+            && node.fs.is_none()
+        {
+            let disk = a.dir.join(format!("node{}.disk", node.id));
+            std::fs::create_dir_all(&disk).unwrap();
+            let log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(a.dir.join(format!("node{}.fs.log", node.id)))
+                .unwrap();
+            let fs = Command::new(bin)
+                .arg(&disk)
+                .arg(&data)
+                .arg("--model")
+                .arg(&a.fs_model)
+                .stdout(Stdio::from(log.try_clone().unwrap()))
+                .stderr(Stdio::from(log))
+                .spawn()
+                .expect("start kosha-faultfs");
+            node.fs = Some(fs);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !mounted(&data) {
+                assert!(
+                    Instant::now() < deadline,
+                    "faultfs did not mount {}",
+                    data.display()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -260,11 +331,44 @@ impl Cluster {
         self.starts += 1;
     }
 
+    /// Crash a node: SIGKILL it and, with `--faultfs`, cut its power.
     fn kill(&mut self, i: usize) {
         if let Some(mut c) = self.nodes[i].child.take() {
             let _ = c.kill(); // SIGKILL
             let _ = c.wait();
         }
+        if let Some(mut fs) = self.nodes[i].fs.take() {
+            signal(&fs, libc::SIGUSR1);
+            let _ = fs.wait();
+            let data = self.a.dir.join(format!("node{}", self.nodes[i].id));
+            while mounted(&data) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    /// Make everything on every node's disk durable (like time passing).
+    fn settle(&self) {
+        for n in &self.nodes {
+            if let Some(fs) = &n.fs {
+                signal(fs, libc::SIGUSR2);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    /// The last power-cut report of a node's faultfs.
+    fn power_report(&self, i: usize) -> Option<String> {
+        let log =
+            std::fs::read_to_string(self.a.dir.join(format!("node{}.fs.log", self.nodes[i].id)))
+                .ok()?;
+        log.lines()
+            .rev()
+            .find(|l| l.contains("power cut:"))
+            .map(|l| {
+                l.trim_start_matches("kosha-faultfs: power cut: ")
+                    .to_string()
+            })
     }
 
     fn ports(&self) -> Vec<u16> {
@@ -273,12 +377,32 @@ impl Cluster {
 }
 
 impl Drop for Cluster {
-    /// Never leave servers behind, even when the test panics.
+    /// Never leave servers (or mounts) behind, even when the test panics.
     fn drop(&mut self) {
-        for i in 0..self.nodes.len() {
-            self.kill(i);
+        for n in &mut self.nodes {
+            if let Some(mut c) = n.child.take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+            if let Some(mut fs) = n.fs.take() {
+                signal(&fs, libc::SIGTERM);
+                let _ = fs.wait();
+            }
         }
     }
+}
+
+fn signal(c: &Child, sig: i32) {
+    unsafe { libc::kill(c.id() as i32, sig) };
+}
+
+fn mounted(path: &std::path::Path) -> bool {
+    std::fs::read_to_string("/proc/mounts")
+        .map(|m| {
+            m.lines()
+                .any(|l| l.split(' ').nth(1) == Some(path.to_str().unwrap_or("")))
+        })
+        .unwrap_or(false)
 }
 
 /// Waits until every node answers S3 requests that need the cluster
@@ -439,9 +563,13 @@ async fn run_worker(
             }
             (State::Present(seed), put(c, &name, seed).await)
         };
+        if let State::Present(seed) = next {
+            w.keys[k].past.push((seed, result.is_ok()));
+        }
         match result {
             Ok(()) => {
                 w.keys[k].acked = next;
+                w.keys[k].maybe.clear();
                 w.acked += 1;
             }
             Err(e) => {
@@ -459,13 +587,17 @@ async fn run_worker(
 }
 
 /// Checks every key on every node; resolves pending operations.
-async fn verify(workers: &mut [Worker], ports: &[u16], round: usize) -> Vec<String> {
+/// Checks every key on every node; resolves pending operations. Returns the
+/// violations and how many earlier failed writes turned up late.
+async fn verify(workers: &mut [Worker], ports: &[u16], round: usize) -> (Vec<String>, usize) {
     let clients: Vec<Client> = ports.iter().map(|&p| client(p)).collect();
     let mut errors = vec![];
+    let mut late = 0;
     for w in workers.iter_mut() {
         for key in w.keys.iter_mut() {
             let mut candidates = vec![key.acked];
             candidates.extend(key.pending);
+            candidates.extend(key.maybe.iter().copied());
             let mut seen = None;
             for (n, c) in clients.iter().enumerate() {
                 let got = match read(c, &key.name).await {
@@ -487,12 +619,30 @@ async fn verify(workers: &mut [Worker], ports: &[u16], round: usize) -> Vec<Stri
                         candidates,
                         match &got {
                             None => "no object".to_string(),
-                            Some(b) => format!("{} unexpected bytes", b.len()),
+                            Some(b) =>
+                                match key.past.iter().rposition(|(seed, _)| *b == body(*seed)) {
+                                    Some(i) => format!(
+                                        "an older value: write {} of {} to this key ({})",
+                                        i + 1,
+                                        key.past.len(),
+                                        if key.past[i].1 {
+                                            "acknowledged"
+                                        } else {
+                                            "not acknowledged"
+                                        }
+                                    ),
+                                    None => format!("{} unexpected bytes", b.len()),
+                                },
                         }
                     )),
                     Some(s) => {
+                        // Nodes are read one after another, so a failed
+                        // write landing late may show up part-way through
+                        // (old value first, then the new one, never back).
+                        let landed = |v: State| key.pending == Some(v) || key.maybe.contains(&v);
                         if let Some(prev) = seen
                             && prev != s
+                            && !(prev == key.acked && landed(s))
                         {
                             errors.push(format!(
                                 "round {round}: {}: nodes disagree ({prev:?} vs {s:?})",
@@ -504,8 +654,16 @@ async fn verify(workers: &mut [Worker], ports: &[u16], round: usize) -> Vec<Stri
                 }
             }
             if let Some(s) = seen {
+                if s != key.acked && key.pending != Some(s) && key.maybe.contains(&s) {
+                    late += 1;
+                    key.maybe.clear();
+                }
+                if let Some(p) = key.pending.take()
+                    && p != s
+                {
+                    key.maybe.push(p);
+                }
                 key.acked = s;
-                key.pending = None;
             }
         }
         // Listing must show exactly the keys that exist.
@@ -555,7 +713,43 @@ async fn verify(workers: &mut [Worker], ports: &[u16], round: usize) -> Vec<Stri
             }
         }
     }
-    errors
+    (errors, late)
+}
+
+/// Print each node's Raft state (debugging aid, `CRASHTEST_DEBUG=1`).
+fn raft_state(ports: &[u16], when: &str) {
+    for &p in ports {
+        let out = Command::new("curl")
+            .args([
+                "-s",
+                "--aws-sigv4",
+                "aws:amz:us-east-1:s3",
+                "--user",
+                &format!("{AK}:{SK}"),
+            ])
+            .arg(format!("http://127.0.0.1:{p}/_kosha/cluster"))
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let pick = |k: &str| {
+            out.find(&format!("\"{k}\":"))
+                .map(|i| {
+                    out[i..]
+                        .chars()
+                        .take_while(|&c| c != ',' && c != '}')
+                        .collect::<String>()
+                })
+                .unwrap_or_default()
+        };
+        println!(
+            "  [{when}] :{p} {} {} {} {} {}",
+            pick("role"),
+            pick("term"),
+            pick("leader"),
+            pick("last_log_index"),
+            pick("last_applied")
+        );
+    }
 }
 
 /// The interesting part of an SDK error.
@@ -621,6 +815,9 @@ async fn main() {
         .send()
         .await
         .expect("create bucket");
+    if a.settle {
+        cluster.settle();
+    }
 
     let mut rng = Rng::new(a.seed);
     let seq = Arc::new(AtomicU64::new(1));
@@ -633,6 +830,8 @@ async fn main() {
                     name: format!("w{id:02}/k{k:03}"),
                     acked: State::Absent,
                     pending: None,
+                    maybe: vec![],
+                    past: vec![],
                 })
                 .collect(),
             acked: 0,
@@ -641,6 +840,7 @@ async fn main() {
         })
         .collect();
     let mut all_errors = vec![];
+    let mut late_total = 0;
     let started = Instant::now();
     for round in 1..=a.rounds {
         let stop = Arc::new(AtomicBool::new(false));
@@ -656,6 +856,9 @@ async fn main() {
         // Chaos: a third of the rounds lose the majority.
         if a.chaos && n > 1 && rng.below(3) == 0 {
             victims.push((first + 1 + rng.below(n as u64 - 1) as usize) % n);
+        }
+        if a.power_all {
+            victims = (0..n).collect();
         }
         for (i, &v) in victims.iter().enumerate() {
             if i > 0 {
@@ -698,25 +901,22 @@ async fn main() {
         wait_ready(&ports).await;
         let recovered = restart.elapsed();
         let victim_ids: Vec<u64> = victims.iter().map(|&v| cluster.nodes[v].id).collect();
-        let mut errors = verify(&mut workers, &ports, round).await;
-        // Nothing may change once verified (a cut-off request must not
-        // land later).
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        let snapshot: Vec<Vec<State>> = workers
-            .iter()
-            .map(|w| w.keys.iter().map(|k| k.acked).collect())
-            .collect();
-        errors.extend(verify(&mut workers, &ports, round).await);
-        for (w, snap) in workers.iter().zip(&snapshot) {
-            for (k, s) in w.keys.iter().zip(snap) {
-                if k.acked != *s {
-                    errors.push(format!(
-                        "round {round}: {} changed after verification: {s:?} -> {:?}",
-                        k.name, k.acked
-                    ));
-                }
-            }
+        let (mut errors, mut late) = verify(&mut workers, &ports, round).await;
+        let debug = std::env::var_os("CRASHTEST_DEBUG").is_some();
+        if debug {
+            raft_state(&ports, "after first check");
         }
+        // Check again: only failed writes may still change what is seen.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        if debug {
+            raft_state(&ports, "before second check");
+        }
+        // The second check accepts only the same values, or failed writes
+        // landing late; an acknowledged write never disappears.
+        let (e2, l2) = verify(&mut workers, &ports, round).await;
+        errors.extend(e2);
+        late += l2;
+        late_total += late;
         let acked: u64 = workers.iter().map(|w| w.acked).sum();
         let failed: u64 = workers.iter().map(|w| w.failed).sum();
         let present = workers
@@ -725,7 +925,7 @@ async fn main() {
             .filter(|k| k.acked != State::Absent)
             .count();
         println!(
-            "round {round:>3}: killed node {}{}; in-flight requests ended in {:.1} s, all nodes ready {:.1} s after restart; totals: {acked} acknowledged ops, {failed} failed or cut off; {present} objects; {} errors",
+            "round {round:>3}: killed node {}{}; in-flight requests ended in {:.1} s, all nodes ready {:.1} s after restart; totals: {acked} acknowledged ops, {failed} failed or cut off; {present} objects; {late} failed writes landed late; {} errors",
             victim_ids
                 .iter()
                 .map(|i| i.to_string())
@@ -738,6 +938,13 @@ async fn main() {
             recovered.as_secs_f64(),
             errors.len()
         );
+        if a.faultfs.is_some() {
+            for &v in &victims {
+                if let Some(r) = cluster.power_report(v) {
+                    println!("  node {} power cut: {r}", cluster.nodes[v].id);
+                }
+            }
+        }
         for e in errors.iter().take(10) {
             println!("  {e}");
         }
@@ -754,14 +961,22 @@ async fn main() {
         } else {
             workers.iter_mut().for_each(|w| w.samples.clear());
         }
+        let failed_round = !errors.is_empty();
         all_errors.extend(errors);
+        if failed_round && a.stop_on_error {
+            println!(
+                "stopping at the first failed round; data kept in {}",
+                a.dir.display()
+            );
+            break;
+        }
     }
     for i in 0..cluster.nodes.len() {
         cluster.kill(i);
     }
     let acked: u64 = workers.iter().map(|w| w.acked).sum();
     println!(
-        "done in {:.0} s: {} crashes, {acked} acknowledged operations, {} errors",
+        "done in {:.0} s: {} crashes, {acked} acknowledged operations, {late_total} failed writes landed late, {} errors",
         started.elapsed().as_secs_f64(),
         a.rounds,
         all_errors.len()

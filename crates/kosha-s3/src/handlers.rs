@@ -2160,10 +2160,13 @@ async fn get_object(ctx: &Ctx, bucket: &str, key: &str) -> S3Result<Response> {
     if ctx.method == Method::HEAD {
         return Ok(b.body(Body::empty()).unwrap());
     }
-    let stream = ctx
-        .engine()
-        .read(&meta, start, end)
-        .map_err(|e| std::io::Error::other(e.to_string()));
+    // The status line is already sent when a chunk fails mid-stream, so
+    // the client only sees a cut-off body: log the cause here.
+    let (bucket, key) = (bucket.to_string(), key.to_string());
+    let stream = ctx.engine().read(&meta, start, end).map_err(move |e| {
+        tracing::warn!(%bucket, %key, error = %e, "object read failed mid-stream");
+        std::io::Error::other(e.to_string())
+    });
     Ok(b.body(Body::from_stream(stream)).unwrap())
 }
 

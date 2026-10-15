@@ -35,7 +35,7 @@ mod writer;
 pub use chunker::ChunkerConfig;
 pub use chunkstore::{ChunkStore, StoredChunk};
 pub use crypt::{ChunkKeys, KeyTag, read_key_file};
-pub use durability::SyncMode;
+pub use durability::{SyncMode, create_dir_all_durable, sync_dir};
 pub use engine::{
     ChunkPlacement, Consensus, CopySource, Engine, EngineConfig, WriteStats, validate_bucket_name,
 };

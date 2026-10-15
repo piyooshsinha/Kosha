@@ -84,7 +84,7 @@ enum Prepared {
 impl ChunkStore {
     pub fn open(root: &Path, opts: StoreOptions) -> Result<Self> {
         let tmp = root.join("tmp");
-        fs::create_dir_all(&tmp)?;
+        crate::durability::create_dir_all_durable(&tmp)?;
         // Bind the keyring to this directory (its id key and marker).
         let opts = match &opts.keys {
             Some(k) => StoreOptions {
@@ -196,7 +196,7 @@ impl ChunkStore {
             touch(&path);
             return Ok(());
         }
-        fs::create_dir_all(path.parent().expect("chunk path has parent"))?;
+        self.make_dir(path.parent().expect("chunk path has parent"))?;
         let tmp = self.tmp.join(format!(
             "{}.s{index}.{}",
             id.to_hex(),
@@ -340,6 +340,16 @@ impl ChunkStore {
         }
     }
 
+    /// Create a chunk directory, durably unless syncs are off. (Group sync
+    /// covers new directories with its `syncfs`; this costs one extra
+    /// fsync per directory, and there are at most 65,536 of them.)
+    fn make_dir(&self, dir: &Path) -> std::io::Result<()> {
+        match self.opts.sync {
+            SyncMode::None => fs::create_dir_all(dir),
+            _ => crate::durability::create_dir_all_durable(dir),
+        }
+    }
+
     /// CPU-side work: dedup check, compression, directory creation.
     fn prepare(&self, id: ChunkId, data: &[u8]) -> Result<Prepared> {
         let path = self.path_of(&id);
@@ -354,7 +364,7 @@ impl ChunkStore {
             }));
         }
         let buf = self.encode(&id, data)?;
-        fs::create_dir_all(path.parent().expect("chunk path has parent"))?;
+        self.make_dir(path.parent().expect("chunk path has parent"))?;
         Ok(Prepared::Write {
             chunk: StoredChunk {
                 id,
@@ -531,7 +541,7 @@ impl ChunkStore {
             id.to_hex(),
             uuid::Uuid::new_v4().simple()
         ));
-        fs::create_dir_all(path.parent().expect("chunk path has parent"))?;
+        self.make_dir(path.parent().expect("chunk path has parent"))?;
         fs::write(&tmp, &data)?;
         fs::File::open(&tmp)?.sync_all()?;
         fs::rename(&tmp, &path)?;
@@ -572,6 +582,7 @@ impl ChunkStore {
                 continue;
             }
             if self.remove_all(id)? {
+                tracing::debug!(chunk = %id.to_hex(), "deleted local copy (now in the cold tier)");
                 removed += 1;
             }
             drop(pins);
@@ -632,6 +643,7 @@ impl ChunkStore {
                 continue;
             }
             if self.remove_all(id)? {
+                tracing::debug!(chunk = %id.to_hex(), "deleted unreferenced chunk");
                 removed += 1;
             }
             drop(pins);
@@ -647,7 +659,10 @@ impl ChunkStore {
             return Ok(false);
         }
         let r = match fs::remove_file(self.path_of(id)) {
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                tracing::debug!(chunk = %id.to_hex(), "deleted local copy (surplus or now erasure coded)");
+                Ok(true)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e.into()),
         };

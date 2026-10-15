@@ -132,6 +132,36 @@ pub fn sync_dir(dir: PathBuf) -> std::io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
 }
 
+/// `create_dir_all`, but every directory it creates is made durable: its
+/// parent is fsynced after the `mkdir`. Without this, a power cut can lose a
+/// new directory, and every file in it, even after those files and the
+/// directory itself were fsynced.
+pub fn create_dir_all_durable(dir: &std::path::Path) -> std::io::Result<()> {
+    let mut missing = vec![];
+    let mut cur = dir;
+    while std::fs::metadata(cur).is_err() {
+        missing.push(cur);
+        match cur.parent() {
+            Some(p) if !p.as_os_str().is_empty() => cur = p,
+            _ => break,
+        }
+    }
+    for d in missing.into_iter().rev() {
+        match std::fs::create_dir(d) {
+            Ok(()) => {}
+            // Created concurrently: someone else syncs it.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+        let parent = match d.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        sync_dir(parent)?;
+    }
+    Ok(())
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;

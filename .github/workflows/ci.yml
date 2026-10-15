@@ -36,3 +36,10 @@ jobs:
           cargo build --bins --examples
           target/debug/examples/crashtest --kosha target/debug/kosha --rounds 8 --dir "$RUNNER_TEMP/crash1"
           target/debug/examples/crashtest --kosha target/debug/kosha --cluster --chaos --rounds 5 --dir "$RUNNER_TEMP/crash2"
+      - name: Power-cut and network-partition tests (root, FUSE, iptables)
+        run: |
+          sudo target/debug/examples/crashtest --kosha target/debug/kosha \
+            --faultfs target/debug/kosha-faultfs --rounds 5 --dir /tmp/kosha-power -- --sync file
+          # The test nodes run as other users, so the binary must be reachable by them.
+          cp target/debug/kosha /tmp/kosha-bin
+          sudo target/debug/examples/partitiontest --kosha /tmp/kosha-bin --seconds 60 --dir /tmp/kosha-partition

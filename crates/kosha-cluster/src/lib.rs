@@ -163,12 +163,13 @@ impl Cluster {
     /// Start Raft and the internal endpoint, and route the engine's metadata
     /// and chunks through the cluster.
     pub async fn start(engine: Engine, cfg: ClusterConfig) -> Result<Cluster, ClusterError> {
-        std::fs::create_dir_all(&cfg.data_dir)?;
+        kosha_engine::create_dir_all_durable(&cfg.data_dir)?;
         let log = log_store::LogStore::open(&cfg.data_dir.join("raft-log.redb"))?;
         let sm = state_machine::StateMachine::open(
             engine.clone(),
             cfg.data_dir.join("raft-snapshot.bin"),
         )?;
+        kosha_engine::sync_dir(cfg.data_dir.clone())?;
         if cfg.tls.as_ref().is_some_and(|t| t.ca.is_none()) {
             return Err(ClusterError::Join(
                 "cluster TLS needs a CA to verify peers".into(),

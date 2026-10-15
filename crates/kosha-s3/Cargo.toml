@@ -30,6 +30,7 @@ tracing = "0.1.44"
 uuid = { version = "1.28.0", features = ["v4"] }
 
 [dev-dependencies]
+libc = "0.2.190"
 aws-config = "1.12.0"
 aws-sdk-s3 = "1.152.0"
 axum = "0.8"
