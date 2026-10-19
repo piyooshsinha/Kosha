@@ -15,11 +15,12 @@ services:
       KOSHA_SECRET_KEY: ${KOSHA_SECRET_KEY:?set KOSHA_SECRET_KEY in .env}
     volumes:
       - kosha-data:/data
-    # Docker's default seccomp profile blocks io_uring, so Kosha uses its
-    # thread-pool I/O backend. Uncomment to let it use io_uring (see
-    # "io_uring vs thread pool" in the README), at the cost of the
-    # container's syscall filter:
-    # security_opt:
-    #   - seccomp=unconfined
+    # Docker's default seccomp profile blocks io_uring. This is that profile
+    # (moby/profiles) with io_uring_setup, io_uring_enter and
+    # io_uring_register allowed, so Kosha can use its io_uring backend while
+    # every other syscall rule stays in place. Remove these two lines to fall
+    # back to Docker's default profile and the thread-pool backend.
+    security_opt:
+      - seccomp=./docker/seccomp-io_uring.json
 volumes:
   kosha-data:

@@ -248,10 +248,13 @@ changes it). Any `KOSHA_*` setting from `kosha --help` can be added under
 `environment:`. The image runs as an unprivileged user and has a health
 check. Upgrade with `git pull && docker compose up -d --build`.
 
-Docker's default seccomp profile blocks io_uring, so inside a container
-Kosha logs `io_uring unavailable` and uses its thread-pool backend. The
-compose file has a commented `security_opt: [seccomp=unconfined]` that
-lets it use io_uring instead.
+Docker's default seccomp profile blocks io_uring. The compose file therefore
+runs the container with `docker/seccomp-io_uring.json`, which is Docker's
+default profile ([moby/profiles](https://github.com/moby/profiles)) with
+only `io_uring_setup`, `io_uring_enter` and `io_uring_register` added; every
+other rule is unchanged. The log shows `io="io_uring"`. With plain
+`docker run` and no `--security-opt seccomp=docker/seccomp-io_uring.json`,
+Kosha logs `io_uring unavailable` and uses its thread-pool backend instead.
 
 ### As a service (home server, NUC, VM)
 
