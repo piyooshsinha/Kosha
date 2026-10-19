@@ -1,0 +1,25 @@
+# Single-node Kosha. Put the keys in a .env file next to this one:
+#   KOSHA_ACCESS_KEY=admin
+#   KOSHA_SECRET_KEY=<openssl rand -hex 20>
+# then: docker compose up -d --build
+services:
+  kosha:
+    build: .
+    image: kosha:latest
+    container_name: kosha
+    restart: unless-stopped
+    ports:
+      - "${KOSHA_PORT:-9000}:9000"
+    environment:
+      KOSHA_ACCESS_KEY: ${KOSHA_ACCESS_KEY:?set KOSHA_ACCESS_KEY in .env}
+      KOSHA_SECRET_KEY: ${KOSHA_SECRET_KEY:?set KOSHA_SECRET_KEY in .env}
+    volumes:
+      - kosha-data:/data
+    # Docker's default seccomp profile blocks io_uring, so Kosha uses its
+    # thread-pool I/O backend. Uncomment to let it use io_uring (see
+    # "io_uring vs thread pool" in the README), at the cost of the
+    # container's syscall filter:
+    # security_opt:
+    #   - seccomp=unconfined
+volumes:
+  kosha-data:

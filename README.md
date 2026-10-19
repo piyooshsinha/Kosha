@@ -234,6 +234,25 @@ mode. Stop the server with Ctrl-C; it shuts down gracefully.
 For local experiments you can skip authentication with `--anonymous`. Never
 use it on a network you don't control.
 
+### With Docker
+
+```sh
+git clone https://github.com/piyooshsinha/Kosha && cd Kosha
+printf 'KOSHA_ACCESS_KEY=admin\nKOSHA_SECRET_KEY=%s\n' "$(openssl rand -hex 20)" > .env
+docker compose up -d --build
+```
+
+This builds the image (console included), stores data in the `kosha-data`
+volume, and serves S3 and the console on port 9000 (`KOSHA_PORT` in `.env`
+changes it). Any `KOSHA_*` setting from `kosha --help` can be added under
+`environment:`. The image runs as an unprivileged user and has a health
+check. Upgrade with `git pull && docker compose up -d --build`.
+
+Docker's default seccomp profile blocks io_uring, so inside a container
+Kosha logs `io_uring unavailable` and uses its thread-pool backend. The
+compose file has a commented `security_opt: [seccomp=unconfined]` that
+lets it use io_uring instead.
+
 ### As a service (home server, NUC, VM)
 
 On a Linux machine with systemd (Debian, Ubuntu, Fedora or Arch), one script
