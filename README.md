@@ -268,7 +268,10 @@ This starts three nodes on one host: S3 and the console on ports 9000, 9001
 and 9002 (any node serves every request), with internal traffic on a private
 Docker network. Node 1 bootstraps the cluster and nodes 2 and 3 join it; on
 later starts they resume from their volumes. `KOSHA_HOST` is the address the
-console shows for each node. All three share the host's disk and power, so
+console shows for each node. To use other host ports, set `KOSHA_PORT_1`,
+`KOSHA_PORT_2` and `KOSHA_PORT_3` in `.env` (defaults 9000-9002) and run
+`up -d` again: each node updates its advertised address when it restarts.
+All three share the host's disk and power, so
 this tolerates a node process failing, not the machine; for real fault
 tolerance, run the nodes on separate machines (see [Run a cluster](#5-run-a-cluster)).
 Stopping one container (`docker stop kosha1`) shows a leader change and
@@ -1325,7 +1328,7 @@ Short versions of the crash, power-cut and partition tests run in CI on every pu
 | `--node-id` | `KOSHA_NODE_ID` | none | enables cluster mode |
 | `--cluster-listen` | `KOSHA_CLUSTER_LISTEN` | `127.0.0.1:9100` | internal Raft + replication port |
 | `--cluster-advertise` | `KOSHA_CLUSTER_ADVERTISE` | `--cluster-listen` | address peers dial |
-| `--api-advertise` | `KOSHA_API_ADVERTISE` | `--listen` | S3 address shown in the console |
+| `--api-advertise` | `KOSHA_API_ADVERTISE` | `--listen` | S3 address shown in the console; a changed value is sent to the cluster on restart |
 | `--cluster-secret` | `KOSHA_CLUSTER_SECRET` | none | shared secret, at least 16 characters |
 | `--init` / `--join <addr>` | `KOSHA_INIT` / `KOSHA_JOIN` | | bootstrap, or join through any member |
 | `--replication` | `KOSHA_REPLICATION` | `2` | copies of each chunk |

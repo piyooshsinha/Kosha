@@ -337,6 +337,53 @@ impl Cluster {
         Err(ClusterError::Join(last_err))
     }
 
+    /// Bring this node's membership record up to date with its configured
+    /// API address. The record is written when the node joins and a
+    /// restarted node resumes from it, so a changed `--api-advertise` would
+    /// otherwise never reach the other members. No-op if it is unchanged.
+    pub async fn refresh_advertised(&self) -> Result<(), ClusterError> {
+        let me = self.self_node();
+        let mut last = String::from("no leader elected");
+        for attempt in 0..RETRIES {
+            let (recorded, leader) = {
+                let m = self.inner.raft.metrics().borrow().clone();
+                let membership = m.membership_config.membership();
+                let leader = m
+                    .current_leader
+                    .and_then(|id| membership.get_node(&id).cloned());
+                (membership.get_node(&self.node_id()).cloned(), leader)
+            };
+            match recorded {
+                None => return Ok(()),
+                Some(n) if n.api == me.api => return Ok(()),
+                Some(_) => {}
+            }
+            if let Some(leader) = leader {
+                match self
+                    .inner
+                    .client
+                    .call::<_, LeaderReply<Result<(), String>>>(
+                        &leader.addr,
+                        "/cluster/update-node",
+                        &(self.node_id(), &me),
+                        FORWARD_TIMEOUT,
+                    )
+                    .await
+                {
+                    Ok(LeaderReply::Ok(Ok(()))) => {
+                        tracing::info!(api = %me.api, "updated this node's advertised API address");
+                        return Ok(());
+                    }
+                    Ok(LeaderReply::Ok(Err(refused))) => return Err(ClusterError::Join(refused)),
+                    Ok(LeaderReply::NotLeader(_)) => last = "leader changed".into(),
+                    Err(e) => last = e.to_string(),
+                }
+            }
+            tokio::time::sleep(backoff(attempt) * 4).await;
+        }
+        Err(ClusterError::Raft(last))
+    }
+
     /// Remove a node from the voter set (run on any member).
     /// Remove a voter from the cluster. Works from any member (forwarded to
     /// the leader). Its chunks are re-replicated by background repair.

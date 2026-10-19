@@ -12,7 +12,26 @@ struct Node {
 }
 
 async fn start_node(id: u64) -> Node {
-    let dir = tempfile::tempdir().unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    start_node_at(
+        id,
+        tempfile::tempdir().unwrap(),
+        port,
+        format!("127.0.0.1:{}", 9000 + id),
+    )
+    .await
+}
+
+/// Start (or restart, given an existing dir and port) a node.
+async fn start_node_at(
+    id: u64,
+    dir: tempfile::TempDir,
+    port: std::net::SocketAddr,
+    api: String,
+) -> Node {
     let mut cfg = EngineConfig::new(dir.path().join("data"));
     cfg.sync = SyncMode::None;
     cfg.chunking = ChunkerConfig {
@@ -24,13 +43,8 @@ async fn start_node(id: u64) -> Node {
     cfg.gc_grace = Duration::from_secs(600);
     let engine = Engine::open(cfg).unwrap();
 
-    // Reserve a port, then hand it to the cluster listener.
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap();
     let mut ccfg = ClusterConfig::new(id, port, "test-secret", dir.path().join("raft"));
-    ccfg.api_addr = format!("127.0.0.1:{}", 9000 + id);
+    ccfg.api_addr = api;
     ccfg.heartbeat_ms = 50;
     ccfg.election_timeout_ms = (300, 600);
     ccfg.logs_to_keep = 0;
@@ -564,4 +578,65 @@ async fn flows_show_where_a_write_went() {
     for n in &nodes {
         n.cluster.shutdown().await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_with_a_new_api_address_updates_membership() {
+    let mut nodes = three_nodes().await;
+    let old = nodes.remove(1);
+    let port: std::net::SocketAddr = old.addr.parse().unwrap();
+    old.cluster.shutdown().await;
+    // Background tasks keep the stopped node's databases locked, so restart
+    // from a copy of its directory (the same state a process restart sees).
+    let dir = tempfile::tempdir().unwrap();
+    let copied = std::process::Command::new("cp")
+        .arg("-a")
+        .arg(format!("{}/.", old._dir.path().display()))
+        .arg(dir.path())
+        .status()
+        .unwrap();
+    assert!(copied.success());
+
+    let restarted = start_node_at(2, dir, port, "10.0.0.2:7001".into()).await;
+    restarted
+        .cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
+    restarted.cluster.refresh_advertised().await.unwrap();
+
+    let api_of_2 = |n: &Node| {
+        n.cluster
+            .status()
+            .nodes
+            .into_iter()
+            .find(|s| s.id == 2)
+            .map(|s| s.api)
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while api_of_2(&nodes[0]).as_deref() != Some("10.0.0.2:7001") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "membership not updated"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Still a voter, and a second refresh is a no-op.
+    assert!(
+        nodes[0]
+            .cluster
+            .status()
+            .nodes
+            .iter()
+            .any(|s| s.id == 2 && s.voter)
+    );
+    restarted.cluster.refresh_advertised().await.unwrap();
+    nodes[0].engine.create_bucket("after").await.unwrap();
+    put(
+        &restarted.engine,
+        "after",
+        "k",
+        b"written via the restarted node",
+    )
+    .await;
 }

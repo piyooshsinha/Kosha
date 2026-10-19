@@ -4,3 +4,4 @@
 *.redb
 ui/node_modules
 ui/dist
+.env

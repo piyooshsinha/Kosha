@@ -438,6 +438,13 @@ async fn main() -> anyhow::Result<()> {
                 tracing::warn!(
                     "this node is not part of a cluster yet: start one with --init or join one with --join"
                 );
+            } else {
+                let c = cluster.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = c.refresh_advertised().await {
+                        tracing::warn!(error = %e, "could not update this node's advertised API address");
+                    }
+                });
             }
             s3.cluster = Some(Arc::new(Hooks(cluster.clone())));
             Some(cluster)

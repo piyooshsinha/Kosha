@@ -32,6 +32,7 @@ pub fn router(inner: Arc<Inner>) -> Router {
         .route("/cluster/join", post(join))
         .route("/cluster/status", get(cluster_status))
         .route("/cluster/remove", post(remove))
+        .route("/cluster/update-node", post(update_node))
         .route(
             "/cluster/flows",
             post(|State(inner): St, body: Bytes| async move {
@@ -169,6 +170,45 @@ async fn join(State(inner): St, body: Bytes) -> Response {
             tracing::info!(node = req.id, addr = %req.node.addr, "node joined as voter");
             msgpack(&Reply::Ok(Ok(())))
         }
+        Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) => {
+            msgpack(&Reply::NotLeader(f.leader_id.zip(f.leader_node)))
+        }
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
+    }
+}
+
+/// Replace a member's advertised API address. The cluster address is left
+/// alone: peers would lose a node whose record pointed somewhere wrong.
+async fn update_node(State(inner): St, body: Bytes) -> Response {
+    type Reply = LeaderReply<Result<(), String>>;
+    let (id, node): (NodeId, KoshaNode) = match decode(&body) {
+        Ok(r) => r,
+        Err(e) => return bad_request(e),
+    };
+    let recorded = inner
+        .raft
+        .metrics()
+        .borrow()
+        .membership_config
+        .membership()
+        .get_node(&id)
+        .cloned();
+    match recorded {
+        None => return msgpack(&Reply::Ok(Err(format!("node {id} is not a member")))),
+        Some(r) if r.addr != node.addr => {
+            return msgpack(&Reply::Ok(Err(format!(
+                "node {id} is recorded at cluster address {}, not {}; only the API address can change",
+                r.addr, node.addr
+            ))));
+        }
+        Some(_) => {}
+    }
+    match inner
+        .raft
+        .change_membership(ChangeMembers::SetNodes([(id, node)].into()), false)
+        .await
+    {
+        Ok(_) => msgpack(&Reply::Ok(Ok(()))),
         Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) => {
             msgpack(&Reply::NotLeader(f.leader_id.zip(f.leader_node)))
         }
