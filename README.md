@@ -9,6 +9,10 @@ with io_uring.
 
 ![Kosha console](docs/images/console-overview.png)
 
+**New to Kosha?** [Install it](#1-install), [start a server](#2-run-a-single-node),
+then follow [How to use Kosha](#4-how-to-use-kosha): a step-by-step tour of
+the web console, from signing in to sharing files and giving apps their own keys.
+
 | Area | How Kosha does it |
 |---|---|
 | Unit of storage | **content-defined chunks** (FastCDC) |
@@ -188,7 +192,7 @@ Garage [S3 compatibility](https://garagehq.deuxfleurs.fr/documentation/reference
 [Install](#1-install) ·
 [Run a server](#2-run-a-single-node) ·
 [Read and write data](#3-read-and-write-data) ·
-[Web console](#4-web-console) ·
+[How to use](#4-how-to-use-kosha) ·
 [Cluster](#5-run-a-cluster) ·
 [Monitoring](#6-monitoring) ·
 [Security](#7-security) ·
@@ -488,46 +492,155 @@ curl --aws-sigv4 "aws:amz:us-east-1:s3" --user admin:change-me-please \
      http://localhost:9000/photos/report.pdf -o report.pdf
 ```
 
-## 4. Web console
+## 4. How to use Kosha
 
-Open **`http://<server>:9000/_kosha/ui/`** and sign in with the access key and
-secret. The console talks to the ordinary S3 API: requests are SigV4-signed in
-your browser, so there are no server-side sessions. It works over plain HTTP
-too.
+Kosha has two front doors on the same port:
 
-- **Overview**: object counts, logical vs on-disk size, and how much dedup and
-  compression saved. Also shows the I/O backend and cluster role.
-- **Buckets and object browser**: create and delete buckets, edit bucket
-  policies, browse folders, drag-and-drop uploads with progress, object
-  details, downloads, expiring share links (1 hour / 1 day / 7 days), and
-  bulk delete.
-- **Users** (root keys only): create users with a starting policy, show their
-  keys once, edit policies, disable, rotate secrets, delete.
-- **Cluster**: a live map of the members (leader, followers, unreachable
-  nodes, and how far each follower is behind the leader's log), plus the
-  Raft term, log and applied indexes, lease-read hit rate and
-  background-repair counters, refreshed every 2 seconds. Nodes can be
-  removed from here.
-- **Data flow** (cluster mode): how each recent write reached the cluster,
-  drawn as a sequence diagram:
-  1. the client's request to the node that received it;
-  2. the object split into chunks, and the nodes each chunk was stored on
-     (or its erasure-coded shards);
-  3. the metadata command forwarded to the leader;
-  4. the Raft log entry and its commit time;
-  5. which nodes have applied it.
+- **the web console** at `http://<server>:9000/_kosha/ui/`, for people: buckets,
+  files, users and the cluster, in a browser;
+- **the S3 API** at `http://<server>:9000`, for programs: backup tools, apps,
+  scripts and SDKs (see [Read and write data](#3-read-and-write-data)).
 
-  Every node records the last 200 writes it received, in memory, and the
-  page merges them from all members. A button sends a test write of a
-  chosen size.
+Both use the same buckets, files and keys. A typical first session:
 
-| Object browser | Cluster (dark mode) |
+### Step 1: Sign in
+
+Open `http://<server>:9000/_kosha/ui/` and sign in with the access key and
+secret the server was started with (`KOSHA_ACCESS_KEY` and
+`KOSHA_SECRET_KEY`). These are the **root keys**: they can do everything,
+so keep them for administration. The console signs every request in your
+browser (SigV4), so the secret never leaves the tab and there are no server
+sessions. **Advanced** sets the region, which Kosha accepts whatever its
+value. The console works over plain HTTP and on phones.
+
+![Sign-in page](docs/images/console-login.png)
+
+### Step 2: Check the overview
+
+The **Overview** page shows how many objects you store, how much data
+clients uploaded (logical size) and how much it takes on disk. The bars show
+where the savings come from: identical chunks stored once (dedup) and
+compression where it helps. The subtitle names the node you're on, its role
+in a cluster and the disk I/O backend.
+
+![Overview page](docs/images/console-overview.png)
+
+### Step 3: Create a bucket
+
+A bucket is a top-level folder with its own name and access rules. On
+**Buckets**, type a name (3–63 characters: lowercase letters, digits, `-`
+and `.`) and click **Create bucket**. Each bucket has:
+
+- **Policy**: who may access it without keys. The editor starts from a
+  public-read template, for serving a static website or shared downloads;
+  save it only if that is what you want. Invalid JSON can't be saved, and
+  the server rejects rules that don't fit the bucket.
+- **Delete**: only works on an empty bucket.
+
+![Buckets page](docs/images/console-buckets.png)
+
+### Step 4: Upload, browse and share files
+
+Click a bucket to browse it.
+
+- **Upload**: click **Upload** or drag files onto the list. Each file shows
+  its progress. For very large files or whole folders, the AWS CLI (below)
+  is faster: it uploads in parallel parts and can resume.
+- **Folders**: **New folder** creates one; click a folder to open it and the
+  path at the top to go back. Folders are just key prefixes (`2026/holiday.jpg`).
+- **Details**: click a file to see its size, type, date and ETag.
+  **Download** saves it and **Open** shows it in a new tab.
+- **Share**: pick how long a link stays valid (1 hour, 1 day or 7 days) and
+  click **Copy link**. Anyone with the link can download that one file until
+  it expires, without an account.
+- **Delete**: tick files (or the header box for all) and click **Delete**.
+
+![Object browser](docs/images/console-browser.png)
+
+Uploading the same content twice costs nothing extra: in this example a copy
+of `holiday-beach.jpg` in another bucket is stored once, which is part of the
+saving on the Overview page.
+
+### Step 5: Give each app its own keys
+
+Don't put the root keys in apps. On **Users**, create a user per app or
+person, with a starting policy:
+
+| Starting policy | What the user can do |
 |---|---|
-| ![](docs/images/console-browser.png) | ![](docs/images/console-cluster-dark.png) |
+| Read-only | list and download from every bucket |
+| Home directory | read and write only under `home/<user name>/` in bucket `home` |
+| No policy | nothing until you attach one with **Policy** |
+
+The new keys are shown **once**: copy them into the app straight away. Later
+you can edit the user's **Policy** (standard AWS IAM JSON), **Disable** it
+temporarily, **Rotate** its secret if it leaks, or **Delete** it.
+
+![Users page](docs/images/console-users.png)
+
+Then point the app at Kosha with those keys. Most S3 tools need four
+settings:
+
+```sh
+export AWS_ACCESS_KEY_ID=<access key>  AWS_SECRET_ACCESS_KEY=<secret key>
+export AWS_DEFAULT_REGION=us-east-1     # any value works
+aws --endpoint-url http://<server>:9000 s3 sync ~/Pictures s3://photos/   # e.g. back up a folder
+```
+
+In SDKs and apps the same settings are the endpoint URL, the two keys, a
+region, and **path-style addressing** (`force_path_style`, "use path-style
+URLs"). Examples for the AWS CLI, Rust, Python, curl and more are in
+[Read and write data](#3-read-and-write-data).
+
+### Step 6: Watch the cluster (cluster mode)
+
+**Cluster** shows the members live, refreshed every 2 seconds:
+
+- which node leads and how far each follower is behind its log;
+- unreachable nodes, marked as such;
+- the Raft term, log and snapshot indexes, lease-read hit rate and
+  background-repair counters.
+
+**Remove** takes a node out for good; its data is re-replicated to the
+others.
+
+![Cluster page](docs/images/console-cluster.png)
+
+**Data flow** shows how each recent write reached the cluster, as a
+sequence diagram:
+
+1. the client's request to the node that received it;
+2. the object split into chunks, and the nodes each chunk was stored on
+   (or its erasure-coded shards);
+3. the metadata command forwarded to the leader;
+4. the Raft log entry and its commit time;
+5. which nodes have applied it.
+
+Pick a bucket and size and click **Send** to watch a test write. Every node
+keeps its last 200 writes in memory, and the page merges them from all
+members, so the list starts empty after a restart.
 
 ![Data flow page](docs/images/console-dataflow.png)
 
-![Users page](docs/images/console-users.png)
+The console follows your system's light or dark theme:
+
+![Cluster page in dark mode](docs/images/console-cluster-dark.png)
+
+### Everyday tasks
+
+| I want to… | Do this |
+|---|---|
+| back up a folder from my laptop | `aws --endpoint-url http://<server>:9000 s3 sync ~/Documents s3://backups/laptop/` (rerun it to copy only changes) |
+| share one file with someone | open the file in the console, pick a duration, **Copy link** |
+| host a static website | upload it to a bucket, then **Policy** → save the public-read template |
+| give an app limited access | **Users** → create a user with a starting policy, put its keys in the app |
+| see how much space dedup saves | **Overview** |
+| keep old versions or block deletes | turn on [versioning or Object Lock](#versioning-object-lock-and-lifecycle) |
+| delete old files automatically | add a [lifecycle rule](#versioning-object-lock-and-lifecycle) |
+| move rarely read data to cheaper storage | set up the [cold tier](#cold-tier) |
+| find out whether the cluster is healthy | **Cluster**: one leader, every node reachable and in sync |
+| replace a failed node | **Cluster** → **Remove** it, then start a new node with `--join` ([Run a cluster](#5-run-a-cluster)) |
+| check the server from a script | `curl http://<server>:9000/_kosha/health`, metrics in [Monitoring](#6-monitoring) |
 
 ## 5. Run a cluster
 
