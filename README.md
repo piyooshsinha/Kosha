@@ -234,6 +234,28 @@ mode. Stop the server with Ctrl-C; it shuts down gracefully.
 For local experiments you can skip authentication with `--anonymous`. Never
 use it on a network you don't control.
 
+### As a service (home server, NUC, VM)
+
+On a Linux machine with systemd (Debian, Ubuntu, Fedora or Arch), one script
+builds Kosha from the checkout and installs it as a service:
+
+```sh
+git clone https://github.com/piyooshsinha/Kosha && cd Kosha
+sudo scripts/install.sh
+```
+
+It installs a C toolchain and Rust if they are missing, builds the binary
+(and the console if `npm` is available), and installs it as
+`/usr/local/bin/kosha`. It creates a `kosha` system user, keeps data in
+`/var/lib/kosha`, and generates credentials into `/etc/kosha/kosha.env`
+(mode 600). Then it starts `kosha.service` on `0.0.0.0:9000` and prints the
+endpoint, console URL and keys. Set `KOSHA_LISTEN` or `KOSHA_DATA_DIR` before
+the first run to change those. Later, edit `/etc/kosha/kosha.env` (any
+`KOSHA_*` setting from `kosha --help`) and run `sudo systemctl restart kosha`.
+Re-running the script rebuilds and upgrades in place without changing the
+keys. `sudo scripts/install.sh uninstall` removes the service and binary but
+keeps the data.
+
 ## 3. Read and write data
 
 Kosha works with S3 clients as-is. Point them at the server with path-style
@@ -1311,7 +1333,7 @@ crates/
   kosha-server    the `kosha` binary (embeds the console)
   kosha-faultfs   test tool: FUSE filesystem that simulates power cuts
 ui/               web console (React + TypeScript + Vite)
-scripts/          dev-cluster.sh
+scripts/          install.sh (systemd service), dev-cluster.sh, compare-bench.sh
 ```
 
 ## Development
