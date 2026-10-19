@@ -253,6 +253,11 @@ impl ClusterHooks for Hooks {
         serde_json::to_value(self.0.status()).unwrap_or_default()
     }
 
+    fn flows(&self, limit: usize) -> futures::future::BoxFuture<'static, serde_json::Value> {
+        let c = self.0.clone();
+        Box::pin(async move { serde_json::to_value(c.flows(limit).await).unwrap_or_default() })
+    }
+
     fn remove_node(&self, id: u64) -> futures::future::BoxFuture<'static, Result<(), String>> {
         let c = self.0.clone();
         Box::pin(async move { c.remove_node(id).await.map_err(|e| e.to_string()) })

@@ -256,6 +256,24 @@ other rule is unchanged. The log shows `io="io_uring"`. With plain
 `docker run` and no `--security-opt seccomp=docker/seccomp-io_uring.json`,
 Kosha logs `io_uring unavailable` and uses its thread-pool backend instead.
 
+### A 3-node cluster with Docker
+
+```sh
+printf 'KOSHA_ACCESS_KEY=admin\nKOSHA_SECRET_KEY=%s\nKOSHA_CLUSTER_SECRET=%s\nKOSHA_HOST=%s\n' \
+  "$(openssl rand -hex 20)" "$(openssl rand -hex 24)" "$(hostname -I | awk '{print $1}')" > .env
+docker compose -f docker-compose.cluster.yml up -d --build
+```
+
+This starts three nodes on one host: S3 and the console on ports 9000, 9001
+and 9002 (any node serves every request), with internal traffic on a private
+Docker network. Node 1 bootstraps the cluster and nodes 2 and 3 join it; on
+later starts they resume from their volumes. `KOSHA_HOST` is the address the
+console shows for each node. All three share the host's disk and power, so
+this tolerates a node process failing, not the machine; for real fault
+tolerance, run the nodes on separate machines (see [Run a cluster](#5-run-a-cluster)).
+Stopping one container (`docker stop kosha1`) shows a leader change and
+the stopped node as unreachable in the console.
+
 ### As a service (home server, NUC, VM)
 
 On a Linux machine with systemd (Debian, Ubuntu, Fedora or Arch), one script
@@ -482,13 +500,29 @@ too.
   bulk delete.
 - **Users** (root keys only): create users with a starting policy, show their
   keys once, edit policies, disable, rotate secrets, delete.
-- **Cluster**: leader, Raft term, log and applied indexes, per-node
-  replication progress, lease-read hit rate and background-repair counters,
-  refreshed every 2 seconds. Nodes can be removed from here.
+- **Cluster**: a live map of the members (leader, followers, unreachable
+  nodes, and how far each follower is behind the leader's log), plus the
+  Raft term, log and applied indexes, lease-read hit rate and
+  background-repair counters, refreshed every 2 seconds. Nodes can be
+  removed from here.
+- **Data flow** (cluster mode): how each recent write reached the cluster,
+  drawn as a sequence diagram:
+  1. the client's request to the node that received it;
+  2. the object split into chunks, and the nodes each chunk was stored on
+     (or its erasure-coded shards);
+  3. the metadata command forwarded to the leader;
+  4. the Raft log entry and its commit time;
+  5. which nodes have applied it.
+
+  Every node records the last 200 writes it received, in memory, and the
+  page merges them from all members. A button sends a test write of a
+  chosen size.
 
 | Object browser | Cluster (dark mode) |
 |---|---|
 | ![](docs/images/console-browser.png) | ![](docs/images/console-cluster-dark.png) |
+
+![Data flow page](docs/images/console-dataflow.png)
 
 ![Users page](docs/images/console-users.png)
 
@@ -1356,6 +1390,9 @@ crates/
   kosha-faultfs   test tool: FUSE filesystem that simulates power cuts
 ui/               web console (React + TypeScript + Vite)
 scripts/          install.sh (systemd service), dev-cluster.sh, compare-bench.sh
+docker/           seccomp profile that allows io_uring in containers
+Dockerfile, docker-compose.yml, docker-compose.cluster.yml
+                  container image, single node, 3-node cluster
 ```
 
 ## Development

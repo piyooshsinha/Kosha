@@ -32,6 +32,13 @@ pub fn router(inner: Arc<Inner>) -> Router {
         .route("/cluster/join", post(join))
         .route("/cluster/status", get(cluster_status))
         .route("/cluster/remove", post(remove))
+        .route(
+            "/cluster/flows",
+            post(|State(inner): St, body: Bytes| async move {
+                let limit = decode::<usize>(&body).unwrap_or(usize::MAX);
+                msgpack(&inner.local_flows(limit))
+            }),
+        )
         .route("/health", get(|| async { "ok" }))
         .route(
             "/chunk/{id}",

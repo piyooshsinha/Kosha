@@ -193,6 +193,30 @@ Chunks are immutable and content-addressed, so replication needs no
 consensus of its own: any copy of a chunk is the same bytes, and repairs are
 idempotent.
 
+## Write flow records
+
+For the console's Data flow page, each node keeps an in-memory record of the
+last 200 writes it received (`kosha-cluster/src/flows.rs`):
+
+- **Chunks:** `place` records each chunk's replica nodes (or shard nodes),
+  any preferred replicas that failed, and its timing.
+- **Commands:** `propose_batch` records the user-visible commands in a
+  batch: whether the batch went to the leader directly or was forwarded,
+  the log index, the batch size and the commit time. Bookkeeping commands
+  such as access times and event acks are skipped.
+- **Joining them:** a `PutObject` lists its chunk ids, so a flow is joined
+  to its chunks' placements by id.
+
+`GET /_kosha/cluster/flows` asks every member for its records over the
+internal endpoint, with a 2-second timeout, and merges them. It also returns
+each member's applied index and whether it answered. The Cluster page uses
+`?limit=0` for that reachability alone: the leader keeps a stopped
+follower's last replicated index, so that index alone does not show the
+follower is down.
+
+The records only observe the write path, never change it, and they are not
+persisted, so a restart clears them.
+
 ## Background repair and rebalancing
 
 Every node runs a repairer (`kosha-cluster/src/repair.rs`, every

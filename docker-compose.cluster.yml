@@ -1,0 +1,72 @@
+# A 3-node Kosha cluster on one Docker host (for trying clustering, or as a
+# base to spread across machines). Put these in .env next to this file:
+#   KOSHA_ACCESS_KEY=admin
+#   KOSHA_SECRET_KEY=<openssl rand -hex 20>
+#   KOSHA_CLUSTER_SECRET=<openssl rand -hex 24>
+#   KOSHA_HOST=<this machine's LAN address, shown in the console; default 127.0.0.1>
+# then: docker compose -f docker-compose.cluster.yml up -d --build
+#
+# Node 1 bootstraps the cluster and nodes 2 and 3 join through it; on later
+# starts the nodes ignore --init/--join and resume from their volumes. S3 and
+# the console are on host ports 9000, 9001 and 9002 (any node serves every
+# request). All three nodes share this host's disk and power, so this
+# survives a node process failing, not the machine failing.
+name: kosha-cluster
+
+x-node: &node
+  build: .
+  image: kosha:latest
+  restart: unless-stopped
+  # Docker's default seccomp profile plus io_uring (see docker-compose.yml).
+  security_opt:
+    - seccomp=./docker/seccomp-io_uring.json
+
+x-env: &env
+  KOSHA_ACCESS_KEY: ${KOSHA_ACCESS_KEY:?set KOSHA_ACCESS_KEY in .env}
+  KOSHA_SECRET_KEY: ${KOSHA_SECRET_KEY:?set KOSHA_SECRET_KEY in .env}
+  KOSHA_CLUSTER_SECRET: ${KOSHA_CLUSTER_SECRET:?set KOSHA_CLUSTER_SECRET in .env}
+  KOSHA_CLUSTER_LISTEN: 0.0.0.0:9100
+
+services:
+  kosha1:
+    <<: *node
+    container_name: kosha1
+    ports: ["9000:9000"]
+    environment:
+      <<: *env
+      KOSHA_NODE_ID: "1"
+      KOSHA_CLUSTER_ADVERTISE: kosha1:9100
+      KOSHA_API_ADVERTISE: ${KOSHA_HOST:-127.0.0.1}:9000
+      KOSHA_INIT: "true"
+    volumes: [kosha1:/data]
+
+  kosha2:
+    <<: *node
+    container_name: kosha2
+    ports: ["9001:9000"]
+    depends_on: [kosha1]
+    environment:
+      <<: *env
+      KOSHA_NODE_ID: "2"
+      KOSHA_CLUSTER_ADVERTISE: kosha2:9100
+      KOSHA_API_ADVERTISE: ${KOSHA_HOST:-127.0.0.1}:9001
+      KOSHA_JOIN: kosha1:9100
+    volumes: [kosha2:/data]
+
+  kosha3:
+    <<: *node
+    container_name: kosha3
+    ports: ["9002:9000"]
+    depends_on: [kosha1]
+    environment:
+      <<: *env
+      KOSHA_NODE_ID: "3"
+      KOSHA_CLUSTER_ADVERTISE: kosha3:9100
+      KOSHA_API_ADVERTISE: ${KOSHA_HOST:-127.0.0.1}:9002
+      KOSHA_JOIN: kosha1:9100
+    volumes: [kosha3:/data]
+
+volumes:
+  kosha1:
+  kosha2:
+  kosha3:

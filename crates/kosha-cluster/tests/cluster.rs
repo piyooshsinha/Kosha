@@ -508,3 +508,60 @@ async fn lost_majority_fails_fast_with_unavailable() {
         t.elapsed()
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flows_show_where_a_write_went() {
+    let nodes = three_nodes().await;
+    let leader = nodes[0].cluster.status().leader.unwrap();
+    let follower = nodes
+        .iter()
+        .find(|n| n.cluster.node_id() != leader)
+        .unwrap();
+    follower.engine.create_bucket("flows").await.unwrap();
+    let meta = put(&follower.engine, "flows", "obj", &data(60_000, 7)).await;
+    let chunks = chunk_ids(&meta);
+    let ids: Vec<String> = chunks.iter().map(|c| c.to_hex()).collect();
+
+    // Any node merges every member's flows.
+    let other = nodes
+        .iter()
+        .find(|n| n.cluster.node_id() != follower.cluster.node_id())
+        .unwrap();
+    let view = other.cluster.flows(200).await;
+    assert_eq!(view.nodes.len(), 3);
+    assert!(view.nodes.iter().all(|n| n.reachable));
+    let flow = view
+        .flows
+        .iter()
+        .find(|f| f.op == "PutObject" && f.key == "obj")
+        .expect("the write is recorded");
+    assert_eq!(flow.node, follower.cluster.node_id());
+    assert!(flow.forwarded, "a follower forwards to the leader");
+    assert_eq!(flow.leader, Some(leader));
+    assert_eq!(flow.size, 60_000);
+    assert_eq!(flow.chunk_count, ids.len());
+    let traced: Vec<&str> = flow.chunks.iter().map(|c| c.id.as_str()).collect();
+    assert_eq!(traced, ids.iter().map(String::as_str).collect::<Vec<_>>());
+    for (c, id) in flow.chunks.iter().zip(&chunks) {
+        assert_eq!(c.replicas.len(), 2, "replication factor 2");
+        // The replicas really hold the chunk.
+        for r in &c.replicas {
+            let n = nodes.iter().find(|n| n.cluster.node_id() == *r).unwrap();
+            assert!(n.engine.chunk_store().has(id));
+        }
+    }
+    // The writer waited until it applied the entry itself.
+    let index = flow.log_index.unwrap();
+    let writer = view
+        .nodes
+        .iter()
+        .find(|n| n.id == follower.cluster.node_id())
+        .unwrap();
+    assert!(writer.last_applied.unwrap() >= index);
+    // A reachability-only view (the cluster page) carries no flows.
+    let bare = other.cluster.flows(0).await;
+    assert!(bare.flows.is_empty() && bare.nodes.iter().all(|n| n.reachable));
+    for n in &nodes {
+        n.cluster.shutdown().await;
+    }
+}

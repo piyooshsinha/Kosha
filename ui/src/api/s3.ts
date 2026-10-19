@@ -74,6 +74,52 @@ export interface ClusterStatus {
   };
 }
 
+/** Where one chunk of a write was stored. */
+export interface ChunkTrace {
+  id: string;
+  len: number;
+  stored: number;
+  replicas: number[];
+  failed: number[];
+  shards: [number, number][];
+  layout: string | null;
+  start_ms: number;
+  end_ms: number;
+}
+
+/** One write, as recorded by the node that received it. */
+export interface Flow {
+  node: number;
+  seq: number;
+  op: string;
+  bucket: string;
+  key: string;
+  size: number;
+  inline_bytes: number;
+  chunk_count: number;
+  chunks: ChunkTrace[];
+  reused_chunks: number;
+  leader: number | null;
+  forwarded: boolean;
+  log_index: number | null;
+  batch: number;
+  started_ms: number;
+  proposed_ms: number;
+  committed_ms: number;
+  error: string | null;
+}
+
+export interface FlowsView {
+  mode?: "single-node";
+  node_id: number;
+  leader: number | null;
+  term: number;
+  replication_factor: number;
+  erasure: string | null;
+  nodes: { id: number; api: string; voter: boolean; reachable: boolean; last_applied: number | null }[];
+  flows: Flow[];
+}
+
 export interface User {
   access_key: string;
   name: string;
@@ -290,5 +336,10 @@ export class S3 {
 
   async cluster(): Promise<ClusterStatus> {
     return (await this.request("GET", "/_kosha/cluster")).json();
+  }
+
+  /** Recent writes across the cluster; `limit` 0 returns only the members' reachability. */
+  async flows(limit = 200): Promise<FlowsView> {
+    return (await this.request("GET", "/_kosha/cluster/flows", [["limit", String(limit)]])).json();
   }
 }

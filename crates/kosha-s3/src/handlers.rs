@@ -422,6 +422,21 @@ async fn handle(st: Arc<AppState>, req: Request) -> S3Result<Response> {
         };
         return Ok(axum::Json(body).into_response());
     }
+    if raw_path == "/_kosha/cluster/flows" {
+        let body = match &st.cfg.cluster {
+            Some(c) => {
+                let limit = query
+                    .iter()
+                    .find(|(k, _)| k == "limit")
+                    .and_then(|(_, v)| v.parse().ok())
+                    .unwrap_or(200usize)
+                    .min(200);
+                c.flows(limit).await
+            }
+            None => serde_json::json!({ "mode": "single-node" }),
+        };
+        return Ok(axum::Json(body).into_response());
+    }
     if let Some(id) = raw_path.strip_prefix("/_kosha/cluster/nodes/") {
         if parts.method != Method::DELETE {
             return Err(S3Error::new(

@@ -160,13 +160,14 @@ impl Inner {
         }
     }
 
-    /// Encode a chunk and place every shard. Returns the stored size.
+    /// Encode a chunk and place every shard. Returns the stored size and
+    /// the node that took each shard.
     pub(crate) async fn place_shards(
         &self,
         id: ChunkId,
         data: Bytes,
         layout: Layout,
-    ) -> kosha_engine::Result<u64> {
+    ) -> kosha_engine::Result<(u64, Vec<(u8, NodeId)>)> {
         let store = self.engine.chunk_store();
         let (stored, shards) = tokio::task::spawn_blocking(move || {
             store.compress_external(&data).map(|plain| {
@@ -188,8 +189,12 @@ impl Inner {
         // Shards whose designated node failed go to the next nodes down
         // the ranking, one shard per node.
         let mut spare = ranked.iter().skip(layout.total());
+        let mut placed = Vec::with_capacity(shards.len());
         for (i, r) in first.into_iter().enumerate() {
-            let Err(mut err) = r else { continue };
+            let Err(mut err) = r else {
+                placed.push((i as u8, ranked[i].0));
+                continue;
+            };
             loop {
                 let Some(node) = spare.next() else {
                     return Err(kosha_engine::Error::Internal(format!(
@@ -198,12 +203,15 @@ impl Inner {
                     )));
                 };
                 match self.store_shard(node, id, i as u8, shards[i].clone()).await {
-                    Ok(()) => break,
+                    Ok(()) => {
+                        placed.push((i as u8, node.0));
+                        break;
+                    }
                     Err(e) => err = e,
                 }
             }
         }
-        Ok(stored)
+        Ok((stored, placed))
     }
 
     async fn shard_from(

@@ -1,12 +1,16 @@
 import { useEffect, useState } from "react";
 import type { ClusterStatus, S3 } from "../api/s3.ts";
 import type { PushToast } from "./Toasts.tsx";
+import { ClusterMap, type MapNode } from "./ClusterMap.tsx";
 
 export function ClusterView({ s3, toast }: { s3: S3; toast: PushToast }) {
   const [status, setStatus] = useState<ClusterStatus | null>(null);
   const [removing, setRemoving] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [updated, setUpdated] = useState<Date | null>(null);
+  // Which members answered a direct probe (the leader keeps a stopped
+  // follower's last replicated index, so that alone cannot show it is down).
+  const [reachable, setReachable] = useState<Map<number, boolean>>(new Map());
 
   useEffect(() => {
     let live = true;
@@ -20,11 +24,19 @@ export function ClusterView({ s3, toast }: { s3: S3; toast: PushToast }) {
           setUpdated(new Date());
         })
         .catch((e) => live && setError(String(e.message ?? e)));
+    const probe = () =>
+      s3
+        .flows(0)
+        .then((v) => live && v.nodes && setReachable(new Map(v.nodes.map((n) => [n.id, n.reachable]))))
+        .catch(() => {});
     load();
+    probe();
     const t = setInterval(load, 2000);
+    const p = setInterval(probe, 4000);
     return () => {
       live = false;
       clearInterval(t);
+      clearInterval(p);
     };
   }, [s3]);
 
@@ -41,7 +53,11 @@ export function ClusterView({ s3, toast }: { s3: S3; toast: PushToast }) {
         </header>
         <div className="card">
           <h2>Start a cluster</h2>
-          <p>Run each node with a unique id and a shared secret. Bootstrap the first one, then join the rest through it:</p>
+          <p>
+            To try one on a single Docker host, use <code>docker-compose.cluster.yml</code> from the repository (see the
+            README). On separate machines, run each node with a unique id and a shared secret, bootstrap the first one
+            and join the rest through it:
+          </p>
           <pre className="code">{`export KOSHA_CLUSTER_SECRET=$(openssl rand -hex 24)
 kosha --node-id 1 --cluster-listen 10.0.0.1:9100 --init
 kosha --node-id 2 --cluster-listen 10.0.0.2:9100 --join 10.0.0.1:9100
@@ -127,6 +143,35 @@ kosha --node-id 3 --cluster-listen 10.0.0.3:9100 --join 10.0.0.1:9100`}</pre>
         )}
       </section>
 
+      <div className="card map-card">
+        <div className="map-head">
+          <h2>Topology</h2>
+          <a className="fine" href="#/flow">
+            See how data reaches the nodes →
+          </a>
+        </div>
+        <ClusterMap
+          leader={status.leader ?? null}
+          nodes={nodes.map(
+            (n): MapNode => ({
+              id: n.id,
+              role:
+                reachable.get(n.id) === false || (isLeader && n.matched == null && n.id !== status.leader)
+                  ? "down"
+                  : n.id === status.leader
+                    ? "leader"
+                    : n.voter
+                      ? "follower"
+                      : "learner",
+              sub: n.id === status.leader ? `log ${lastIndex}` : n.matched != null ? `log ${n.matched}` : "",
+              api: n.api || n.addr,
+              you: n.id === status.node_id,
+              lag: isLeader && n.matched != null ? lastIndex - n.matched : null,
+            }),
+          )}
+        />
+      </div>
+
       <div className="card flush">
         <table className="table">
           <thead>
@@ -156,7 +201,9 @@ kosha --node-id 3 --cluster-listen 10.0.0.3:9100 --join 10.0.0.1:9100`}</pre>
                   <td className="mono">{n.addr}</td>
                   {isLeader && (
                     <td className="right mono">
-                      {n.matched != null ? (
+                      {reachable.get(n.id) === false && n.id !== status.leader ? (
+                        <span className="lag">unreachable{n.matched != null ? ` (had ${n.matched})` : ""}</span>
+                      ) : n.matched != null ? (
                         <>
                           {n.matched}
                           {lag ? <span className="lag"> −{lag}</span> : <span className="ok"> ✓</span>}

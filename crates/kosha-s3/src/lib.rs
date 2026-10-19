@@ -47,6 +47,10 @@ pub trait ClusterHooks: Send + Sync + 'static {
     fn status(&self) -> serde_json::Value;
     /// `DELETE /_kosha/cluster/nodes/{id}`. `Err` carries a user-facing reason.
     fn remove_node(&self, id: u64) -> futures::future::BoxFuture<'static, Result<(), String>>;
+    /// JSON served at `GET /_kosha/cluster/flows`: recent writes and where
+    /// their data went, merged across members.
+    /// `limit` caps the flows returned (0: only the members' reachability).
+    fn flows(&self, limit: usize) -> futures::future::BoxFuture<'static, serde_json::Value>;
     /// Extra Prometheus series appended to `/_kosha/metrics`.
     fn prometheus(&self) -> String {
         String::new()

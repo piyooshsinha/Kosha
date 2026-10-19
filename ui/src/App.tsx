@@ -6,6 +6,7 @@ import { Overview } from "./components/Overview.tsx";
 import { Buckets } from "./components/Buckets.tsx";
 import { Browser } from "./components/Browser.tsx";
 import { ClusterView } from "./components/Cluster.tsx";
+import { DataFlow } from "./components/DataFlow.tsx";
 import { Users } from "./components/Users.tsx";
 import { Toasts, useToasts } from "./components/Toasts.tsx";
 
@@ -16,6 +17,7 @@ export type Route =
   | { page: "buckets" }
   | { page: "browse"; bucket: string; prefix: string }
   | { page: "cluster" }
+  | { page: "flow" }
   | { page: "users" };
 
 function parseRoute(hash: string): Route {
@@ -25,6 +27,8 @@ function parseRoute(hash: string): Route {
       return { page: "buckets" };
     case "cluster":
       return { page: "cluster" };
+    case "flow":
+      return { page: "flow" };
     case "users":
       return { page: "users" };
     case "b":
@@ -49,6 +53,8 @@ export function href(r: Route): string {
       return "#/buckets";
     case "cluster":
       return "#/cluster";
+    case "flow":
+      return "#/flow";
     case "users":
       return "#/users";
     case "browse":
@@ -103,6 +109,7 @@ export function App() {
     { label: "Buckets", route: { page: "buckets" }, active: route.page === "buckets" || route.page === "browse", icon: "▤" },
     { label: "Users", route: { page: "users" }, active: route.page === "users", icon: "◉" },
     { label: "Cluster", route: { page: "cluster" }, active: route.page === "cluster", icon: "⬡" },
+    { label: "Data flow", route: { page: "flow" }, active: route.page === "flow", icon: "⇢" },
   ];
 
   return (
@@ -138,6 +145,7 @@ export function App() {
         {route.page === "buckets" && <Buckets s3={s3} toast={toasts.push} />}
         {route.page === "browse" && <Browser s3={s3} bucket={route.bucket} prefix={route.prefix} toast={toasts.push} />}
         {route.page === "cluster" && <ClusterView s3={s3} toast={toasts.push} />}
+        {route.page === "flow" && <DataFlow s3={s3} toast={toasts.push} />}
         {route.page === "users" && <Users s3={s3} toast={toasts.push} />}
       </main>
       <Toasts items={toasts.items} dismiss={toasts.dismiss} />

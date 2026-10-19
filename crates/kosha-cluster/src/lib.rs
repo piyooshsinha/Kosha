@@ -19,6 +19,7 @@
 
 mod ec;
 mod erasure;
+mod flows;
 mod lease;
 mod log_store;
 mod network;
@@ -27,6 +28,7 @@ mod rpc;
 mod server;
 mod state_machine;
 pub mod tls;
+pub use flows::{ChunkTrace, Flow, NodeFlows};
 mod types;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -137,6 +139,7 @@ pub(crate) struct Inner {
     pub client: Client,
     pub lease: lease::ReadLease,
     pub repair_stats: repair::RepairStats,
+    pub flows: flows::FlowLog,
 }
 
 /// A running cluster member.
@@ -213,6 +216,7 @@ impl Cluster {
             client,
             lease: lease::ReadLease::new(cfg.lease_reads, cfg.election_timeout_ms.0),
             repair_stats: Default::default(),
+            flows: Default::default(),
         });
         let repairer = cfg
             .repair_interval
@@ -371,6 +375,50 @@ impl Cluster {
     /// Run one re-replication/rebalancing pass now.
     pub async fn repair_now(&self) -> RepairReport {
         self.inner.repair_round().await
+    }
+
+    /// Recent writes received by every reachable member, newest first (at
+    /// most `limit`), with each member's applied index (an entry at or below
+    /// it is applied there) and whether it answered within two seconds.
+    pub async fn flows(&self, limit: usize) -> FlowsView {
+        let inner = &self.inner;
+        let st = status(inner);
+        let peers = futures::future::join_all(st.nodes.iter().map(|n| async move {
+            if n.id == inner.cfg.node_id {
+                return (n, Some(inner.local_flows(limit)));
+            }
+            let got = inner
+                .client
+                .call::<_, NodeFlows>(&n.addr, "/cluster/flows", &limit, Duration::from_secs(2))
+                .await;
+            (n, got.ok())
+        }))
+        .await;
+        let mut flows = Vec::new();
+        let mut nodes = Vec::new();
+        for (n, got) in peers {
+            nodes.push(FlowNode {
+                id: n.id,
+                api: n.api.clone(),
+                voter: n.voter,
+                reachable: got.is_some(),
+                last_applied: got.as_ref().and_then(|g| g.last_applied),
+            });
+            if let Some(g) = got {
+                flows.extend(g.flows);
+            }
+        }
+        flows.sort_by(|a, b| b.committed_ms.cmp(&a.committed_ms).then(b.seq.cmp(&a.seq)));
+        flows.truncate(limit);
+        FlowsView {
+            node_id: st.node_id,
+            leader: st.leader,
+            term: st.term,
+            replication_factor: st.replication_factor,
+            erasure: inner.cfg.erasure.map(|l| l.to_string()),
+            nodes,
+            flows,
+        }
     }
 
     pub fn status(&self) -> ClusterStatus {
@@ -532,6 +580,27 @@ pub struct ClusterStatus {
     pub repair: RepairStatus,
 }
 
+/// `GET /_kosha/cluster/flows`: recent writes across the cluster.
+#[derive(Clone, Debug, Serialize)]
+pub struct FlowsView {
+    pub node_id: NodeId,
+    pub leader: Option<NodeId>,
+    pub term: u64,
+    pub replication_factor: usize,
+    pub erasure: Option<String>,
+    pub nodes: Vec<FlowNode>,
+    pub flows: Vec<Flow>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct FlowNode {
+    pub id: NodeId,
+    pub api: String,
+    pub voter: bool,
+    pub reachable: bool,
+    pub last_applied: Option<u64>,
+}
+
 /// Cumulative background repair counters on this node.
 #[derive(Clone, Debug, Serialize)]
 pub struct RepairStatus {
@@ -613,6 +682,16 @@ fn raft_err(e: impl std::fmt::Display) -> kosha_engine::Error {
 }
 
 impl Inner {
+    pub(crate) fn local_flows(&self, limit: usize) -> NodeFlows {
+        NodeFlows {
+            node: self.cfg.node_id,
+            last_applied: self.raft.metrics().borrow().last_applied.map(|l| l.index),
+            flows: self.flows.latest(limit),
+        }
+    }
+}
+
+impl Inner {
     /// Leader-side voter removal with guardrails. `Ok(Ok)` on success,
     /// `Ok(Err(msg))` for a refused request, `NotLeader` to redirect.
     pub(crate) async fn remove_voter(
@@ -662,6 +741,36 @@ impl Inner {
     /// batch is forwarded to the leader in one RPC, then the follower waits
     /// until it has applied the entry itself (read-your-writes).
     async fn propose_batch(&self, cmds: Vec<Command>) -> kosha_engine::Result<Vec<CommandResult>> {
+        let pending = flows::FlowLog::describe(&cmds);
+        let proposed_ms = flows::now_ms();
+        let traced = pending.iter().any(Option::is_some);
+        let result = self.propose_batch_inner(cmds).await;
+        if traced {
+            let (results, leader, forwarded, index, error) = match &result {
+                Ok(c) => (
+                    Some(c.results.as_slice()),
+                    c.leader,
+                    c.forwarded,
+                    Some(c.index),
+                    None,
+                ),
+                Err(e) => (None, None, false, None, Some(e.to_string())),
+            };
+            self.flows.record_commit(
+                self.cfg.node_id,
+                pending,
+                results,
+                leader,
+                forwarded,
+                index,
+                proposed_ms,
+                error,
+            );
+        }
+        result.map(|c| c.results)
+    }
+
+    async fn propose_batch_inner(&self, cmds: Vec<Command>) -> kosha_engine::Result<Committed> {
         // Ids are fixed before the first attempt: every retry below re-sends
         // the same ids, so a batch the leader already committed is not
         // applied twice.
@@ -687,7 +796,14 @@ impl Inner {
                 break;
             };
             match written {
-                Ok(resp) => return Ok(resp.data.0),
+                Ok(resp) => {
+                    return Ok(Committed {
+                        results: resp.data.0,
+                        leader: Some(self.cfg.node_id),
+                        forwarded: false,
+                        index: resp.log_id.index,
+                    });
+                }
                 Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) => {
                     if let Some(leader) = f.leader_node {
                         match self
@@ -702,7 +818,12 @@ impl Inner {
                         {
                             Ok(LeaderReply::Ok(p)) => {
                                 self.wait_applied(p.index).await?;
-                                return Ok(p.results);
+                                return Ok(Committed {
+                                    results: p.results,
+                                    leader: f.leader_id,
+                                    forwarded: true,
+                                    index: p.index,
+                                });
                             }
                             Ok(LeaderReply::NotLeader(_)) => last = "leader changed".into(),
                             Err(e) => last = e.to_string(),
@@ -768,6 +889,14 @@ impl Inner {
             "cluster unavailable for reads: {last}"
         )))
     }
+}
+
+/// A batch committed through Raft, and how it got there.
+struct Committed {
+    results: Vec<CommandResult>,
+    leader: Option<NodeId>,
+    forwarded: bool,
+    index: u64,
 }
 
 /// Group commit for the Raft write path: commands queue up while the
@@ -904,13 +1033,31 @@ impl Inner {
     }
 
     async fn place(self: Arc<Self>, id: ChunkId, data: Bytes) -> kosha_engine::Result<u64> {
+        let start_ms = flows::now_ms();
+        let len = data.len() as u64;
         let ranked = rank_voters(&self, &id);
         if let Some(layout) = self.ec_layout(data.len(), ranked.len()) {
-            return self.place_shards(id, data, layout).await;
+            let (stored, shards) = self.place_shards(id, data, layout).await?;
+            self.flows.record_chunk(
+                id,
+                ChunkTrace {
+                    id: id.to_hex(),
+                    len,
+                    stored,
+                    replicas: vec![],
+                    failed: vec![],
+                    shards,
+                    layout: Some(layout.to_string()),
+                    start_ms,
+                    end_ms: flows::now_ms(),
+                },
+            );
+            return Ok(stored);
         }
         let want = self.cfg.replication.clamp(1, ranked.len().max(1));
         let mut stored = 0u64;
         let mut ok = 0usize;
+        let (mut replicas, mut failed) = (Vec::new(), Vec::new());
         // Write the preferred replicas in parallel, then fall back down the
         // ranking for any that failed.
         let first = futures::future::join_all(
@@ -920,13 +1067,17 @@ impl Inner {
                 .map(|n| self.store_replica(n, id, data.clone())),
         )
         .await;
-        for r in first {
+        for (r, n) in first.into_iter().zip(&ranked) {
             match r {
                 Ok(s) => {
                     ok += 1;
                     stored = stored.max(s);
+                    replicas.push(n.0);
                 }
-                Err(e) => tracing::warn!(error = %e, "replica write failed, trying next node"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "replica write failed, trying next node");
+                    failed.push(n.0);
+                }
             }
         }
         for n in ranked.iter().skip(want) {
@@ -937,10 +1088,28 @@ impl Inner {
                 Ok(s) => {
                     ok += 1;
                     stored = stored.max(s);
+                    replicas.push(n.0);
                 }
-                Err(e) => tracing::warn!(error = %e, "fallback replica write failed"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "fallback replica write failed");
+                    failed.push(n.0);
+                }
             }
         }
+        self.flows.record_chunk(
+            id,
+            ChunkTrace {
+                id: id.to_hex(),
+                len,
+                stored,
+                replicas,
+                failed,
+                shards: vec![],
+                layout: None,
+                start_ms,
+                end_ms: flows::now_ms(),
+            },
+        );
         if ok < want {
             return Err(kosha_engine::Error::Internal(format!(
                 "stored {ok} of {want} replicas for chunk {}",
