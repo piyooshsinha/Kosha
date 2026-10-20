@@ -349,6 +349,13 @@ async fn handle(st: Arc<AppState>, req: Request) -> S3Result<Response> {
     let raw_path = parts.uri.path().to_string();
 
     if raw_path == "/_kosha/health" {
+        if st.cfg.cluster.as_ref().is_some_and(|c| c.removed()) {
+            return Ok((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "removed from the cluster\n",
+            )
+                .into_response());
+        }
         return Ok((StatusCode::OK, "ok\n").into_response());
     }
     if raw_path == "/_kosha/metrics" && st.cfg.metrics_public {

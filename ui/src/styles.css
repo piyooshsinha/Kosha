@@ -353,6 +353,14 @@ label {
   overflow: hidden;
 }
 
+.removed-card {
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--line, transparent));
+}
+
+.removed-card h2 {
+  color: var(--danger);
+}
+
 .error-box {
   border: 1px solid color-mix(in srgb, var(--danger) 40%, transparent);
   background: color-mix(in srgb, var(--danger) 10%, transparent);

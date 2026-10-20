@@ -69,6 +69,42 @@ kosha --node-id 3 --cluster-listen 10.0.0.3:9100 --join 10.0.0.1:9100`}</pre>
     );
   }
 
+  if (status.removed) {
+    const others = (status.nodes ?? []).filter((n) => n.id !== status.node_id && n.api);
+    return (
+      <>
+        <header className="page-head">
+          <div>
+            <h1>Cluster</h1>
+            <p className="muted">This console is served by node {status.node_id}.</p>
+          </div>
+        </header>
+        <div className="card removed-card">
+          <h2>Node {status.node_id} was removed from the cluster</h2>
+          <p>
+            It no longer stores data or votes, refuses S3 requests and reports itself unhealthy, so load balancers skip
+            it. The remaining nodes elected their own leader and keep serving.
+          </p>
+          {others.length > 0 && (
+            <p>
+              Open the console on a member:{" "}
+              {others.map((n, i) => (
+                <span key={n.id}>
+                  {i > 0 && " · "}
+                  <a href={`${location.protocol}//${n.api}/_kosha/ui/#/cluster`}>node {n.id}</a>
+                </span>
+              ))}
+            </p>
+          )}
+          <p className="fine">
+            To bring it back, keep it running and enter its cluster address under Add a node on a member&rsquo;s console.
+            To retire it, stop its process.
+          </p>
+        </div>
+      </>
+    );
+  }
+
   const nodes = status.nodes ?? [];
   const voters = nodes.filter((n) => n.voter).length;
   const quorum = Math.floor(voters / 2) + 1;

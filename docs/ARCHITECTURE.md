@@ -256,6 +256,20 @@ log, so while it runs it can be added back the same way.
 
 Every S3 response carries `x-kosha-node: <id>`, the node that served it.
 
+A removed node has to find out it was removed. A removed leader commits the
+entry itself, so its own membership no longer lists it. A removed follower
+never receives that entry (replication to it stops first), so it would wait
+for a leader forever and call elections nobody answers. Every node therefore
+checks every 2 seconds: if its own membership omits it, it is removed; if it
+follows a leader, it is not; with no leader, it asks the other members it
+knows for `/cluster/info`, and the first one that follows a leader decides
+by whether it still lists this node. Unreachable peers decide nothing, so a
+partitioned node is never mistaken for a removed one. A removed node turns
+off elections (openraft's runtime `elect` switch), fails S3 requests at once
+with `503`, answers `503` on `/_kosha/health` and skips background repair.
+Added back, it receives the new membership from the leader, follows it again
+and turns elections back on.
+
 `DELETE /_kosha/cluster/nodes/{id}` (SigV4) and the console's **Remove**
 button work from any node: a follower forwards the request to the leader.
 The leader refuses non-voters and refuses to remove the last voter. After

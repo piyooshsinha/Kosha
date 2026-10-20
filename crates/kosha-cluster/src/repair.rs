@@ -333,7 +333,7 @@ pub(crate) fn spawn(
         loop {
             tick.tick().await;
             let Some(inner) = inner.upgrade() else { return };
-            if inner.raft.is_initialized().await.unwrap_or(false) {
+            if inner.raft.is_initialized().await.unwrap_or(false) && !inner.is_removed() {
                 inner.repair_round().await;
             }
             drop::<Arc<Inner>>(inner);

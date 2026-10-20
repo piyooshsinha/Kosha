@@ -140,6 +140,8 @@ pub(crate) struct Inner {
     pub lease: lease::ReadLease,
     pub repair_stats: repair::RepairStats,
     pub flows: flows::FlowLog,
+    /// Set once this node learns it is no longer in the membership.
+    pub removed: std::sync::atomic::AtomicBool,
 }
 
 /// A running cluster member.
@@ -148,6 +150,7 @@ pub struct Cluster {
     inner: Arc<Inner>,
     server: Arc<tokio::task::JoinHandle<()>>,
     repairer: Option<Arc<tokio::task::JoinHandle<()>>>,
+    watcher: Arc<tokio::task::JoinHandle<()>>,
 }
 
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -217,7 +220,9 @@ impl Cluster {
             lease: lease::ReadLease::new(cfg.lease_reads, cfg.election_timeout_ms.0),
             repair_stats: Default::default(),
             flows: Default::default(),
+            removed: Default::default(),
         });
+        let watcher = Arc::new(spawn_membership_watch(Arc::downgrade(&inner)));
         let repairer = cfg
             .repair_interval
             .map(|every| Arc::new(repair::spawn(Arc::downgrade(&inner), every)));
@@ -258,6 +263,7 @@ impl Cluster {
             inner,
             server: Arc::new(server),
             repairer,
+            watcher,
         })
     }
 
@@ -517,6 +523,11 @@ impl Cluster {
         }
     }
 
+    /// Whether this node was removed from the cluster (and not added back).
+    pub fn is_removed(&self) -> bool {
+        self.inner.is_removed()
+    }
+
     pub fn status(&self) -> ClusterStatus {
         status(&self.inner)
     }
@@ -639,11 +650,113 @@ impl Cluster {
     /// Stop Raft and the internal endpoint (simulates a node failure in tests).
     pub async fn shutdown(&self) {
         self.server.abort();
+        self.watcher.abort();
         if let Some(r) = &self.repairer {
             r.abort();
         }
         let _ = self.inner.raft.shutdown().await;
     }
+}
+
+// -------------------------------------------------------------- membership
+
+/// How often a node without a leader asks its peers whether it is still a
+/// member.
+const MEMBERSHIP_CHECK: Duration = Duration::from_secs(2);
+
+impl Inner {
+    pub(crate) fn is_removed(&self) -> bool {
+        self.removed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Fail fast on a removed node instead of waiting for a leader that
+    /// will never answer it.
+    fn check_member(&self) -> kosha_engine::Result<()> {
+        if self.is_removed() {
+            return Err(kosha_engine::Error::Unavailable(format!(
+                "node {} was removed from the cluster; send requests to another node",
+                self.cfg.node_id
+            )));
+        }
+        Ok(())
+    }
+
+    fn set_removed(&self, removed: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.removed.swap(removed, Relaxed) == removed {
+            return;
+        }
+        // A removed follower never sees the entry that removed it and would
+        // otherwise call elections forever.
+        self.raft.runtime_config().elect(!removed);
+        if removed {
+            tracing::warn!(
+                node = self.cfg.node_id,
+                "this node was removed from the cluster: it refuses requests and calls no elections until it is added back"
+            );
+        } else {
+            tracing::info!(
+                node = self.cfg.node_id,
+                "this node is a cluster member again"
+            );
+        }
+    }
+
+    /// Decide whether this node is still a member. A removed leader sees its
+    /// removal in its own log; a removed follower does not, so when it has
+    /// no leader it asks the members it knows: one that follows a leader
+    /// and no longer lists this node settles it. Unreachable peers (a
+    /// partition) change nothing.
+    async fn check_membership(&self) {
+        let id = self.cfg.node_id;
+        let (peers, has_leader, listed) = {
+            let m = self.raft.metrics().borrow().clone();
+            let membership = m.membership_config.membership();
+            if membership.nodes().next().is_none() {
+                return; // not initialized yet
+            }
+            let peers: Vec<String> = membership
+                .nodes()
+                .filter(|(n, _)| **n != id)
+                .map(|(_, n)| n.addr.clone())
+                .collect();
+            (
+                peers,
+                m.current_leader.is_some(),
+                membership.get_node(&id).is_some(),
+            )
+        };
+        if !listed {
+            return self.set_removed(true);
+        }
+        if has_leader {
+            return self.set_removed(false);
+        }
+        for addr in peers {
+            let Ok(info) = self
+                .client
+                .call::<_, NodeInfo>(&addr, "/cluster/info", &(), Duration::from_secs(1))
+                .await
+            else {
+                continue;
+            };
+            if info.leader.is_some() {
+                return self.set_removed(!info.members.iter().any(|(n, _)| *n == id));
+            }
+        }
+    }
+}
+
+fn spawn_membership_watch(inner: std::sync::Weak<Inner>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(MEMBERSHIP_CHECK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let Some(inner) = inner.upgrade() else { return };
+            inner.check_membership().await;
+        }
+    })
 }
 
 // ------------------------------------------------------------------ status
@@ -662,6 +775,9 @@ pub struct NodeStatus {
 pub struct ClusterStatus {
     pub node_id: NodeId,
     pub state: String,
+    /// This node holds cluster state but is no longer a member: it refuses
+    /// requests and calls no elections until it is added back.
+    pub removed: bool,
     pub term: u64,
     pub leader: Option<NodeId>,
     pub last_log_index: Option<u64>,
@@ -729,6 +845,7 @@ fn status(inner: &Inner) -> ClusterStatus {
     ClusterStatus {
         node_id: m.id,
         state: match m.state {
+            _ if inner.is_removed() => "removed",
             ServerState::Leader => "leader",
             ServerState::Follower => "follower",
             ServerState::Candidate => "candidate",
@@ -736,8 +853,9 @@ fn status(inner: &Inner) -> ClusterStatus {
             ServerState::Shutdown => "shutdown",
         }
         .into(),
+        removed: inner.is_removed(),
         term: m.current_term,
-        leader: m.current_leader,
+        leader: m.current_leader.filter(|_| !inner.is_removed()),
         last_log_index: m.last_log_index,
         last_applied: m.last_applied.map(|l| l.index),
         snapshot_index: m.snapshot.map(|l| l.index),
@@ -867,6 +985,7 @@ impl Inner {
     }
 
     async fn propose_batch_inner(&self, cmds: Vec<Command>) -> kosha_engine::Result<Committed> {
+        self.check_member()?;
         // Ids are fixed before the first attempt: every retry below re-sends
         // the same ids, so a batch the leader already committed is not
         // applied twice.
@@ -936,6 +1055,7 @@ impl Inner {
     }
 
     async fn read_barrier(&self) -> kosha_engine::Result<()> {
+        self.check_member()?;
         let mut last = String::from("no leader");
         let deadline = tokio::time::Instant::now() + QUORUM_DEADLINE;
         for attempt in 0..RETRIES {

@@ -56,6 +56,11 @@ pub trait ClusterHooks: Send + Sync + 'static {
     /// their data went, merged across members.
     /// `limit` caps the flows returned (0: only the members' reachability).
     fn flows(&self, limit: usize) -> futures::future::BoxFuture<'static, serde_json::Value>;
+    /// True once this node was removed from the cluster: `/_kosha/health`
+    /// then answers 503 so load balancers stop sending it traffic.
+    fn removed(&self) -> bool {
+        false
+    }
     /// Extra Prometheus series appended to `/_kosha/metrics`.
     fn prometheus(&self) -> String {
         String::new()

@@ -724,13 +724,32 @@ Things to know:
   call `DELETE /_kosha/cluster/nodes/<id>` (SigV4-signed) on any node. Its
   data is re-replicated in the background. Stop the process afterwards, or
   add it back later with **Add a node** while it still runs.
+- **A removed node** notices within a few seconds, even if it was a
+  follower that never saw its own removal (it asks its peers). It then
+  stops calling elections, answers S3 requests with an immediate `503`
+  ("node N was removed from the cluster"), reports `503` on
+  `/_kosha/health`, and its console says so and links to the members.
+  The remaining nodes elect their own leader and keep serving.
 - Every add and remove is logged on the node that received it, with the
   access key, the client address and any `X-Forwarded-For`
   (`cluster membership: node removed node=3 key="admin" source=…`).
 - **Which node am I talking to?** Clients don't need to know: every node
   serves every request, so put the nodes behind one address (a load
-  balancer or DNS name) and let it pick a live one. Every response carries
-  `x-kosha-node: <id>`, so you can see which node served a request
+  balancer or DNS name) and let it pick a live one. Have the load
+  balancer check `/_kosha/health` so it also skips nodes that were
+  removed, for example with Caddy:
+
+  ```
+  reverse_proxy 10.0.0.1:9000 10.0.0.2:9000 10.0.0.3:9000 {
+      lb_policy first
+      health_uri /_kosha/health
+      health_interval 5s
+      fail_duration 10s
+      flush_interval -1
+  }
+  ```
+
+  Every response carries `x-kosha-node: <id>`, so you can see which node served a request
   (`curl -sI http://<server>:9000/_kosha/health | grep x-kosha-node`), and
   the console's Data flow page shows which node received each write.
 - Internal traffic (port 9100) is authenticated by the shared secret. Without
@@ -815,7 +834,7 @@ curl -X DELETE --aws-sigv4 "aws:amz:us-east-1:s3" --user admin:admin-secret-key 
 
 | Endpoint | Auth | Returns |
 |---|---|---|
-| `GET /_kosha/health` | none | `ok`, for load balancer and liveness probes |
+| `GET /_kosha/health` | none | `ok`, for load balancer and liveness probes; `503` on a node that was removed from the cluster |
 | `GET /_kosha/stats` | SigV4 | objects, logical/unique/physical bytes, dedup and compression ratios, I/O backend |
 | `GET /_kosha/metrics` | SigV4, or none with `--metrics-public` | Prometheus: requests and latency histograms per S3 operation, bytes in/out, storage gauges, group commit/sync batching, Raft state, follower lag, lease/quorum reads, repair counters, pending/delivered/failed events |
 | `GET /_kosha/cluster` | SigV4 | role, term, leader, log/applied indexes, members, replication progress, lease vs quorum reads, background repair counters |

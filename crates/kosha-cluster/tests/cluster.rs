@@ -699,3 +699,67 @@ async fn add_node_by_address_and_back_after_removal() {
     assert!(err.contains("another cluster"), "{err}");
     assert!(a.cluster.add_node("127.0.0.1:1").await.is_err());
 }
+
+async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while !cond() {
+        assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removed_nodes_know_they_were_removed() {
+    let nodes = three_nodes().await;
+    nodes[0].engine.create_bucket("bkt").await.unwrap();
+    let leader = nodes[0].cluster.status().leader.unwrap();
+    let follower = (1..=3).find(|id| *id != leader).unwrap();
+    let n = |id: u64| &nodes[id as usize - 1];
+
+    // A removed follower never receives the entry that removed it; it finds
+    // out from its peers, stops calling elections and fails fast.
+    n(leader).cluster.remove_node(follower).await.unwrap();
+    wait_until("follower sees its removal", || {
+        n(follower).cluster.is_removed()
+    })
+    .await;
+    let term = n(follower).cluster.status().term;
+    let started = std::time::Instant::now();
+    let err = n(follower)
+        .engine
+        .create_bucket("refused")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("was removed"), "{err}");
+    assert!(started.elapsed() < Duration::from_secs(1));
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        n(follower).cluster.status().term,
+        term,
+        "removed node kept electing"
+    );
+    assert_eq!(n(follower).cluster.status().state, "removed");
+    put(&n(leader).engine, "bkt", "k1", b"members still write").await;
+
+    // Added back, it is a member again.
+    n(leader).cluster.add_node(&n(follower).addr).await.unwrap();
+    wait_until("follower rejoins", || !n(follower).cluster.is_removed()).await;
+    put(&n(follower).engine, "bkt", "k2", b"rejoined").await;
+
+    // A removed leader sees its removal in its own log; the others elect a
+    // new leader and keep serving.
+    n(leader).cluster.remove_node(leader).await.unwrap();
+    wait_until("leader sees its removal", || n(leader).cluster.is_removed()).await;
+    let survivor = (1..=3).find(|id| *id != leader).unwrap();
+    wait_until("new leader", || {
+        n(survivor)
+            .cluster
+            .status()
+            .leader
+            .is_some_and(|l| l != leader)
+    })
+    .await;
+    put(&n(survivor).engine, "bkt", "k3", b"after the leader left").await;
+    assert!(n(leader).engine.create_bucket("refused").await.is_err());
+}

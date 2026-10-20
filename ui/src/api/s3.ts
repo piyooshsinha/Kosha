@@ -55,6 +55,8 @@ export interface ClusterStatus {
   mode?: "single-node";
   node_id?: number;
   state?: string;
+  /** This node was removed from the cluster and has not been added back. */
+  removed?: boolean;
   term?: number;
   leader?: number | null;
   last_log_index?: number | null;

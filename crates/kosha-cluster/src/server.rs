@@ -179,15 +179,16 @@ async fn join(State(inner): St, body: Bytes) -> Response {
 }
 
 async fn node_info(State(inner): St) -> Response {
-    let members = inner
-        .raft
-        .metrics()
-        .borrow()
-        .membership_config
-        .membership()
-        .nodes()
-        .map(|(id, n)| (*id, n.addr.clone()))
-        .collect();
+    let (members, leader) = {
+        let m = inner.raft.metrics().borrow().clone();
+        let members = m
+            .membership_config
+            .membership()
+            .nodes()
+            .map(|(id, n)| (*id, n.addr.clone()))
+            .collect();
+        (members, m.current_leader)
+    };
     msgpack(&NodeInfo {
         id: inner.cfg.node_id,
         node: KoshaNode {
@@ -198,6 +199,7 @@ async fn node_info(State(inner): St) -> Response {
         erasure: inner.cfg.erasure,
         initialized: inner.raft.is_initialized().await.unwrap_or(false),
         members,
+        leader,
     })
 }
 

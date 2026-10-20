@@ -57,6 +57,9 @@ pub struct NodeInfo {
     /// cluster address) of its last known membership.
     pub initialized: bool,
     pub members: Vec<(NodeId, String)>,
+    /// The leader this node currently follows, if any.
+    #[serde(default)]
+    pub leader: Option<NodeId>,
 }
 
 #[derive(Clone)]

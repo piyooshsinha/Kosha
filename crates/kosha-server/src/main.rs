@@ -272,6 +272,10 @@ impl ClusterHooks for Hooks {
         Box::pin(async move { c.add_node(&addr).await.map_err(|e| e.to_string()) })
     }
 
+    fn removed(&self) -> bool {
+        self.0.is_removed()
+    }
+
     fn prometheus(&self) -> String {
         self.0.prometheus()
     }
