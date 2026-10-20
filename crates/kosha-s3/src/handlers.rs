@@ -163,6 +163,9 @@ pub async fn dispatch(State(st): State<Arc<AppState>>, req: Request) -> Response
         HeaderValue::from_str(&request_id).unwrap(),
     );
     h.insert(header::SERVER, HeaderValue::from_static("Kosha"));
+    if let Some(c) = &metrics_st.cfg.cluster {
+        h.insert("x-kosha-node", HeaderValue::from(c.node_id()));
+    }
     let elapsed = started.elapsed();
     let bytes_out = if is_head {
         0
@@ -436,6 +439,32 @@ async fn handle(st: Arc<AppState>, req: Request) -> S3Result<Response> {
             None => serde_json::json!({ "mode": "single-node" }),
         };
         return Ok(axum::Json(body).into_response());
+    }
+    if raw_path == "/_kosha/cluster/nodes" {
+        if parts.method != Method::POST {
+            return Err(S3Error::new(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "MethodNotAllowed",
+                "use POST to add a node",
+            ));
+        }
+        let Some(cluster) = &st.cfg.cluster else {
+            return Err(S3Error::invalid_request(
+                "this server is not part of a cluster",
+            ));
+        };
+        let req = crate::admin::read_json(body, payload, &parts.headers).await?;
+        let addr = crate::admin::str_field(&req, "address")?
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .ok_or_else(|| {
+                S3Error::invalid_argument("address (the new node's cluster host:port) is required")
+            })?;
+        let id = cluster
+            .add_node(addr.to_string())
+            .await
+            .map_err(|e| S3Error::new(StatusCode::CONFLICT, "InvalidRequest", e))?;
+        return Ok(axum::Json(serde_json::json!({ "id": id })).into_response());
     }
     if let Some(id) = raw_path.strip_prefix("/_kosha/cluster/nodes/") {
         if parts.method != Method::DELETE {

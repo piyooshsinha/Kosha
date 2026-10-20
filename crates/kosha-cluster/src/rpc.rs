@@ -46,6 +46,19 @@ pub struct JoinRequest {
     pub erasure: Option<crate::erasure::Layout>,
 }
 
+/// What a node reports about itself before it is added to a cluster.
+#[derive(Debug, Serialize, serde::Deserialize)]
+pub struct NodeInfo {
+    pub id: NodeId,
+    pub node: KoshaNode,
+    pub encryption: Option<String>,
+    pub erasure: Option<crate::erasure::Layout>,
+    /// Whether the node already has cluster state, and the members (id and
+    /// cluster address) of its last known membership.
+    pub initialized: bool,
+    pub members: Vec<(NodeId, String)>,
+}
+
 #[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,

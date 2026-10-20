@@ -240,7 +240,21 @@ uploads are safe. Tests cover both directions with exact counts:
 `repair_restores_replicas_after_a_node_dies` and
 `repair_removes_surplus_replicas`.
 
-## Removing nodes
+## Adding and removing nodes
+
+`POST /_kosha/cluster/nodes` with `{"address": "host:port"}` (and the
+console's **Add a node**) admits a running node by its cluster address. The
+receiving node calls the new node's `/cluster/info`, which reports its id,
+advertised addresses, encryption key fingerprint, erasure layout and, if it
+already has Raft state, the members it last knew. The request is refused if
+the id is already a voter, or if the node holds state from a different
+cluster (none of its known members match ours by id and address). Otherwise
+it goes through the same path as `--join`: the leader checks the encryption
+and erasure settings, adds the node as a learner, waits for it to catch up
+and promotes it to voter. A node removed earlier still holds this cluster's
+log, so while it runs it can be added back the same way.
+
+Every S3 response carries `x-kosha-node: <id>`, the node that served it.
 
 `DELETE /_kosha/cluster/nodes/{id}` (SigV4) and the console's **Remove**
 button work from any node: a follower forwards the request to the leader.

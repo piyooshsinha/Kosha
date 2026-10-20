@@ -285,6 +285,11 @@ export class S3 {
     return (await this.request("GET", "/_kosha/stats")).json();
   }
 
+  /** Admit a running node by its cluster address (host:port). Returns its id. */
+  async addNode(address: string): Promise<number> {
+    return (await (await this.json("POST", "/_kosha/cluster/nodes", { address })).json()).id;
+  }
+
   async removeNode(id: number) {
     await this.request("DELETE", `/_kosha/cluster/nodes/${id}`);
   }

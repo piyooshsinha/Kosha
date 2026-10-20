@@ -17,7 +17,7 @@ use openraft::raft::{AppendEntriesRequest, InstallSnapshotRequest, VoteRequest};
 use serde::Deserialize;
 
 use crate::Inner;
-use crate::rpc::{JoinRequest, LeaderReply, Proposed, SECRET_HEADER, decode, encode};
+use crate::rpc::{JoinRequest, LeaderReply, NodeInfo, Proposed, SECRET_HEADER, decode, encode};
 use crate::types::*;
 
 type St = State<Arc<Inner>>;
@@ -33,6 +33,7 @@ pub fn router(inner: Arc<Inner>) -> Router {
         .route("/cluster/status", get(cluster_status))
         .route("/cluster/remove", post(remove))
         .route("/cluster/update-node", post(update_node))
+        .route("/cluster/info", post(node_info))
         .route(
             "/cluster/flows",
             post(|State(inner): St, body: Bytes| async move {
@@ -175,6 +176,29 @@ async fn join(State(inner): St, body: Bytes) -> Response {
         }
         Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
     }
+}
+
+async fn node_info(State(inner): St) -> Response {
+    let members = inner
+        .raft
+        .metrics()
+        .borrow()
+        .membership_config
+        .membership()
+        .nodes()
+        .map(|(id, n)| (*id, n.addr.clone()))
+        .collect();
+    msgpack(&NodeInfo {
+        id: inner.cfg.node_id,
+        node: KoshaNode {
+            addr: inner.cfg.advertise.clone(),
+            api: inner.cfg.api_addr.clone(),
+        },
+        encryption: inner.engine.encryption_fingerprint().map(str::to_string),
+        erasure: inner.cfg.erasure,
+        initialized: inner.raft.is_initialized().await.unwrap_or(false),
+        members,
+    })
 }
 
 /// Replace a member's advertised API address. The cluster address is left

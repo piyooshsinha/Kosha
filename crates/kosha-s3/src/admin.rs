@@ -71,7 +71,11 @@ fn policy_from(v: &Value) -> S3Result<Option<String>> {
     Ok(Some(doc))
 }
 
-async fn read_json(body: Body, payload: Payload, headers: &HeaderMap) -> S3Result<Value> {
+pub(crate) async fn read_json(
+    body: Body,
+    payload: Payload,
+    headers: &HeaderMap,
+) -> S3Result<Value> {
     let raw = BodySource::new(body, payload, headers)?
         .collect(MAX_BODY)
         .await?;
@@ -82,7 +86,7 @@ async fn read_json(body: Body, payload: Payload, headers: &HeaderMap) -> S3Resul
         .map_err(|e| S3Error::invalid_argument(format!("body is not valid JSON: {e}")))
 }
 
-fn str_field<'a>(v: &'a Value, name: &str) -> S3Result<Option<&'a str>> {
+pub(crate) fn str_field<'a>(v: &'a Value, name: &str) -> S3Result<Option<&'a str>> {
     match v.get(name) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) => Ok(Some(s)),

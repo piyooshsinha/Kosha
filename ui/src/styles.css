@@ -828,7 +828,8 @@ label {
 
 /* ------------------------------------------------------------ data flow */
 
-.test-write {
+.test-write,
+.add-node {
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -836,13 +837,23 @@ label {
   flex-wrap: wrap;
 }
 
-.test-write h2 {
+.test-write h2,
+.add-node h2 {
   margin-bottom: 2px;
 }
 
-.test-write p {
+.test-write p,
+.add-node p {
   margin: 0;
   max-width: 520px;
+}
+
+.add-node {
+  margin-top: 16px;
+}
+
+.add-node input {
+  min-width: 220px;
 }
 
 .flow-layout {

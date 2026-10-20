@@ -6,6 +6,8 @@ import { ClusterMap, type MapNode } from "./ClusterMap.tsx";
 export function ClusterView({ s3, toast }: { s3: S3; toast: PushToast }) {
   const [status, setStatus] = useState<ClusterStatus | null>(null);
   const [removing, setRemoving] = useState<number | null>(null);
+  const [newAddr, setNewAddr] = useState("");
+  const [adding, setAdding] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [updated, setUpdated] = useState<Date | null>(null);
   // Which members answered a direct probe (the leader keeps a stopped
@@ -81,7 +83,7 @@ kosha --node-id 3 --cluster-listen 10.0.0.3:9100 --join 10.0.0.1:9100`}</pre>
       id === status!.node_id
         ? `Remove node ${id} — the node serving this console — from the cluster?`
         : `Remove node ${id} from the cluster?`;
-    if (!confirm(`${warn}\n\nIts chunks will be re-replicated to the remaining nodes. Stop the process after removal.`)) return;
+    if (!confirm(`${warn}\n\nIts chunks will be re-replicated to the remaining nodes. While its process runs, you can add it back with Add a node.`)) return;
     setRemoving(id);
     try {
       await s3.removeNode(id);
@@ -90,6 +92,19 @@ kosha --node-id 3 --cluster-listen 10.0.0.3:9100 --join 10.0.0.1:9100`}</pre>
       toast("error", (e as Error).message);
     } finally {
       setRemoving(null);
+    }
+  }
+  async function add(e: React.FormEvent) {
+    e.preventDefault();
+    setAdding(true);
+    try {
+      const id = await s3.addNode(newAddr.trim());
+      toast("ok", `Node ${id} added; it catches up in the background`);
+      setNewAddr("");
+    } catch (err) {
+      toast("error", (err as Error).message);
+    } finally {
+      setAdding(false);
     }
   }
   const leaderNode = nodes.find((n) => n.id === status.leader);
@@ -225,6 +240,28 @@ kosha --node-id 3 --cluster-listen 10.0.0.3:9100 --join 10.0.0.1:9100`}</pre>
             })}
           </tbody>
         </table>
+      </div>
+      <div className="card add-node">
+        <div>
+          <h2>Add a node</h2>
+          <p className="fine">
+            Start Kosha on the new machine with this cluster&rsquo;s secret, its own node id and no <code>--init</code> or <code>--join</code>,
+            then enter the address of its cluster port. A removed node that is still running can be added back the same
+            way.
+          </p>
+        </div>
+        <form className="inline-form" onSubmit={add}>
+          <input
+            value={newAddr}
+            onChange={(e) => setNewAddr(e.target.value)}
+            placeholder="host:9100"
+            aria-label="New node's cluster address"
+            spellCheck={false}
+          />
+          <button className="primary" disabled={adding || !newAddr.trim()}>
+            {adding ? "Adding…" : "Add node"}
+          </button>
+        </form>
       </div>
       {!isLeader && leaderNode?.api && (
         <p className="fine">

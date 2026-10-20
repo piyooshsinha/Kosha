@@ -45,8 +45,13 @@ pub struct S3Config {
 pub trait ClusterHooks: Send + Sync + 'static {
     /// JSON served at `GET /_kosha/cluster`.
     fn status(&self) -> serde_json::Value;
+    /// This node's id, sent on every response as `x-kosha-node`.
+    fn node_id(&self) -> u64;
     /// `DELETE /_kosha/cluster/nodes/{id}`. `Err` carries a user-facing reason.
     fn remove_node(&self, id: u64) -> futures::future::BoxFuture<'static, Result<(), String>>;
+    /// `POST /_kosha/cluster/nodes` with `{"address": "host:port"}`: admit a
+    /// running node by its cluster address. Returns its id.
+    fn add_node(&self, addr: String) -> futures::future::BoxFuture<'static, Result<u64, String>>;
     /// JSON served at `GET /_kosha/cluster/flows`: recent writes and where
     /// their data went, merged across members.
     /// `limit` caps the flows returned (0: only the members' reachability).

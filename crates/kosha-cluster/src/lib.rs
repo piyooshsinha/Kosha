@@ -46,7 +46,7 @@ use serde::Serialize;
 
 pub use crate::erasure::Layout as ErasureLayout;
 pub use crate::repair::RepairReport;
-use crate::rpc::{Client, JoinRequest, LeaderReply, Proposed};
+use crate::rpc::{Client, JoinRequest, LeaderReply, NodeInfo, Proposed};
 use crate::types::*;
 pub use crate::types::{CommandBatch, KoshaNode, NodeId};
 
@@ -309,6 +309,58 @@ impl Cluster {
                 .map(str::to_string),
             erasure: self.inner.cfg.erasure,
         };
+        self.send_join(seed, &req).await?;
+        tracing::info!(node = self.node_id(), "joined cluster");
+        Ok(())
+    }
+
+    /// Admit a running node that is not a member yet, given the address of
+    /// its internal cluster endpoint (`host:port`). It must share this
+    /// cluster's secret, encryption key and erasure layout; a node that holds
+    /// another cluster's state is refused. Returns the node's id.
+    pub async fn add_node(&self, addr: &str) -> Result<NodeId, ClusterError> {
+        let info: NodeInfo = self
+            .inner
+            .client
+            .call(addr, "/cluster/info", &(), FORWARD_TIMEOUT)
+            .await
+            .map_err(|e| ClusterError::Join(format!("cannot reach a Kosha node at {addr}: {e}")))?;
+        let membership = self
+            .inner
+            .raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .clone();
+        if membership.voter_ids().any(|id| id == info.id) {
+            return Err(ClusterError::Join(format!(
+                "node {} is already a member",
+                info.id
+            )));
+        }
+        let ours =
+            |(id, a): &(NodeId, String)| membership.get_node(id).is_some_and(|n| &n.addr == a);
+        if info.initialized && !info.members.iter().any(ours) {
+            return Err(ClusterError::Join(format!(
+                "node {} at {addr} belongs to another cluster; start it with an empty data directory",
+                info.id
+            )));
+        }
+        let req = JoinRequest {
+            id: info.id,
+            node: info.node,
+            encryption: info.encryption,
+            erasure: info.erasure,
+        };
+        self.send_join(&self.inner.cfg.advertise.clone(), &req)
+            .await?;
+        tracing::info!(node = info.id, %addr, "added node to the cluster");
+        Ok(info.id)
+    }
+
+    /// Send a join request to `seed`, following redirects to the leader.
+    async fn send_join(&self, seed: &str, req: &JoinRequest) -> Result<(), ClusterError> {
         let mut target = seed.to_string();
         let mut last_err = String::new();
         for attempt in 0..RETRIES {
@@ -318,15 +370,12 @@ impl Cluster {
                 .call::<_, LeaderReply<Result<(), String>>>(
                     &target,
                     "/cluster/join",
-                    &req,
+                    req,
                     FORWARD_TIMEOUT,
                 )
                 .await
             {
-                Ok(LeaderReply::Ok(Ok(()))) => {
-                    tracing::info!(node = self.node_id(), "joined cluster");
-                    return Ok(());
-                }
+                Ok(LeaderReply::Ok(Ok(()))) => return Ok(()),
                 Ok(LeaderReply::Ok(Err(refused))) => return Err(ClusterError::Join(refused)),
                 Ok(LeaderReply::NotLeader(Some((_, leader)))) => target = leader.addr,
                 Ok(LeaderReply::NotLeader(None)) => last_err = "no leader elected yet".into(),

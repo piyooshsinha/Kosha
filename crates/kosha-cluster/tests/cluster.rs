@@ -640,3 +640,62 @@ async fn restart_with_a_new_api_address_updates_membership() {
     )
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn add_node_by_address_and_back_after_removal() {
+    let a = start_node(1).await;
+    let b = start_node(2).await;
+    a.cluster.initialize().await.unwrap();
+    a.cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
+    a.engine.create_bucket("bkt").await.unwrap();
+    put(&a.engine, "bkt", "before", &data(50_000, 1)).await;
+
+    // Node 2 runs with no cluster state; an admin adds it by address.
+    assert_eq!(a.cluster.add_node(&b.addr).await.unwrap(), 2);
+    b.cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert_eq!(get(&b.engine, "bkt", "before").await, data(50_000, 1));
+    let voter = |id| {
+        a.cluster
+            .status()
+            .nodes
+            .iter()
+            .any(|n| n.id == id && n.voter)
+    };
+    assert!(voter(2));
+    let err = a.cluster.add_node(&b.addr).await.unwrap_err().to_string();
+    assert!(err.contains("already a member"), "{err}");
+
+    // Removed while still running, it can be added back.
+    a.cluster.remove_node(2).await.unwrap();
+    assert!(!voter(2));
+    put(&a.engine, "bkt", "during", b"written while node 2 was out").await;
+    assert_eq!(a.cluster.add_node(&b.addr).await.unwrap(), 2);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if voter(2) && b.engine.head_object("bkt", "during").await.is_ok() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "node 2 did not rejoin"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // A node from another cluster is refused.
+    let c = start_node(3).await;
+    c.cluster.initialize().await.unwrap();
+    c.cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
+    let err = a.cluster.add_node(&c.addr).await.unwrap_err().to_string();
+    assert!(err.contains("another cluster"), "{err}");
+    assert!(a.cluster.add_node("127.0.0.1:1").await.is_err());
+}

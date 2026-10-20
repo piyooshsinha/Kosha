@@ -281,6 +281,19 @@ tolerance, run the nodes on separate machines (see [Run a cluster](#5-run-a-clus
 Stopping one container (`docker stop kosha1`) shows a leader change and
 the stopped node as unreachable in the console.
 
+To add a fourth node on the same host, start it on the cluster's Docker
+network without `KOSHA_INIT` or `KOSHA_JOIN`, then add `kosha4:9100` under
+**Add a node** on the console's Cluster page:
+
+```sh
+set -a; . ./.env; set +a
+docker run -d --name kosha4 --restart unless-stopped --network kosha-cluster_default \
+  --security-opt seccomp=./docker/seccomp-io_uring.json -p 9003:9000 -v kosha4:/data \
+  -e KOSHA_ACCESS_KEY -e KOSHA_SECRET_KEY -e KOSHA_CLUSTER_SECRET \
+  -e KOSHA_NODE_ID=4 -e KOSHA_CLUSTER_LISTEN=0.0.0.0:9100 -e KOSHA_CLUSTER_ADVERTISE=kosha4:9100 \
+  -e KOSHA_API_ADVERTISE=${KOSHA_HOST:-127.0.0.1}:9003 kosha:latest
+```
+
 ### As a service (home server, NUC, VM)
 
 On a Linux machine with systemd (Debian, Ubuntu, Fedora or Arch), one script
@@ -601,8 +614,11 @@ URLs"). Examples for the AWS CLI, Rust, Python, curl and more are in
 - the Raft term, log and snapshot indexes, lease-read hit rate and
   background-repair counters.
 
-**Remove** takes a node out for good; its data is re-replicated to the
-others.
+**Add a node** admits a new Kosha node: start it with the cluster secret,
+its own node id and no `--init`/`--join`, then enter the address of its
+cluster port (e.g. `10.0.0.4:9100`). **Remove** takes a node out; its data
+is re-replicated to the others, and while its process still runs it can be
+added back the same way.
 
 ![Cluster page](docs/images/console-cluster.png)
 
@@ -639,7 +655,9 @@ The console follows your system's light or dark theme:
 | delete old files automatically | add a [lifecycle rule](#versioning-object-lock-and-lifecycle) |
 | move rarely read data to cheaper storage | set up the [cold tier](#cold-tier) |
 | find out whether the cluster is healthy | **Cluster**: one leader, every node reachable and in sync |
-| replace a failed node | **Cluster** → **Remove** it, then start a new node with `--join` ([Run a cluster](#5-run-a-cluster)) |
+| add capacity | start a new node, then **Cluster** → **Add a node** ([Run a cluster](#5-run-a-cluster)) |
+| replace a failed node | **Cluster** → **Remove** it, start a new node, then **Add a node** |
+| know which node served a request | every response has an `x-kosha-node` header; the Data flow page shows it per write |
 | check the server from a script | `curl http://<server>:9000/_kosha/health`, metrics in [Monitoring](#6-monitoring) |
 
 ## 5. Run a cluster
@@ -693,9 +711,25 @@ Things to know:
   `--replication` copies without waiting for reads. Surplus copies, for
   example fallback replicas written while a node was down, are removed once
   the designated nodes confirm they have theirs.
+- **Adding a node**: start it with the cluster secret, a new `--node-id` and
+  neither `--init` nor `--join`, then enter its cluster address
+  (`--cluster-listen`/`--cluster-advertise`, e.g. `10.0.0.4:9100`) under
+  **Add a node** on the console's Cluster page, or `POST
+  /_kosha/cluster/nodes` with `{"address": "10.0.0.4:9100"}`. Kosha asks the
+  node who it is, refuses one that belongs to another cluster or uses a
+  different encryption key or erasure layout, then adds it as a voter; it
+  catches up in the background. (Starting it with `--join 10.0.0.1:9100`
+  does the same without the console.)
 - **Removing a node**: click **Remove** in the console's Cluster page, or
-  call `DELETE /_kosha/cluster/nodes/<id>` (SigV4-signed) on any node. Then
-  stop that node's process. Its data is re-replicated in the background.
+  call `DELETE /_kosha/cluster/nodes/<id>` (SigV4-signed) on any node. Its
+  data is re-replicated in the background. Stop the process afterwards, or
+  add it back later with **Add a node** while it still runs.
+- **Which node am I talking to?** Clients don't need to know: every node
+  serves every request, so put the nodes behind one address (a load
+  balancer or DNS name) and let it pick a live one. Every response carries
+  `x-kosha-node: <id>`, so you can see which node served a request
+  (`curl -sI http://<server>:9000/_kosha/health | grep x-kosha-node`), and
+  the console's Data flow page shows which node received each write.
 - Internal traffic (port 9100) is authenticated by the shared secret. Without
   `--cluster-tls-*` it is plain HTTP, so **either enable mutual TLS
   ([Security](#cluster-mutual-tls)) or keep it on a private network.**
@@ -782,6 +816,7 @@ curl -X DELETE --aws-sigv4 "aws:amz:us-east-1:s3" --user admin:admin-secret-key 
 | `GET /_kosha/stats` | SigV4 | objects, logical/unique/physical bytes, dedup and compression ratios, I/O backend |
 | `GET /_kosha/metrics` | SigV4, or none with `--metrics-public` | Prometheus: requests and latency histograms per S3 operation, bytes in/out, storage gauges, group commit/sync batching, Raft state, follower lag, lease/quorum reads, repair counters, pending/delivered/failed events |
 | `GET /_kosha/cluster` | SigV4 | role, term, leader, log/applied indexes, members, replication progress, lease vs quorum reads, background repair counters |
+| `POST /_kosha/cluster/nodes` | SigV4 | adds a running node by its cluster address: `{"address": "host:9100"}` → `{"id": 4}` |
 | `DELETE /_kosha/cluster/nodes/{id}` | SigV4 | removes a voter (refuses non-voters and the last voter) |
 | `/_kosha/admin/users[/{key}]` | SigV4 | user management (see [Security](#users-and-policies)) |
 

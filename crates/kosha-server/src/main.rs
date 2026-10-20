@@ -253,6 +253,10 @@ impl ClusterHooks for Hooks {
         serde_json::to_value(self.0.status()).unwrap_or_default()
     }
 
+    fn node_id(&self) -> u64 {
+        self.0.node_id()
+    }
+
     fn flows(&self, limit: usize) -> futures::future::BoxFuture<'static, serde_json::Value> {
         let c = self.0.clone();
         Box::pin(async move { serde_json::to_value(c.flows(limit).await).unwrap_or_default() })
@@ -261,6 +265,11 @@ impl ClusterHooks for Hooks {
     fn remove_node(&self, id: u64) -> futures::future::BoxFuture<'static, Result<(), String>> {
         let c = self.0.clone();
         Box::pin(async move { c.remove_node(id).await.map_err(|e| e.to_string()) })
+    }
+
+    fn add_node(&self, addr: String) -> futures::future::BoxFuture<'static, Result<u64, String>> {
+        let c = self.0.clone();
+        Box::pin(async move { c.add_node(&addr).await.map_err(|e| e.to_string()) })
     }
 
     fn prometheus(&self) -> String {
