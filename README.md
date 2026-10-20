@@ -724,6 +724,9 @@ Things to know:
   call `DELETE /_kosha/cluster/nodes/<id>` (SigV4-signed) on any node. Its
   data is re-replicated in the background. Stop the process afterwards, or
   add it back later with **Add a node** while it still runs.
+- Every add and remove is logged on the node that received it, with the
+  access key, the client address and any `X-Forwarded-For`
+  (`cluster membership: node removed node=3 key="admin" source=…`).
 - **Which node am I talking to?** Clients don't need to know: every node
   serves every request, so put the nodes behind one address (a load
   balancer or DNS name) and let it pick a live one. Every response carries

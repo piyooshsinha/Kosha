@@ -460,11 +460,17 @@ async fn handle(st: Arc<AppState>, req: Request) -> S3Result<Response> {
             .ok_or_else(|| {
                 S3Error::invalid_argument("address (the new node's cluster host:port) is required")
             })?;
-        let id = cluster
-            .add_node(addr.to_string())
-            .await
-            .map_err(|e| S3Error::new(StatusCode::CONFLICT, "InvalidRequest", e))?;
-        return Ok(axum::Json(serde_json::json!({ "id": id })).into_response());
+        let who = Caller::of(&parts, authn.access_key.as_deref());
+        return match cluster.add_node(addr.to_string()).await {
+            Ok(id) => {
+                tracing::info!(node = id, address = addr, key = who.key, source = %who.source, forwarded_for = who.forwarded_for, "cluster membership: node added");
+                Ok(axum::Json(serde_json::json!({ "id": id })).into_response())
+            }
+            Err(e) => {
+                tracing::warn!(address = addr, key = who.key, source = %who.source, forwarded_for = who.forwarded_for, error = %e, "cluster membership: add refused");
+                Err(S3Error::new(StatusCode::CONFLICT, "InvalidRequest", e))
+            }
+        };
     }
     if let Some(id) = raw_path.strip_prefix("/_kosha/cluster/nodes/") {
         if parts.method != Method::DELETE {
@@ -482,11 +488,17 @@ async fn handle(st: Arc<AppState>, req: Request) -> S3Result<Response> {
         let id: u64 = id
             .parse()
             .map_err(|_| S3Error::invalid_argument("node id must be a number"))?;
-        cluster
-            .remove_node(id)
-            .await
-            .map_err(|e| S3Error::new(StatusCode::CONFLICT, "InvalidRequest", e))?;
-        return Ok(StatusCode::NO_CONTENT.into_response());
+        let who = Caller::of(&parts, authn.access_key.as_deref());
+        return match cluster.remove_node(id).await {
+            Ok(()) => {
+                tracing::info!(node = id, key = who.key, source = %who.source, forwarded_for = who.forwarded_for, "cluster membership: node removed");
+                Ok(StatusCode::NO_CONTENT.into_response())
+            }
+            Err(e) => {
+                tracing::warn!(node = id, key = who.key, source = %who.source, forwarded_for = who.forwarded_for, error = %e, "cluster membership: remove refused");
+                Err(S3Error::new(StatusCode::CONFLICT, "InvalidRequest", e))
+            }
+        };
     }
 
     let (bucket, key) = resolve_target(&st, &parts.headers, &raw_path);
@@ -2389,6 +2401,31 @@ async fn list_parts(ctx: &Ctx, bucket: &str, key: &str) -> S3Result<Response> {
             .close("Part");
     }
     Ok(xml_response(x.finish("ListPartsResult")))
+}
+
+/// Who sent an administrative request, for the audit log: the access key,
+/// the peer address and, behind a reverse proxy, `X-Forwarded-For`.
+struct Caller<'a> {
+    key: &'a str,
+    source: String,
+    forwarded_for: &'a str,
+}
+
+impl<'a> Caller<'a> {
+    fn of(parts: &'a axum::http::request::Parts, key: Option<&'a str>) -> Self {
+        Caller {
+            key: key.unwrap_or("anonymous"),
+            source: parts
+                .extensions
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                .map_or_else(|| "unknown".into(), |ci| ci.0.to_string()),
+            forwarded_for: parts
+                .headers
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("-"),
+        }
+    }
 }
 
 #[cfg(test)]
